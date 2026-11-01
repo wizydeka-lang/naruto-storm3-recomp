@@ -27,5 +27,12 @@ class NarutoApp : public rex::ReXApp {
   // std::unique_ptr<rex::ui::AchievementNotificationDialog>
   // CreateAchievementNotificationDialog() override;
   // void OnShutdown() override {}
-  // void OnConfigurePaths(rex::PathConfig& paths) override {}
+
+#ifdef __ANDROID__
+  // The default beside the executable is the read-only system app_process
+  // folder; keep settings with the user data the Android activity passes.
+  void OnConfigurePaths(rex::PathConfig& paths) override {
+    paths.config_path = paths.user_data_root / "naruto.toml";
+  }
+#endif
 };

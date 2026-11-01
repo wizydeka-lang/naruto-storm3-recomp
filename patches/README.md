@@ -83,3 +83,57 @@ matching runtime and GPU plugin and rebuild the game as described in
 `docs/performance.md`. The shader correction remains necessary as a separate
 patch. Pre-change runtimes are backed up under
 `out/performance/backups/before-present-semaphore-fix/`.
+
+## Android build support
+
+`rexglue-android.patch` applies independently to the same SDK revision. It lets
+the SDK compile and link for Android arm64 with NDK r30 (Clang 21, libc++).
+NDK r27 is too old: its libc++ lacks floating-point `std::from_chars` and
+`std::jthread`. Desktop builds are unaffected.
+
+- `chrono.h`: supplies `clock_time_conversion` and `clock_cast`, which the
+  NDK's libc++ lacks, as Apple's libc++ already needed.
+- `main_android.h` (new): `GetAndroidApiLevel()`, which `memory_posix.cpp` and
+  `threading_posix.cpp` call but the SDK never defined.
+- `fiber_posix.cpp`, `fiber.h`: bionic has no `getcontext`, `makecontext` or
+  `swapcontext`, so Android fibers switch with a small arm64 assembly routine
+  that saves the AAPCS64 callee-saved registers on the fiber's own stack.
+- `threading_posix.cpp`: bionic has no robust mutexes; Android uses plain
+  mutexes, as macOS does.
+- `filesystem_posix.cpp`: `OpenAndroidContentFileDescriptor` opens a
+  `content://` URI from the Android file picker through `ContentResolver`,
+  using SDL's JNI environment and activity.
+- `surface_android.h`/`.cpp` (new), `window_sdl.cpp`: present to the SDL
+  window's `ANativeWindow` instead of X11 or Wayland.
+- `gpu_plugin_loader.cpp`: on Android the executable is the system's
+  `app_process`, so GPU plugins are loaded from the folder holding
+  `librexruntime.so`, the app's native library folder.
+- `windowed_app.h`: Android no longer switches to Xenia's several-apps-in-one-
+  library registration. SDL's activity runs one game per app, so the game
+  defines `GetWindowedAppCreator()` as on desktop.
+- CMake: links `android` instead of X11/Wayland, and not `pthread`/`rt`, which
+  are part of bionic's libc.
+
+Configure the SDK with the NDK toolchain in its own build directory:
+
+```bash
+cmake -S "$SDK" -B "$SDK/out/build/android-arm64" -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE=$HOME/Android/android-ndk-r30/build/cmake/android.toolchain.cmake \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-26 -DANDROID_STL=c++_shared \
+  -DCMAKE_BUILD_TYPE=Release -DREXGLUE_ENABLE_FIDELITYFX=OFF -DREXGLUE_ENABLE_TRACY=OFF
+cmake --build "$SDK/out/build/android-arm64"
+```
+
+The SDK names this platform `linux-arm64`, so its libraries land in
+`out/linux-arm64/`; do not build a real Linux arm64 SDK in the same checkout.
+
+## Verification
+
+- The complete SDK, including `librexruntime.so` and `librexgpu-xenos.so`,
+  builds for Android arm64; the libraries use 16 KB segment alignment.
+- The game builds against it as `libmain.so` with the `android-arm64-release`
+  preset, and passes all 252 function/parent dispatch checks.
+- The desktop Linux SDK still builds with the patch applied.
+- None of this has run on a device yet. The fiber switch, content URIs and the
+  Android surface are untested at run time, and guest memory on 16 KB-page
+  devices remains an open question.
