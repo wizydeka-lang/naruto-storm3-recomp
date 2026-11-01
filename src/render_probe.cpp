@@ -4,15 +4,16 @@
 // (config/naruto_d3d_funcs.toml), records what each frame draws and which
 // device state it uses, then calls the original function, so the Xenia GPU
 // backend still renders. With NARUTO_RENDER_PROBE=1 in the environment, a
-// summary is logged every 10 seconds; with NARUTO_NATIVE_VIEW=1, each frame is
-// handed to the native view (native_view.h). Otherwise the hooks only pass
-// through.
+// summary is logged every 10 seconds; with NARUTO_NATIVE_VIEW=1, each draw is
+// captured (frame_capture.h) and each frame handed to the native view
+// (native_view.h). Otherwise the hooks only pass through.
 
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 #include <rex/runtime.h>
 
+#include "frame_capture.h"
 #include "native_view.h"
 #include "shader_library.h"
 
@@ -95,6 +96,7 @@ struct FrameStats {
   uint64_t resolves = 0;
   uint64_t resolves_with_clear_color = 0;
   uint64_t texture_binds = 0;
+  uint64_t captured_draws = 0;
   std::map<uint32_t, uint64_t> resolve_flags;
   std::map<uint32_t, uint64_t> primitive_types;
   std::set<uint32_t> vertex_shaders;
@@ -110,18 +112,28 @@ const bool g_enabled = g_logging || native_view::Enabled();
 std::mutex g_mutex;
 FrameStats g_stats;
 native_view::FrameInfo g_frame;
+uint32_t g_pass = 0;  // index of g_frame.passes being drawn
 std::set<uint32_t> g_all_vertex_shaders;
 std::set<uint32_t> g_all_pixel_shaders;
 auto g_window_start = std::chrono::steady_clock::now();
 
+// Called after the original draw function, which has committed the device's
+// state for it.
 void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, bool indexed,
-                uint32_t count) {
+                int32_t base_vertex, uint32_t start, uint32_t count) {
   uint32_t vs = LoadGuest32(base, device + kDeviceVertexShader);
   uint32_t ps = LoadGuest32(base, device + kDevicePixelShader);
   std::lock_guard<std::mutex> lock(g_mutex);
-  MatchShader(base, vs, shader_library::Stage::kVertex);
-  MatchShader(base, ps, shader_library::Stage::kPixel);
+  int vs_index = MatchShader(base, vs, shader_library::Stage::kVertex);
+  int ps_index = MatchShader(base, ps, shader_library::Stage::kPixel);
   g_frame.draws++;
+  if (native_view::Enabled() &&
+      frame_capture::Capture(base,
+                             {device, primitive_type, indexed, base_vertex, start, count, vs, ps,
+                              vs_index, ps_index, g_pass},
+                             g_frame)) {
+    g_stats.captured_draws++;
+  }
   (indexed ? g_stats.indexed_draws : g_stats.vertex_draws)++;
   (indexed ? g_stats.indices : g_stats.vertices) += count;
   g_stats.primitive_types[primitive_type]++;
@@ -155,12 +167,13 @@ void LogWindow() {
       "[render probe] {:.1f} fps | draws/frame {:.1f} indexed + {:.1f} non-indexed "
       "({:.0f} indices, {:.0f} vertices) | primitive types/frame{} | clears/frame {:.2f} "
       "resolves/frame {:.2f} (with clear color {:.2f}; flags{}) texture binds/frame {:.1f} | "
-      "shaders this window {} VS {} PS, all {} VS {} PS, library matches {}/{}",
+      "shaders this window {} VS {} PS, all {} VS {} PS, library matches {}/{} | "
+      "captured draws/frame {:.1f}",
       s.frames / seconds, s.indexed_draws / frames, s.vertex_draws / frames, s.indices / frames,
       s.vertices / frames, primitives, s.clears / frames, s.resolves / frames,
       s.resolves_with_clear_color / frames, resolve_flags, s.texture_binds / frames, s.vertex_shaders.size(), s.pixel_shaders.size(),
       g_all_vertex_shaders.size(), g_all_pixel_shaders.size(), matched,
-      g_shader_matches.size());
+      g_shader_matches.size(), s.captured_draws / frames);
   g_stats = {};
   g_window_start = now;
 }
@@ -195,28 +208,34 @@ REX_HOOK_RAW(sub_82746748) {
       if (g_logging) {
         LogWindow();
       }
-      frame = g_frame;
+      frame = std::move(g_frame);
       g_frame = {};
+      g_pass = 0;
     }
-    native_view::SubmitFrame(frame);
+    native_view::SubmitFrame(std::move(frame));
   }
   __imp__sub_82746748(ctx, base);
 }
 
 // D3DDevice_DrawIndexedVertices(device, primitive type, base vertex, start index, index count)
 REX_HOOK_RAW(sub_827518D8) {
-  if (g_enabled) {
-    RecordDraw(base, ctx.r3.u32, ctx.r4.u32, true, ctx.r7.u32);
-  }
+  uint32_t device = ctx.r3.u32, primitive_type = ctx.r4.u32, start = ctx.r6.u32,
+           count = ctx.r7.u32;
+  int32_t base_vertex = ctx.r5.s32;
   __imp__sub_827518D8(ctx, base);
+  if (g_enabled) {
+    RecordDraw(base, device, primitive_type, true, base_vertex, start, count);
+  }
 }
 
 // D3DDevice_DrawVertices(device, primitive type, start vertex, vertex count)
 REX_HOOK_RAW(sub_827514C0) {
-  if (g_enabled) {
-    RecordDraw(base, ctx.r3.u32, ctx.r4.u32, false, ctx.r6.u32);
-  }
+  uint32_t device = ctx.r3.u32, primitive_type = ctx.r4.u32, start = ctx.r5.u32,
+           count = ctx.r6.u32;
   __imp__sub_827514C0(ctx, base);
+  if (g_enabled) {
+    RecordDraw(base, device, primitive_type, false, 0, start, count);
+  }
 }
 
 // D3DDevice_Clear
@@ -231,16 +250,28 @@ REX_HOOK_RAW(sub_8275BD48) {
   if (g_enabled) {
     uint32_t flags = ctx.r4.u32;
     uint32_t clear_color = ctx.r10.u32;
+    float clear_depth = float(ctx.f1.f64);
     std::lock_guard<std::mutex> lock(g_mutex);
     g_stats.resolves++;
     g_stats.resolve_flags[flags]++;
+    // The clear arguments only apply with D3DRESOLVE_CLEARRENDERTARGET
+    // (0x100) and D3DRESOLVE_CLEARDEPTHSTENCIL (0x200); otherwise they hold
+    // leftovers.
+    native_view::PassInfo next;
+    if ((flags & 0x200) && clear_depth >= 0.0f && clear_depth <= 1.0f) {
+      next.clear_depth = clear_depth;
+    }
     if (clear_color) {
       g_stats.resolves_with_clear_color++;
-      g_frame.has_clear_color = true;
+    }
+    if (clear_color && (flags & 0x100)) {
+      next.has_clear_color = true;
       for (int i = 0; i < 4; ++i) {
-        g_frame.clear_color[i] = std::bit_cast<float>(LoadGuest32(base, clear_color + 4 * i));
+        next.clear_color[i] = std::bit_cast<float>(LoadGuest32(base, clear_color + 4 * i));
       }
     }
+    g_frame.passes.push_back(next);
+    g_pass++;
   }
   __imp__sub_8275BD48(ctx, base);
 }

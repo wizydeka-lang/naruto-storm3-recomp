@@ -32,7 +32,7 @@ XENOSRECOMP_URL = "https://github.com/hedge-dev/XenosRecomp.git"
 XENOSRECOMP_REVISION = "990d03b28a27b50277ee5d8d942e1c5f873869d1"
 PATCH = ROOT / "tools" / "shaders" / "xenosrecomp-naruto.patch"
 LIBRARIES = ["nuccMaterial", "nuccPostEffect"]
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def run(*args, **kwargs):

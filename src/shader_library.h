@@ -18,15 +18,27 @@ namespace shader_library {
 
 enum class Stage { kVertex, kPixel };
 
+// A vertex shader input: the vertex fetch instruction at instruction index
+// address reads it. The converted shader declares element i at location i.
+struct VertexElement {
+  uint32_t address;
+  uint8_t usage;  // D3DDECLUSAGE
+  uint8_t usage_index;
+};
+
 struct Shader {
   Stage stage;
   std::string library;  // "nuccMaterial" or "nuccPostEffect"
   uint32_t offset;      // container offset in the library file
   std::vector<uint32_t> microcode;  // host-endian instruction words
+  std::vector<VertexElement> vertex_elements;
+  std::vector<uint32_t> spirv;  // from the shader cache; empty if not built
 };
 
-// Loads both libraries from the game's data folder; returns false if neither
-// was found.
+// Loads both libraries from the game's data folder, and the SPIR-V shader
+// cache tools/build-shaders.py writes (NARUTO_SHADER_CACHE, or
+// out/shaders/naruto_shaders.bin next to the game folder). Returns false if
+// neither library was found.
 bool Load(const std::filesystem::path& game_data_root);
 
 const std::vector<Shader>& Shaders();

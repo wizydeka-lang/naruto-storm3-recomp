@@ -48,9 +48,41 @@ renderer object at `0x82AC4380`); in the traced runs the device was at
 | `+0x480` | fetch constants: 32 slots × 24 bytes (textures, vertex buffers) | `SetVertexFetchConstant` writes slot (95 − register) / 3 |
 | `+0x780` | vertex shader float constants, 16 bytes per register | `SetVertexShaderConstantFN` |
 | `+0x1780` | pixel shader float constants | `SetPixelShaderConstantFN` |
+| `+0x2880` | register shadows: `0x2000`–`0x200F` (`RB_SURFACE_INFO`...) | draw functions flush them with `sub_82749108` |
+| `+0x28CC` | register shadows: `0x2100`–`0x2114` (`RB_COLOR_MASK`, `RB_ALPHA_REF`, viewport scale/offset) | as above |
+| `+0x2920` | register shadows: `0x2180`–`0x2184` | as above |
+| `+0x2934` | register shadows: `0x2200`–`0x220B` (`RB_DEPTHCONTROL`, `RB_BLENDCONTROL0`, `RB_COLORCONTROL`, `PA_SU_SC_MODE_CNTL`, `PA_CL_VTE_CNTL`, `RB_MODECONTROL`) | as above |
 | `+0x2FD0` | current vertex declaration (likely) | `SetVertexDeclaration` |
+| `+0x320C` | current index buffer | `SetIndices`; `DrawIndexedVertices` reads its header |
 | `+0x330C` | current pixel shader | `SetPixelShader` |
 | `+0x3310` | current vertex shader | `SetVertexShader` |
+
+`sub_82749108(device, mask, first register, shadow)` writes one register per
+set mask bit, from the most significant bit, so register *first + k* is at
+*shadow + 4k*.
+
+An index buffer header keeps the Xbox 360 `D3DResource` layout: `Common` at
+`+0` (bit 31 set for 32-bit indices, bits 29–30 the endian swap) and the
+data's virtual address at `+0x18`. Vertex buffers are only known through the
+vertex fetch constants at `+0x480` (physical address, size, endian swap).
+
+## Shader objects
+
+A vertex shader object keeps variants at `+896`, eight bytes each. The
+per-draw commit `sub_8274A238` uses the first variant, or the one at `+904`
+when bit `0x20` of `+872` is set. A variant's microcode is at
+`*(shader + 32) + *(variant + 872)`, `*(variant + 876)` bytes long. Binding a
+vertex declaration patches the vertex fetch instructions in place, so the
+bound microcode describes the current vertex layout. A pixel shader's info
+block is at `shader + *(shader + 64)`; its microcode is at
+`*(shader + 24) + *(info + 40)`, `*(info + 44)` bytes long.
+
+## Resolve flags
+
+The game resolves with flags `0x0`, `0x1` and `0x14` (render target 0, 1,
+and the depth buffer). None include `D3DRESOLVE_CLEARRENDERTARGET` (`0x100`)
+or `D3DRESOLVE_CLEARDEPTHSTENCIL` (`0x200`), so the clear color and depth
+arguments are not used, and the game never calls `Clear`.
 
 ## Resources are not created through Direct3D
 
@@ -81,11 +113,8 @@ runtime's `/dev/shm/xenia_memory_*` file while the game ran (guest addresses
 
 ## Not yet identified
 
-- The shader object layout: the per-draw commit reads an offset at `+896` of
-  the vertex shader object, which leads to its microcode. Needed to match bound
-  shaders to the precompiled `.nsh` shaders.
-- The register shadows after `+0x2780` (render target, depth, viewport, blend
-  and raster state as the GPU sees them).
+- How the game clears render targets (probably with full-screen quads).
+- Where the device keeps boolean shader constants.
 - `sub_8274ABB8`, `sub_8274D0F8`, `sub_8274D230`, `sub_8274CA60` and
   `sub_8274CFC8`: load-time entry points the engine calls, probably buffer
   header and lock helpers.

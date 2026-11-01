@@ -1,5 +1,5 @@
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..ee7eeb1 100644
+index 698a418..a8ff7fb 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -1,3 +1,6 @@
@@ -34,7 +34,45 @@ index 698a418..ee7eeb1 100644
  static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
  {
      "2D",
-@@ -307,7 +328,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -179,35 +200,10 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     auto findResult = vertexElements.find(address);
+     assert(findResult != vertexElements.end());
+ 
+-    switch (findResult->second.usage)
+-    {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+-        print("tfetchR11G11B10(");
+-        break;
+-
+-    case DeclUsage::TexCoord:
+-        print("tfetchTexcoord(g_SwappedTexcoords, ");
+-        break;
+-    }
+-
++    // Naruto: the host converts every vertex format to what the fetch would
++    // return, so inputs are read as they are.
+     print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+ 
+-    switch (findResult->second.usage)
+-    {
+-    case DeclUsage::Normal:
+-    case DeclUsage::Tangent:
+-    case DeclUsage::Binormal:
+-        out += ')';
+-        break;
+-
+-    case DeclUsage::TexCoord:
+-        print(", {})", uint32_t(findResult->second.usageIndex));
+-        break;
+-    }
+-
+     out += '.';
+     printDstSwizzle(instr.dstSwizzle, true);
+ 
+@@ -307,7 +303,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
      switch (instr.dimension)
      {
      case TextureDimension::Texture1D:
@@ -44,7 +82,7 @@ index 698a418..ee7eeb1 100644
          componentCount = 1;
          break;
      case TextureDimension::Texture2D:
-@@ -332,10 +354,22 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+@@ -332,10 +329,22 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
  #endif
  
      print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
@@ -68,7 +106,7 @@ index 698a418..ee7eeb1 100644
      case TextureDimension::Texture2D:
          print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
          break;
-@@ -458,7 +492,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+@@ -458,7 +467,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
                  auto findResult = float4Constants.find(reg);
                  if (findResult != float4Constants.end())
                  {
@@ -77,7 +115,7 @@ index 698a418..ee7eeb1 100644
                      if (findResult->second->registerCount > 1)
                      {
                      #ifdef UNLEASHED_RECOMP
-@@ -1125,7 +1159,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1125,7 +1134,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
          const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
              constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
  
@@ -86,7 +124,7 @@ index 698a418..ee7eeb1 100644
  
      #ifdef UNLEASHED_RECOMP
          if (!isPixelShader)
-@@ -1199,7 +1233,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1199,7 +1208,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          if (constantInfo->registerSet == RegisterSet::Float4)
          {
@@ -95,7 +133,7 @@ index 698a418..ee7eeb1 100644
  
              print("\tfloat4 {}", constantName);
  
-@@ -1228,7 +1262,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1228,7 +1237,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          if (constantInfo->registerSet == RegisterSet::Sampler)
          {
@@ -104,7 +142,7 @@ index 698a418..ee7eeb1 100644
  
              for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
              {
-@@ -1253,7 +1287,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+@@ -1253,7 +1262,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
  
          if (constantInfo->registerSet == RegisterSet::Bool)
          {
@@ -113,3 +151,31 @@ index 698a418..ee7eeb1 100644
              println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
              boolConstants.emplace(constantInfo->registerIndex, constantName);
          }
+@@ -1312,7 +1321,10 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
+ 
+-            const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
++            // Naruto: every input is a float4 at the location of its vertex
++            // element's index; the host builds the vertex input from the
++            // element list and the vertex fetch each element points to.
++            const char* usageType = "float4";
+ 
+         #ifdef UNLEASHED_RECOMP
+             if ((vertexElement.usage == DeclUsage::TexCoord && vertexElement.usageIndex == 2 && isMetaInstancer) ||
+@@ -1324,14 +1336,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             out += '\t';
+ 
+-            for (auto& usageLocation : USAGE_LOCATIONS)
+-            {
+-                if (usageLocation.usage == vertexElement.usage && usageLocation.usageIndex == vertexElement.usageIndex)
+-                {
+-                    print("[[vk::location({})]] ", usageLocation.location);
+-                    break;
+-                }
+-            }
++            print("[[vk::location({})]] ", i);
+ 
+             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
+                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
