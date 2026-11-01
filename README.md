@@ -71,10 +71,17 @@ The second command translates `assets/default.xex` into `generated/default/`. Th
 ### Run
 
 ```bash
-python3 tools/launcher.py
+bash tools/run-radeon.sh
 ```
 
-See [Launcher](#launcher) below. `tools/run-radeon.sh` is an older launcher kept for profiling (`--profile`); it defaults to NVIDIA, and `--radeon` picks the AMD driver.
+It runs the Release build with `assets/` as the game data. It defaults to the NVIDIA driver; `--radeon` picks the AMD driver, `--debug` the Debug build, and `--profile` an isolated run with GPU logs. To pass other [game options](#game-options), start the game directly:
+
+```bash
+LD_LIBRARY_PATH=$HOME/rexglue-sdk/out/install/linux-amd64/lib64 \
+  ./out/build/linux-amd64-release/naruto --game_data_root="$PWD/assets" --gpu_plugin=xenos
+```
+
+The game leaves a large shared-memory file in `/dev/shm` when it exits. Delete leftover `/dev/shm/xenia_memory_*` files while no game is running; otherwise they fill memory and later runs can crash.
 
 ## 3. Windows
 
@@ -89,7 +96,7 @@ These steps have not been tested on Windows yet.
 | [LLVM](https://github.com/llvm/llvm-project/releases) | Clang 20 or newer, if Visual Studio's bundled Clang is older. `clang` and `clang++` must be on `PATH`. |
 | [CMake](https://cmake.org/download/) | 3.25 or newer, on `PATH` |
 | [Ninja](https://github.com/ninja-build/ninja/releases) | On `PATH` (Visual Studio's CMake tools also provide it) |
-| [Python](https://www.python.org/downloads/windows/) | 3.10 or newer, with the `py` launcher, for `tools\check-game.py` and the launcher |
+| [Python](https://www.python.org/downloads/windows/) | 3.10 or newer, for `tools\check-game.py` |
 
 Use a short folder path such as `C:\dev\naruto-recomp`; long paths can break the SDK build.
 
@@ -124,83 +131,47 @@ Copy-Item "$sdkPrefix/bin/*.dll" .\out\build\win-amd64-release\ -Force
 ### Run
 
 ```powershell
-py -3 tools\launcher.py
-```
-
-See [Launcher](#launcher) below. To start the game without it:
-
-```powershell
 $gameRoot = (Resolve-Path .\assets).Path
 & .\out\build\win-amd64-release\naruto.exe "--game_data_root=$gameRoot" --gpu_plugin=xenos
 ```
 
-## Launcher
+## Game options
 
-`tools/launcher.py` opens a small window with a game file picker, a GPU list, resolution, fullscreen and upscaler options, a keyboard-controls option, and **Play** and **Stop game** buttons. The window needs PySide6:
+Add these to the `naruto` command line. `--game_data_root` can point at any folder that holds the game files, for example on another drive.
 
-```bash
-pip install PySide6        # Windows: py -3 -m pip install PySide6
-```
+| Option | Effect |
+| --- | --- |
+| `--window_width=1920 --window_height=1080` | Window size. The game's image is scaled to it by the upscaler, which costs almost nothing. |
+| `--fullscreen=true` | Fill the screen; the window size then doesn't matter. |
+| `--draw_resolution_scale_x=2 --draw_resolution_scale_y=2` | Render scale (see below). |
+| `--present_effect=fsr` | Upscaler (see below). |
+| `--mnk_mode=true` | Keyboard controls (see [Playing](#playing)). |
 
-Many Linux desktops (KDE, Bazzite) already include it. Without PySide6, or with `--cli`, the launcher shows the same options as a menu in the terminal:
-
-```text
-=== Naruto launcher ===
- 1) Game:     .../assets/default.xex  [OK]
- 2) GPU:      NVIDIA GeForce RTX 2050 (10de:25ad)
- 3) Keyboard: off (use a controller)
- 4) Build:    release
- 5) Resolution: 720p (original)
- 6) Fullscreen: on
- 7) Upscaler:   AMD FSR 1 (sharpest)
- 8) Render scale: 1x (1280x720)
- P) Play   Q) Quit
-```
-
-- **Game:** choose your `default.xex` with **Browse…**, or type its path. The game data is read from the folder that holds it, so your game files can live anywhere, for example on another drive. The launcher refuses a different game version.
-- **GPU:** pick which graphics card runs the game.
-  - On Linux, each card is listed by name. The launcher makes Vulkan use only that card's driver.
-  - On Windows, choose **High performance** (dedicated GPU), **Power saving** (integrated GPU) or **Let Windows decide**. The launcher saves this as Windows' per-app graphics preference for `naruto.exe`, the same setting as Settings › System › Display › Graphics.
-- **Resolution:** the window size: 720p, 1080p or 1440p. The game's image is scaled to it by the upscaler, which costs almost nothing. With **Fullscreen** on, the picture fills your screen and the window size doesn't matter.
 - **Render scale:** how many pixels the game is drawn at.
 
-  | Choice | Rendered at | GPU work |
+  | Scale | Rendered at | GPU work |
   | --- | --- | --- |
-  | 1x (default) | 1280×720 | original |
-  | 2x | 2560×1440 | about 4× |
-  | 3x | 3840×2160 | about 9× |
+  | 1 (default) | 1280×720 | original |
+  | 2 | 2560×1440 | about 4× |
+  | 3 | 3840×2160 | about 9× |
 
   ReXGlue only scales by whole numbers: its render target and texture caches give each of the game's pixels a whole block of screen pixels, so steps such as 1.5x are not possible without rewriting them. 2x is sharper, but an RTX 2050 drops from 30 to about 18 FPS on the menus.
 - **Upscaler:** sharpens the picture as it is scaled up to your screen.
 
-  | Choice | Effect |
+  | `--present_effect` | Effect |
   | --- | --- |
-  | AMD FSR 1 (default) | Sharpest; crisp edges and texture detail |
-  | AMD CAS | Light sharpening |
-  | Off | Plain scaling, softest |
+  | `fsr` | AMD FSR 1: sharpest; crisp edges and texture detail |
+  | `cas` | AMD CAS: light sharpening |
+  | (not set) | Plain scaling, softest |
 
-  Both upscalers ran at the full 30 FPS on an RTX 2050, so **render scale 1x with FSR is the recommended setting**, at any window size: sharper than plain scaling without the slowdown of 2x. They need an SDK set up with `tools/setup-sdk.sh` or `.ps1`, which downloads AMD's FidelityFX headers (about 5 MB). With an older SDK the launcher quietly uses plain scaling.
-- **Keyboard:** turns on keyboard controls (see [Playing](#playing)).
-- **Build:** switches between the Release and Debug builds.
+  Both upscalers ran at the full 30 FPS on an RTX 2050, so **render scale 1 with FSR is the recommended setting**, at any window size: sharper than plain scaling without the slowdown of 2x. They need an SDK set up with `tools/setup-sdk.sh` or `.ps1`, which downloads AMD's FidelityFX headers (about 5 MB).
 
-**Stop game** closes the game (it is forced closed if it hasn't quit after 5 seconds). On Linux the launcher also removes the large shared-memory file the game leaves in `/dev/shm` when it exits; without that, leftovers fill memory and later runs can crash. If you start `naruto` without the launcher, delete leftover `/dev/shm/xenia_memory_*` files yourself while no game is running.
-
-Choices are saved in `out/launcher.json` and reused next time. To skip the window:
-
-```bash
-python3 tools/launcher.py --list-gpus                  # show GPU ids
-python3 tools/launcher.py --gpu 10de:25ad --play       # launch on that GPU now
-python3 tools/launcher.py --xex /games/naruto/default.xex --keyboard --play
-python3 tools/launcher.py --resolution 1440p --render-scale 2 --no-fullscreen --play
-python3 tools/launcher.py --resolution 720p --upscaler fsr --play
-```
-
-The build itself always uses `assets/default.xex`; the launcher's game path only sets where the game reads its data while running.
+The build itself always uses `assets/default.xex`; `--game_data_root` only sets where the game reads its data while running.
 
 ## Playing
 
 - **Controller:** an Xbox-style controller works directly.
-- **Keyboard:** turn it on in the launcher, or add `--mnk_mode=true` when starting `naruto` directly.
+- **Keyboard:** add `--mnk_mode=true` when starting `naruto`.
 
   | Keys | Controller |
   | --- | --- |
@@ -225,7 +196,7 @@ Settings are stored in `naruto.toml` next to the executable. The first build cre
 - **`assets/default.xex not found` during configure:** do step 1 first.
 - **`check-game.py` reports a different SHA-256:** your copy is a different version. It won't work with this function list.
 - **The first launch stutters:** shaders are compiled and cached the first time each effect appears. Later runs are smoother.
-- **Low FPS:** choose the dedicated GPU in the launcher, and use render scale 1x with the FSR upscaler.
+- **Low FPS:** run on the dedicated GPU, and use render scale 1 with the FSR upscaler.
 - **Updating:** after pulling new changes, run the setup script again if `patches/` changed. If `naruto_manifest.toml` changed, repeat all four build commands; otherwise only the last one.
 
 ## How the project is organised
@@ -236,7 +207,7 @@ Settings are stored in `naruto.toml` next to the executable. The first build cre
 | `src/` | Application startup code |
 | `patches/` | Fixes applied to the ReXGlue SDK (see `patches/README.md`) |
 | `config/` | Default runtime settings |
-| `tools/` | SDK setup, game check, launcher and build checks |
+| `tools/` | SDK setup, game check, run script and build checks |
 | `docs/` | Development notes |
 
 Generated code (`generated/default/`) and build output (`out/`) are created on your machine and are not part of the repository.
