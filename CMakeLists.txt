@@ -36,6 +36,7 @@ set(NARUTO_SOURCES
     src/main.cpp
     src/render_probe.cpp
     src/native_view.cpp
+    src/shader_library.cpp
 )
 
 if(WIN32)

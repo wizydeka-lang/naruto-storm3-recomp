@@ -11,8 +11,10 @@
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
+#include <rex/runtime.h>
 
 #include "native_view.h"
+#include "shader_library.h"
 
 #include <bit>
 #include <chrono>
@@ -21,6 +23,8 @@
 #include <map>
 #include <mutex>
 #include <set>
+#include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -30,6 +34,55 @@ constexpr uint32_t kDeviceVertexShader = 0x3310;
 
 uint32_t LoadGuest32(const uint8_t* base, uint32_t address) {
   return rex::memory::load_and_swap<uint32_t>(base + address);
+}
+
+// Microcode of a bound shader object (docs/d3d-functions.md). A vertex shader
+// holds variants patched for different vertex layouts; variant 0 is enough to
+// identify it. A pixel shader has one copy.
+std::vector<uint32_t> ShaderMicrocode(const uint8_t* base, uint32_t shader,
+                                      shader_library::Stage stage) {
+  uint32_t address, size;
+  if (stage == shader_library::Stage::kVertex) {
+    uint32_t variant = shader + LoadGuest32(base, shader + 896);
+    address = LoadGuest32(base, shader + 32) + LoadGuest32(base, variant + 872);
+    size = LoadGuest32(base, variant + 876);
+  } else {
+    uint32_t info = shader + LoadGuest32(base, shader + 64);
+    address = LoadGuest32(base, shader + 24) + LoadGuest32(base, info + 40);
+    size = LoadGuest32(base, info + 44);
+  }
+  std::vector<uint32_t> words;
+  if (size && size % 4 == 0 && size <= 0x10000) {
+    for (uint32_t i = 0; i < size; i += 4) {
+      words.push_back(LoadGuest32(base, address + i));
+    }
+  }
+  return words;
+}
+
+// Bound shader object -> library index (-1: no match), matched once per object.
+std::unordered_map<uint32_t, int> g_shader_matches;
+bool g_library_loaded = false;
+
+int MatchShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage) {
+  if (!shader) {
+    return -1;
+  }
+  auto [it, inserted] = g_shader_matches.try_emplace(shader, -1);
+  if (inserted) {
+    if (!g_library_loaded) {
+      g_library_loaded = true;
+      shader_library::Load(std::string(REXCVAR_GET(game_data_root)));
+    }
+    std::vector<uint32_t> words = ShaderMicrocode(base, shader, stage);
+    it->second = shader_library::Match(stage, words.data(), words.size());
+    if (it->second < 0) {
+      REXLOG_WARN("[render probe] {} shader object {:08X} ({} words) matches no library shader",
+                  stage == shader_library::Stage::kVertex ? "vertex" : "pixel", shader,
+                  words.size());
+    }
+  }
+  return it->second;
 }
 
 struct FrameStats {
@@ -66,6 +119,8 @@ void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, b
   uint32_t vs = LoadGuest32(base, device + kDeviceVertexShader);
   uint32_t ps = LoadGuest32(base, device + kDevicePixelShader);
   std::lock_guard<std::mutex> lock(g_mutex);
+  MatchShader(base, vs, shader_library::Stage::kVertex);
+  MatchShader(base, ps, shader_library::Stage::kPixel);
   g_frame.draws++;
   (indexed ? g_stats.indexed_draws : g_stats.vertex_draws)++;
   (indexed ? g_stats.indices : g_stats.vertices) += count;
@@ -83,6 +138,10 @@ void LogWindow() {
   const FrameStats& s = g_stats;
   double frames = s.frames ? double(s.frames) : 1.0;
   g_all_vertex_shaders.insert(s.vertex_shaders.begin(), s.vertex_shaders.end());
+  size_t matched = 0;
+  for (auto [object, index] : g_shader_matches) {
+    matched += index >= 0;
+  }
   g_all_pixel_shaders.insert(s.pixel_shaders.begin(), s.pixel_shaders.end());
   std::string primitives;
   for (auto [type, n] : s.primitive_types) {
@@ -96,11 +155,12 @@ void LogWindow() {
       "[render probe] {:.1f} fps | draws/frame {:.1f} indexed + {:.1f} non-indexed "
       "({:.0f} indices, {:.0f} vertices) | primitive types/frame{} | clears/frame {:.2f} "
       "resolves/frame {:.2f} (with clear color {:.2f}; flags{}) texture binds/frame {:.1f} | "
-      "shaders this window {} VS {} PS, all {} VS {} PS",
+      "shaders this window {} VS {} PS, all {} VS {} PS, library matches {}/{}",
       s.frames / seconds, s.indexed_draws / frames, s.vertex_draws / frames, s.indices / frames,
       s.vertices / frames, primitives, s.clears / frames, s.resolves / frames,
       s.resolves_with_clear_color / frames, resolve_flags, s.texture_binds / frames, s.vertex_shaders.size(), s.pixel_shaders.size(),
-      g_all_vertex_shaders.size(), g_all_pixel_shaders.size());
+      g_all_vertex_shaders.size(), g_all_pixel_shaders.size(), matched,
+      g_shader_matches.size());
   g_stats = {};
   g_window_start = now;
 }
