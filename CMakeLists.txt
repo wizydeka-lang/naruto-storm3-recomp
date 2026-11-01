@@ -48,6 +48,22 @@ endif()
 
 rexglue_setup_target(naruto GPU_PLUGINS xenos)
 
+# Development aid for mapping the game's Direct3D functions: counts calls to
+# each guest function in the D3D address range (tools/guest-call-trace). Use a
+# separate build directory; it slows the game down.
+option(NARUTO_TRACE_GUEST_CALLS "Count guest function calls (development only)" OFF)
+if(NARUTO_TRACE_GUEST_CALLS)
+    set(NARUTO_TRACE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tools/guest-call-trace")
+    # Only the generated code gets the profiling prologue; its tracy/Tracy.hpp
+    # is the stand-in in NARUTO_TRACE_DIR.
+    target_compile_definitions(naruto_recomp PRIVATE
+        REXGLUE_PROFILE_GUEST_FUNCTIONS REXGLUE_ENABLE_PROFILING)
+    target_include_directories(naruto_recomp BEFORE PRIVATE "${NARUTO_TRACE_DIR}")
+    target_sources(naruto PRIVATE "${NARUTO_TRACE_DIR}/guest_call_trace.cpp")
+    set_source_files_properties("${NARUTO_TRACE_DIR}/guest_call_trace.cpp" PROPERTIES
+        INCLUDE_DIRECTORIES "${NARUTO_TRACE_DIR}")
+endif()
+
 # Seed the gameplay configuration (it carries rendering fixes) for every
 # platform and build type, without overwriting settings saved later.
 if(NOT EXISTS "${CMAKE_CURRENT_BINARY_DIR}/naruto.toml")

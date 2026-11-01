@@ -1,0 +1,258 @@
+# Xbox 360 Direct3D functions in Naruto Shippuden: Ultimate Ninja Storm 3
+# Full Burst's default.xex (SHA-256 da6d872d...4fcd), for a native renderer
+# that hooks the game's D3D calls. Addresses only match that executable.
+#
+# Found by analysing this project's own generated code and runtime behaviour
+# (see docs/d3d-functions.md); names follow the Xbox 360 XDK.
+
+[functions]
+# Draws and shaders: argument patterns at the engine's call sites, per-draw
+# call counts (342 draws/frame in the trace), and the device fields written.
+0x82746748 = {name = "D3DDevice_Swap"}               # calls VdGetSystemCommandBuffer/VdSwap; exactly 1/frame
+0x827518D8 = {name = "D3DDevice_DrawIndexedVertices"} # (dev, prim 6, 0, startIndex, indexCount); 301/frame
+0x827514C0 = {name = "D3DDevice_DrawVertices"}        # (dev, prim 13 quad list, 0, 4); 41/frame
+0x82750838 = {name = "D3DDevice_SetVertexShader"}     # stores device+0x3310, sets dirty bit 0x80000
+0x82750630 = {name = "D3DDevice_SetPixelShader"}      # stores device+0x330C, sets dirty bits 0x100000|0x20000
+0x82750A50 = {name = "D3DDevice_SetVertexDeclaration"} # stores device+0x2FD0, sets dirty bit 0x80000 (likely)
+0x8273E758 = {name = "D3DDevice_SetVertexFetchConstant"} # (dev, register, buffer, offset); writes fetch constant 95-register
+0x8273E328 = {name = "D3DDevice_SetStreamSource"}     # (dev, stream, buffer, offset, stride, 1)
+0x8273E448 = {name = "D3DDevice_SetIndices"}          # (dev, indexBuffer); ~1 per indexed draw (302/frame)
+0x8274D2C8 = {name = "D3DDevice_SetTexture"}          # (dev, sampler, texture, pending mask); reset loop over 26 samplers
+0x82750288 = {name = "D3DDevice_SetVertexShaderConstantFN"} # copies to device+0x780+16*register, pending mask arg
+0x82750360 = {name = "D3DDevice_SetPixelShaderConstantFN"}  # copies to device+0x1780+16*register
+0x8273E700 = {name = "D3DDevice_SetBlendState"}       # (dev, render target, packed RB_BLENDCONTROL) (likely)
+0x8273EB88 = {name = "D3DDevice_SetViewport"}         # (dev, &viewport) with float MinZ/MaxZ at +16/+20
+0x8273E230 = {name = "D3DDevice_SetScissorRect"}      # (dev, &rect) from float-to-int conversions
+0x8273F320 = {name = "D3DDevice_SetRenderTarget"}     # (dev, index, surface); 6-instruction thunk
+0x8273F048 = {name = "D3DDevice_SetDepthStencilSurface"} # (dev, surface), after the Z render states
+0x82750BD8 = {name = "D3DDevice_SetShaderGPRAllocation"} # (dev, flags, vs, ps); (0,0,0) in the reset sequence (likely)
+0x8275BD48 = {name = "D3DDevice_Resolve"}             # float ClearZ in f1, rect and texture pointers; 28/frame
+0x8275D010 = {name = "D3DDevice_Clear"}               # (dev, count, rects, flags 63/48, color, f1 Z, stencil, EDRAM)
+0x827456D8 = {name = "Direct3D_CreateDevice"}         # (0, 1, 0, 1, &params, &device); device pointer kept at 0x82AC4384
+
+# Render and sampler states: the per-device dispatch table at runtime holds
+# 121 setters then 121 getters, indexed by D3DRENDERSTATETYPE / 4 (the first
+# 10 slots are stubs). Order checked against the XDK enum: 91 + 20 entries,
+# and Wrap0-15 getters are 16 consecutive 16-byte functions.
+0x8273C690 = {name = "D3DDevice_SetRenderState_ZEnable"}  # state 40
+0x8273C6C8 = {name = "D3DDevice_GetRenderState_ZEnable"}
+0x8273C700 = {name = "D3DDevice_SetRenderState_ZFunc"}  # state 44
+0x8273C728 = {name = "D3DDevice_GetRenderState_ZFunc"}
+0x8273C6D0 = {name = "D3DDevice_SetRenderState_ZWriteEnable"}  # state 48
+0x8273C6F0 = {name = "D3DDevice_GetRenderState_ZWriteEnable"}
+0x8273BF98 = {name = "D3DDevice_SetRenderState_FillMode"}  # state 52
+0x8273BFB8 = {name = "D3DDevice_GetRenderState_FillMode"}
+0x8273BF68 = {name = "D3DDevice_SetRenderState_CullMode"}  # state 56
+0x8273BF88 = {name = "D3DDevice_GetRenderState_CullMode"}
+0x8273C000 = {name = "D3DDevice_SetRenderState_AlphaBlendEnable"}  # state 60
+0x8273C080 = {name = "D3DDevice_GetRenderState_AlphaBlendEnable"}
+0x8273C390 = {name = "D3DDevice_SetRenderState_SeparateAlphaBlendEnable"}  # state 64
+0x8273C418 = {name = "D3DDevice_GetRenderState_SeparateAlphaBlendEnable"}
+0x8273C4B8 = {name = "D3DDevice_SetRenderState_BlendFactor"}  # state 68
+0x8273C548 = {name = "D3DDevice_GetRenderState_BlendFactor"}
+0x8273C120 = {name = "D3DDevice_SetRenderState_SrcBlend"}  # state 72
+0x8273C1A0 = {name = "D3DDevice_GetRenderState_SrcBlend"}
+0x8273C1B0 = {name = "D3DDevice_SetRenderState_DestBlend"}  # state 76
+0x8273C230 = {name = "D3DDevice_GetRenderState_DestBlend"}
+0x8273C090 = {name = "D3DDevice_SetRenderState_BlendOp"}  # state 80
+0x8273C110 = {name = "D3DDevice_GetRenderState_BlendOp"}
+0x8273C2B0 = {name = "D3DDevice_SetRenderState_SrcBlendAlpha"}  # state 84
+0x8273C310 = {name = "D3DDevice_GetRenderState_SrcBlendAlpha"}
+0x8273C320 = {name = "D3DDevice_SetRenderState_DestBlendAlpha"}  # state 88
+0x8273C380 = {name = "D3DDevice_GetRenderState_DestBlendAlpha"}
+0x8273C240 = {name = "D3DDevice_SetRenderState_BlendOpAlpha"}  # state 92
+0x8273C2A0 = {name = "D3DDevice_GetRenderState_BlendOpAlpha"}
+0x8273BFC8 = {name = "D3DDevice_SetRenderState_AlphaTestEnable"}  # state 96
+0x8273BFF0 = {name = "D3DDevice_GetRenderState_AlphaTestEnable"}
+0x8273C428 = {name = "D3DDevice_SetRenderState_AlphaRef"}  # state 100
+0x8273C460 = {name = "D3DDevice_GetRenderState_AlphaRef"}
+0x8273C488 = {name = "D3DDevice_SetRenderState_AlphaFunc"}  # state 104
+0x8273C4A8 = {name = "D3DDevice_GetRenderState_AlphaFunc"}
+0x8273C738 = {name = "D3DDevice_SetRenderState_StencilEnable"}  # state 108
+0x8273C770 = {name = "D3DDevice_GetRenderState_StencilEnable"}
+0x8273C778 = {name = "D3DDevice_SetRenderState_TwoSidedStencilMode"}  # state 112
+0x8273C7A0 = {name = "D3DDevice_GetRenderState_TwoSidedStencilMode"}
+0x8273C7E0 = {name = "D3DDevice_SetRenderState_StencilFail"}  # state 116
+0x8273C808 = {name = "D3DDevice_GetRenderState_StencilFail"}
+0x8273C818 = {name = "D3DDevice_SetRenderState_StencilZFail"}  # state 120
+0x8273C840 = {name = "D3DDevice_GetRenderState_StencilZFail"}
+0x8273C850 = {name = "D3DDevice_SetRenderState_StencilPass"}  # state 124
+0x8273C870 = {name = "D3DDevice_GetRenderState_StencilPass"}
+0x8273C7B0 = {name = "D3DDevice_SetRenderState_StencilFunc"}  # state 128
+0x8273C7D0 = {name = "D3DDevice_GetRenderState_StencilFunc"}
+0x8273C950 = {name = "D3DDevice_SetRenderState_StencilRef"}  # state 132
+0x8273C968 = {name = "D3DDevice_GetRenderState_StencilRef"}
+0x8273C970 = {name = "D3DDevice_SetRenderState_StencilMask"}  # state 136
+0x8273C988 = {name = "D3DDevice_GetRenderState_StencilMask"}
+0x8273C990 = {name = "D3DDevice_SetRenderState_StencilWriteMask"}  # state 140
+0x8273C9A8 = {name = "D3DDevice_GetRenderState_StencilWriteMask"}
+0x8273C8B0 = {name = "D3DDevice_SetRenderState_CCWStencilFail"}  # state 144
+0x8273C8D8 = {name = "D3DDevice_GetRenderState_CCWStencilFail"}
+0x8273C8E8 = {name = "D3DDevice_SetRenderState_CCWStencilZFail"}  # state 148
+0x8273C910 = {name = "D3DDevice_GetRenderState_CCWStencilZFail"}
+0x8273C920 = {name = "D3DDevice_SetRenderState_CCWStencilPass"}  # state 152
+0x8273C940 = {name = "D3DDevice_GetRenderState_CCWStencilPass"}
+0x8273C880 = {name = "D3DDevice_SetRenderState_CCWStencilFunc"}  # state 156
+0x8273C8A0 = {name = "D3DDevice_GetRenderState_CCWStencilFunc"}
+0x8273C9B0 = {name = "D3DDevice_SetRenderState_CCWStencilRef"}  # state 160
+0x8273C9C8 = {name = "D3DDevice_GetRenderState_CCWStencilRef"}
+0x8273C9D0 = {name = "D3DDevice_SetRenderState_CCWStencilMask"}  # state 164
+0x8273C9E8 = {name = "D3DDevice_GetRenderState_CCWStencilMask"}
+0x8273C9F0 = {name = "D3DDevice_SetRenderState_CCWStencilWriteMask"}  # state 168
+0x8273CA08 = {name = "D3DDevice_GetRenderState_CCWStencilWriteMask"}
+0x8273CA10 = {name = "D3DDevice_SetRenderState_ClipPlaneEnable"}  # state 172
+0x8273CA58 = {name = "D3DDevice_GetRenderState_ClipPlaneEnable"}
+0x8273CD40 = {name = "D3DDevice_SetRenderState_PointSize"}  # state 176
+0x8273CD88 = {name = "D3DDevice_GetRenderState_PointSize"}
+0x8273CD98 = {name = "D3DDevice_SetRenderState_PointSizeMin"}  # state 180
+0x8273CDD8 = {name = "D3DDevice_GetRenderState_PointSizeMin"}
+0x8273CD30 = {name = "D3DDevice_SetRenderState_PointSpriteEnable"}  # state 184
+0x8273CD38 = {name = "D3DDevice_GetRenderState_PointSpriteEnable"}
+0x8273CDE8 = {name = "D3DDevice_SetRenderState_PointSizeMax"}  # state 188
+0x8273CE28 = {name = "D3DDevice_GetRenderState_PointSizeMax"}
+0x8273CBE0 = {name = "D3DDevice_SetRenderState_MultiSampleAntiAlias"}  # state 192
+0x8273CC00 = {name = "D3DDevice_GetRenderState_MultiSampleAntiAlias"}
+0x8273CC10 = {name = "D3DDevice_SetRenderState_MultiSampleMask"}  # state 196
+0x8273CC28 = {name = "D3DDevice_GetRenderState_MultiSampleMask"}
+0x8273EB78 = {name = "D3DDevice_SetRenderState_ScissorTestEnable"}  # state 200
+0x8273CA68 = {name = "D3DDevice_GetRenderState_ScissorTestEnable"}
+0x8273CA70 = {name = "D3DDevice_SetRenderState_SlopeScaleDepthBias"}  # state 204
+0x8273CB18 = {name = "D3DDevice_GetRenderState_SlopeScaleDepthBias"}
+0x8273CB38 = {name = "D3DDevice_SetRenderState_DepthBias"}  # state 208
+0x8273CBD0 = {name = "D3DDevice_GetRenderState_DepthBias"}
+0x8273CC30 = {name = "D3DDevice_SetRenderState_ColorWriteEnable"}  # state 212
+0x8273CC68 = {name = "D3DDevice_GetRenderState_ColorWriteEnable"}
+0x8273CC70 = {name = "D3DDevice_SetRenderState_ColorWriteEnable1"}  # state 216
+0x8273CCA8 = {name = "D3DDevice_GetRenderState_ColorWriteEnable1"}
+0x8273CCB0 = {name = "D3DDevice_SetRenderState_ColorWriteEnable2"}  # state 220
+0x8273CCE8 = {name = "D3DDevice_GetRenderState_ColorWriteEnable2"}
+0x8273CCF0 = {name = "D3DDevice_SetRenderState_ColorWriteEnable3"}  # state 224
+0x8273CD28 = {name = "D3DDevice_GetRenderState_ColorWriteEnable3"}
+0x8273D4B8 = {name = "D3DDevice_SetRenderState_TessellationMode"}  # state 228
+0x8273D4E0 = {name = "D3DDevice_GetRenderState_TessellationMode"}
+0x8273D448 = {name = "D3DDevice_SetRenderState_MinTessellationLevel"}  # state 232
+0x8273D470 = {name = "D3DDevice_GetRenderState_MinTessellationLevel"}
+0x8273D480 = {name = "D3DDevice_SetRenderState_MaxTessellationLevel"}  # state 236
+0x8273D4A8 = {name = "D3DDevice_GetRenderState_MaxTessellationLevel"}
+0x8273CE38 = {name = "D3DDevice_SetRenderState_Wrap0"}  # state 240
+0x8273D098 = {name = "D3DDevice_GetRenderState_Wrap0"}
+0x8273CE58 = {name = "D3DDevice_SetRenderState_Wrap1"}  # state 244
+0x8273D0A8 = {name = "D3DDevice_GetRenderState_Wrap1"}
+0x8273CE80 = {name = "D3DDevice_SetRenderState_Wrap2"}  # state 248
+0x8273D0B8 = {name = "D3DDevice_GetRenderState_Wrap2"}
+0x8273CEA8 = {name = "D3DDevice_SetRenderState_Wrap3"}  # state 252
+0x8273D0C8 = {name = "D3DDevice_GetRenderState_Wrap3"}
+0x8273CED0 = {name = "D3DDevice_SetRenderState_Wrap4"}  # state 256
+0x8273D0D8 = {name = "D3DDevice_GetRenderState_Wrap4"}
+0x8273CEF8 = {name = "D3DDevice_SetRenderState_Wrap5"}  # state 260
+0x8273D0E8 = {name = "D3DDevice_GetRenderState_Wrap5"}
+0x8273CF20 = {name = "D3DDevice_SetRenderState_Wrap6"}  # state 264
+0x8273D0F8 = {name = "D3DDevice_GetRenderState_Wrap6"}
+0x8273CF48 = {name = "D3DDevice_SetRenderState_Wrap7"}  # state 268
+0x8273D108 = {name = "D3DDevice_GetRenderState_Wrap7"}
+0x8273CF68 = {name = "D3DDevice_SetRenderState_Wrap8"}  # state 272
+0x8273D118 = {name = "D3DDevice_GetRenderState_Wrap8"}
+0x8273CF88 = {name = "D3DDevice_SetRenderState_Wrap9"}  # state 276
+0x8273D128 = {name = "D3DDevice_GetRenderState_Wrap9"}
+0x8273CFB0 = {name = "D3DDevice_SetRenderState_Wrap10"}  # state 280
+0x8273D138 = {name = "D3DDevice_GetRenderState_Wrap10"}
+0x8273CFD8 = {name = "D3DDevice_SetRenderState_Wrap11"}  # state 284
+0x8273D148 = {name = "D3DDevice_GetRenderState_Wrap11"}
+0x8273D000 = {name = "D3DDevice_SetRenderState_Wrap12"}  # state 288
+0x8273D158 = {name = "D3DDevice_GetRenderState_Wrap12"}
+0x8273D028 = {name = "D3DDevice_SetRenderState_Wrap13"}  # state 292
+0x8273D168 = {name = "D3DDevice_GetRenderState_Wrap13"}
+0x8273D050 = {name = "D3DDevice_SetRenderState_Wrap14"}  # state 296
+0x8273D178 = {name = "D3DDevice_GetRenderState_Wrap14"}
+0x8273D078 = {name = "D3DDevice_SetRenderState_Wrap15"}  # state 300
+0x8273D188 = {name = "D3DDevice_GetRenderState_Wrap15"}
+0x8273D198 = {name = "D3DDevice_SetRenderState_ViewportEnable"}  # state 304
+0x8273D1D8 = {name = "D3DDevice_GetRenderState_ViewportEnable"}
+0x8273D1E8 = {name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable"}  # state 308
+0x8273D278 = {name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable"}
+0x8273D280 = {name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable1"}  # state 312
+0x8273D310 = {name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable1"}
+0x8273D318 = {name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable2"}  # state 316
+0x8273D3A8 = {name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable2"}
+0x8273D3B0 = {name = "D3DDevice_SetRenderState_HighPrecisionBlendEnable3"}  # state 320
+0x8273D440 = {name = "D3DDevice_GetRenderState_HighPrecisionBlendEnable3"}
+0x8273D4F0 = {name = "D3DDevice_SetRenderState_HalfPixelOffset"}  # state 324
+0x8273D518 = {name = "D3DDevice_GetRenderState_HalfPixelOffset"}
+0x8273D528 = {name = "D3DDevice_SetRenderState_PrimitiveResetEnable"}  # state 328
+0x8273D548 = {name = "D3DDevice_GetRenderState_PrimitiveResetEnable"}
+0x8273D558 = {name = "D3DDevice_SetRenderState_PrimitiveResetIndex"}  # state 332
+0x8273D578 = {name = "D3DDevice_GetRenderState_PrimitiveResetIndex"}
+0x8273D580 = {name = "D3DDevice_SetRenderState_AlphaToMaskEnable"}  # state 336
+0x8273D5A0 = {name = "D3DDevice_GetRenderState_AlphaToMaskEnable"}
+0x8273D5B0 = {name = "D3DDevice_SetRenderState_AlphaToMaskOffsets"}  # state 340
+0x8273D5D0 = {name = "D3DDevice_GetRenderState_AlphaToMaskOffsets"}
+0x8273D5D8 = {name = "D3DDevice_SetRenderState_GuardBand_X"}  # state 344
+0x8273D600 = {name = "D3DDevice_GetRenderState_GuardBand_X"}
+0x8273D608 = {name = "D3DDevice_SetRenderState_GuardBand_Y"}  # state 348
+0x8273D630 = {name = "D3DDevice_GetRenderState_GuardBand_Y"}
+0x8273D638 = {name = "D3DDevice_SetRenderState_DiscardBand_X"}  # state 352
+0x8273D658 = {name = "D3DDevice_GetRenderState_DiscardBand_X"}
+0x8273D660 = {name = "D3DDevice_SetRenderState_DiscardBand_Y"}  # state 356
+0x8273D688 = {name = "D3DDevice_GetRenderState_DiscardBand_Y"}
+0x8273D728 = {name = "D3DDevice_SetRenderState_HiStencilEnable"}  # state 360
+0x8273D748 = {name = "D3DDevice_GetRenderState_HiStencilEnable"}
+0x8273D758 = {name = "D3DDevice_SetRenderState_HiStencilWriteEnable"}  # state 364
+0x8273D778 = {name = "D3DDevice_GetRenderState_HiStencilWriteEnable"}
+0x8273D788 = {name = "D3DDevice_SetRenderState_HiStencilFunc"}  # state 368
+0x8273D7A8 = {name = "D3DDevice_GetRenderState_HiStencilFunc"}
+0x8273D7B8 = {name = "D3DDevice_SetRenderState_HiStencilRef"}  # state 372
+0x8273D7D0 = {name = "D3DDevice_GetRenderState_HiStencilRef"}
+0x8273D7D8 = {name = "D3DDevice_SetRenderState_PresentInterval"}  # state 376
+0x8273D7E0 = {name = "D3DDevice_GetRenderState_PresentInterval"}
+0x8273D7E8 = {name = "D3DDevice_SetRenderState_PresentImmediateThreshold"}  # state 380
+0x8273D7F8 = {name = "D3DDevice_GetRenderState_PresentImmediateThreshold"}
+0x8273D690 = {name = "D3DDevice_SetRenderState_HiZEnable"}  # state 384
+0x8273D6B0 = {name = "D3DDevice_GetRenderState_HiZEnable"}
+0x8273D6C0 = {name = "D3DDevice_SetRenderState_HiZWriteEnable"}  # state 388
+0x8273D718 = {name = "D3DDevice_GetRenderState_HiZWriteEnable"}
+0x8273C5B8 = {name = "D3DDevice_SetRenderState_LastPixel"}  # state 392
+0x8273C5E0 = {name = "D3DDevice_GetRenderState_LastPixel"}
+0x8273C5F0 = {name = "D3DDevice_SetRenderState_LineWidth"}  # state 396
+0x8273C630 = {name = "D3DDevice_GetRenderState_LineWidth"}
+0x8273C660 = {name = "D3DDevice_SetRenderState_Buffer2Frames"}  # state 400
+0x8273C680 = {name = "D3DDevice_GetRenderState_Buffer2Frames"}
+0x8273DF80 = {name = "D3DDevice_SetSamplerState_AddressU"}  # state 404
+0x8273DFB8 = {name = "D3DDevice_GetSamplerState_AddressU"}
+0x8273DFD0 = {name = "D3DDevice_SetSamplerState_AddressV"}  # state 408
+0x8273E008 = {name = "D3DDevice_GetSamplerState_AddressV"}
+0x8273E020 = {name = "D3DDevice_SetSamplerState_AddressW"}  # state 412
+0x8273E058 = {name = "D3DDevice_GetSamplerState_AddressW"}
+0x8273DF10 = {name = "D3DDevice_SetSamplerState_BorderColor"}  # state 416
+0x8273DF58 = {name = "D3DDevice_GetSamplerState_BorderColor"}
+0x8273D9B0 = {name = "D3DDevice_SetSamplerState_MagFilter"}  # state 420
+0x8273DA78 = {name = "D3DDevice_GetSamplerState_MagFilter"}
+0x8273D808 = {name = "D3DDevice_SetSamplerState_MinFilter"}  # state 424
+0x8273D8D0 = {name = "D3DDevice_GetSamplerState_MinFilter"}
+0x8273DB50 = {name = "D3DDevice_SetSamplerState_MipFilter"}  # state 428
+0x8273DB90 = {name = "D3DDevice_GetSamplerState_MipFilter"}
+0x8273DD70 = {name = "D3DDevice_SetSamplerState_MipMapLodBias"}  # state 432
+0x8273DDD0 = {name = "D3DDevice_GetSamplerState_MipMapLodBias"}
+0x8273DE10 = {name = "D3DDevice_SetSamplerState_MaxMipLevel"}  # state 436
+0x8273DE80 = {name = "D3DDevice_GetSamplerState_MaxMipLevel"}
+0x8273DC50 = {name = "D3DDevice_SetSamplerState_MaxAnisotropy"}  # state 440
+0x8273DCB8 = {name = "D3DDevice_GetSamplerState_MaxAnisotropy"}
+0x8273DAB0 = {name = "D3DDevice_SetSamplerState_MagFilterZ"}  # state 444
+0x8273DB40 = {name = "D3DDevice_GetSamplerState_MagFilterZ"}
+0x8273D908 = {name = "D3DDevice_SetSamplerState_MinFilterZ"}  # state 448
+0x8273D9A0 = {name = "D3DDevice_GetSamplerState_MinFilterZ"}
+0x8273DBA8 = {name = "D3DDevice_SetSamplerState_SeparateZFilterEnable"}  # state 452
+0x8273DC40 = {name = "D3DDevice_GetSamplerState_SeparateZFilterEnable"}
+0x8273DE90 = {name = "D3DDevice_SetSamplerState_MinMipLevel"}  # state 456
+0x8273DF00 = {name = "D3DDevice_GetSamplerState_MinMipLevel"}
+0x8273E070 = {name = "D3DDevice_SetSamplerState_TrilinearThreshold"}  # state 460
+0x8273E0B0 = {name = "D3DDevice_GetSamplerState_TrilinearThreshold"}
+0x8273DCC8 = {name = "D3DDevice_SetSamplerState_AnisotropyBias"}  # state 464
+0x8273DD28 = {name = "D3DDevice_GetSamplerState_AnisotropyBias"}
+0x8273E0C8 = {name = "D3DDevice_SetSamplerState_HGradientExpBias"}  # state 468
+0x8273E108 = {name = "D3DDevice_GetSamplerState_HGradientExpBias"}
+0x8273E120 = {name = "D3DDevice_SetSamplerState_VGradientExpBias"}  # state 472
+0x8273E160 = {name = "D3DDevice_GetSamplerState_VGradientExpBias"}
+0x8273E178 = {name = "D3DDevice_SetSamplerState_WhiteBorderColorW"}  # state 476
+0x8273E1B8 = {name = "D3DDevice_GetSamplerState_WhiteBorderColorW"}
+0x8273E1D0 = {name = "D3DDevice_SetSamplerState_PointBorderEnable"}  # state 480
+0x8273E218 = {name = "D3DDevice_GetSamplerState_PointBorderEnable"}
