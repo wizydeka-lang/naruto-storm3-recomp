@@ -7,7 +7,7 @@
 // The game's draws are captured as they happen (frame_capture.h) and drawn
 // here with the precompiled shaders. The game renders a frame in passes, one
 // per render target, separated by resolves; the view draws one pass at a
-// time. By default it shows the pass with the most draws; with the view's
+// time. By default it shows the pass with the most indices; with the view's
 // window focused, Left and Right pick another and Home returns to the default.
 //
 // Debugging: NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws in the
@@ -32,6 +32,13 @@ struct VertexAttribute {
   uint32_t format;  // VkFormat
 };
 
+// A texture a draw's pixel shader samples: its sampler register and the
+// texture fetch constant bound there (host-endian words).
+struct TextureBinding {
+  uint32_t sampler;
+  uint32_t fetch[6];
+};
+
 struct Draw {
   int vertex_shader = -1;  // shader_library index
   int pixel_shader = -1;   // -1: no pixel shader (depth only)
@@ -44,7 +51,10 @@ struct Draw {
   uint32_t binding_count = 0;
   uint32_t first_attribute = 0;
   uint32_t attribute_count = 0;
-  // Offsets in FrameInfo::data of the shaders' constants, little-endian.
+  uint32_t first_texture = 0;
+  uint32_t texture_count = 0;
+  // Offsets in FrameInfo::data of the shaders' constants, little-endian. The
+  // view fills the shared constants' texture and sampler indices.
   uint32_t vertex_constants = 0;
   uint32_t pixel_constants = 0;
   uint32_t shared_constants = 0;
@@ -54,6 +64,7 @@ struct Draw {
   uint32_t blend_control = 0;  // RB_BLENDCONTROL0
   uint32_t color_mask = 0;     // RB_COLOR_MASK
   uint32_t vte_control = 0;    // PA_CL_VTE_CNTL
+  uint32_t mode_control = 0;   // PA_SU_SC_MODE_CNTL
   bool alpha_test = false;
   float viewport[6] = {};  // PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET}, interleaved
 };
@@ -72,7 +83,10 @@ struct FrameInfo {
   std::vector<Draw> captured;
   std::vector<VertexBinding> bindings;
   std::vector<VertexAttribute> attributes;
+  std::vector<TextureBinding> textures;
   std::vector<uint8_t> data;  // vertices, indices and constants
+  // Guest memory, where the view reads texture data.
+  const uint8_t* guest_base = nullptr;
 };
 
 bool Enabled();

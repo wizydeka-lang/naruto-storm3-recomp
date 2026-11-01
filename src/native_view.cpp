@@ -8,11 +8,14 @@
 // Draws use the shaders XenosRecomp converted (tools/build-shaders.py), which
 // read their constants through buffer device addresses passed as push
 // constants and their textures from bindless descriptor arrays. Textures are
-// not captured yet: every texture is a 1x1 white placeholder.
+// decoded from guest memory when a shown draw first uses them
+// (texture_decode.h) and kept while their memory is unchanged; textures the
+// view can't decode are a 1x1 white placeholder.
 
 #include "native_view.h"
 
 #include "shader_library.h"
+#include "texture_decode.h"
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -30,6 +33,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -41,12 +45,25 @@ namespace {
 constexpr uint32_t kFramesInFlight = 2;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkDeviceSize kInitialUploadSize = 32ull << 20;
+// Descriptor array sizes for 2D, 3D and cube textures; entry 0 is the
+// placeholder.
+constexpr uint32_t kHeapSizes[3] = {8192, 256, 256};
+// One sampler per address mode X and Y (3 bits each) and linear or point
+// magnification and minification.
+constexpr uint32_t kSamplerCount = 256;
+// Texture data uploaded per frame at most; the rest waits for later frames.
+constexpr size_t kTextureUploadBudget = 96u << 20;
+// Size of XenosRecomp's shared constants.
+constexpr uint32_t kSharedConstantsSize = 288;
+// Frames a texture may go unused before it is freed.
+constexpr uint64_t kTextureIdleFrames = 1800;
 
 #define NV_INSTANCE_FUNCTIONS(X)                \
   X(vkEnumeratePhysicalDevices)                 \
   X(vkGetPhysicalDeviceProperties)              \
   X(vkGetPhysicalDeviceFeatures2)               \
   X(vkGetPhysicalDeviceMemoryProperties)        \
+  X(vkGetPhysicalDeviceFormatProperties)        \
   X(vkGetPhysicalDeviceQueueFamilyProperties)   \
   X(vkGetPhysicalDeviceSurfaceSupportKHR)       \
   X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)  \
@@ -98,6 +115,7 @@ constexpr VkDeviceSize kInitialUploadSize = 32ull << 20;
   X(vkCmdEndRenderPass)              \
   X(vkCmdPipelineBarrier)            \
   X(vkCmdClearColorImage)            \
+  X(vkCmdCopyBufferToImage)          \
   X(vkCmdBindPipeline)               \
   X(vkCmdBindDescriptorSets)         \
   X(vkCmdBindVertexBuffers)          \
@@ -147,7 +165,8 @@ VkBlendFactor BlendFactor(uint32_t factor) {
   return factor < std::size(kFactors) ? kFactors[factor] : VK_BLEND_FACTOR_ONE;
 }
 
-// NARUTO_NATIVE_VIEW_DEBUG bits: 1 disables depth testing.
+// NARUTO_NATIVE_VIEW_DEBUG bits: 1 disables depth testing, 2 face culling;
+// 4 flips which winding is front-facing.
 uint32_t DebugFlags() {
   static const uint32_t flags = [] {
     const char* value = std::getenv("NARUTO_NATIVE_VIEW_DEBUG");
@@ -252,7 +271,9 @@ class View {
       }
       vkGetPhysicalDeviceFeatures2(device, &features);
       if (!features.features.shaderInt64 || !features12.bufferDeviceAddress ||
-          !features12.runtimeDescriptorArray || !features12.descriptorBindingPartiallyBound) {
+          !features12.runtimeDescriptorArray || !features12.descriptorBindingPartiallyBound ||
+          !features12.descriptorBindingSampledImageUpdateAfterBind ||
+          !features12.descriptorBindingUpdateUnusedWhilePending) {
         REXLOG_INFO("[native view] {} lacks features the shaders need", properties.deviceName);
         continue;
       }
@@ -272,6 +293,7 @@ class View {
           physical_device_ = device;
           queue_family_ = family;
           device_name_ = properties.deviceName;
+          mirror_clamp_ = features12.samplerMirrorClampToEdge;
         }
         break;
       }
@@ -290,6 +312,9 @@ class View {
     features12.bufferDeviceAddress = VK_TRUE;
     features12.runtimeDescriptorArray = VK_TRUE;
     features12.descriptorBindingPartiallyBound = VK_TRUE;
+    features12.descriptorBindingSampledImageUpdateAfterBind = VK_TRUE;
+    features12.descriptorBindingUpdateUnusedWhilePending = VK_TRUE;
+    features12.samplerMirrorClampToEdge = mirror_clamp_;
     VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     features.pNext = &features12;
     features.features.shaderInt64 = VK_TRUE;
@@ -364,7 +389,7 @@ class View {
 
   Image CreateImage(VkImageType type, VkImageViewType view_type, VkFormat format,
                     VkExtent3D extent, uint32_t layers, VkImageUsageFlags usage,
-                    VkImageAspectFlags aspect) {
+                    VkImageAspectFlags aspect, VkComponentMapping components = {}) {
     Image image;
     VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
     info.flags = view_type == VK_IMAGE_VIEW_TYPE_CUBE ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
@@ -386,9 +411,160 @@ class View {
     view_info.image = image.image;
     view_info.viewType = view_type;
     view_info.format = format;
+    view_info.components = components;
     view_info.subresourceRange = {aspect, 0, 1, 0, layers};
     vkCreateImageView(device_, &view_info, nullptr, &image.view);
     return image;
+  }
+
+  // A decoded texture; index 0 means the view couldn't decode it and draws
+  // with the placeholder.
+  struct CachedTexture {
+    Image image;
+    uint32_t heap = 0;  // 2D, 3D or cube descriptor array
+    uint32_t index = 0;
+    uint64_t fingerprint = 0;
+    uint64_t checked_frame = UINT64_MAX;
+    uint64_t last_used = 0;
+  };
+
+  // Freed once the frames in flight that might use it are done.
+  struct Retired {
+    Image image;
+    uint32_t heap;
+    uint32_t index;
+    uint64_t frame;
+  };
+
+  struct PendingUpload {
+    CachedTexture* texture;
+    texture_decode::Texture decoded;
+    VkDeviceSize offset;
+  };
+
+  void WriteTextureDescriptor(uint32_t heap, uint32_t index, VkImageView view) {
+    VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view,
+                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = descriptor_sets_[heap];
+    write.dstArrayElement = index;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.pImageInfo = &image_info;
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
+  }
+
+  // Sampler table index for a texture fetch constant: address modes X and Y,
+  // and whether magnification and minification filter linearly.
+  static uint32_t SamplerIndex(const uint32_t fetch[6]) {
+    uint32_t mag = (fetch[3] >> 19) & 3, min = (fetch[3] >> 21) & 3;
+    return ((fetch[0] >> 10) & 7) | (((fetch[0] >> 13) & 7) << 3) | (uint32_t(mag != 0) << 6) |
+           (uint32_t(min != 0) << 7);
+  }
+
+  void Retire(CachedTexture& texture) {
+    if (texture.index) {
+      retired_.push_back({texture.image, texture.heap, texture.index, frames_total_});
+    }
+    texture = {};
+  }
+
+  void FreeRetired() {
+    auto done = [&](const Retired& r) { return r.frame + kFramesInFlight <= frames_total_; };
+    for (Retired& r : retired_) {
+      if (done(r)) {
+        DestroyImage(r.image);
+        free_indices_[r.heap].push_back(r.index);
+      }
+    }
+    std::erase_if(retired_, done);
+    if (frames_total_ % 300 == 0) {
+      for (auto it = textures_.begin(); it != textures_.end();) {
+        if (it->second.last_used + kTextureIdleFrames < frames_total_) {
+          Retire(it->second);
+          it = textures_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+  }
+
+  // The cache entry for a bound texture, decoded into uploads if it is new or
+  // its memory changed; nullptr if it has to wait for a later frame.
+  const CachedTexture* Texture(const FrameInfo& frame, const uint32_t fetch[6],
+                               std::vector<PendingUpload>& uploads, size_t& budget) {
+    // The fields that decide the image: pitch and tiling, format, endian and
+    // address, size, swizzle, dimension.
+    std::array<uint32_t, 5> key = {fetch[0] & 0xFFC00000, fetch[1], fetch[2],
+                                   fetch[3] & 0x1FFE, fetch[5] & 0x600};
+    auto it = textures_.find(key);
+    if (it != textures_.end()) {
+      CachedTexture& texture = it->second;
+      texture.last_used = frames_total_;
+      if (texture.checked_frame == frames_total_) {
+        return &texture;
+      }
+      texture.checked_frame = frames_total_;
+      uint64_t fingerprint = texture_decode::Fingerprint(frame.guest_base, fetch);
+      if (fingerprint == texture.fingerprint) {
+        return &texture;
+      }
+      Retire(texture);
+      textures_.erase(it);
+    }
+
+    CachedTexture entry;
+    entry.last_used = entry.checked_frame = frames_total_;
+    entry.fingerprint = texture_decode::Fingerprint(frame.guest_base, fetch);
+    texture_decode::Texture decoded;
+    const char* reason = nullptr;
+    if (!texture_decode::Describe(fetch, decoded, &reason)) {
+      WarnOnce(reason, fetch[1] & 0x3F);
+      textures_failed_++;
+      return &textures_.emplace(key, entry).first->second;
+    }
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(physical_device_, VkFormat(decoded.format), &properties);
+    if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
+      WarnOnce("texture format not supported by the GPU", decoded.format);
+      textures_failed_++;
+      return &textures_.emplace(key, entry).first->second;
+    }
+    entry.heap = uint32_t(decoded.dimension);
+    if (!budget || free_indices_[entry.heap].empty()) {
+      return nullptr;
+    }
+    texture_decode::Decode(frame.guest_base, fetch, decoded);
+    if (const char* dir = std::getenv("NARUTO_NATIVE_VIEW_TEXTURES")) {
+      texture_decode::WritePreview(
+          decoded, fmt::format("{}/{:08x}_{:08x}.ppm", dir, fetch[1], fetch[2]).c_str());
+    }
+    budget = decoded.data.size() >= budget ? 0 : budget - decoded.data.size();
+
+    static constexpr VkImageViewType kViewTypes[3] = {
+        VK_IMAGE_VIEW_TYPE_2D, VK_IMAGE_VIEW_TYPE_3D, VK_IMAGE_VIEW_TYPE_CUBE};
+    VkComponentMapping components{
+        VkComponentSwizzle(decoded.swizzle[0]), VkComponentSwizzle(decoded.swizzle[1]),
+        VkComponentSwizzle(decoded.swizzle[2]), VkComponentSwizzle(decoded.swizzle[3])};
+    entry.image = CreateImage(
+        decoded.dimension == texture_decode::Dimension::k3D ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
+        kViewTypes[entry.heap], VkFormat(decoded.format),
+        {decoded.width, decoded.height, decoded.depth}, decoded.layers,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, VK_IMAGE_ASPECT_COLOR_BIT,
+        components);
+    entry.index = free_indices_[entry.heap].back();
+    free_indices_[entry.heap].pop_back();
+    WriteTextureDescriptor(entry.heap, entry.index, entry.image.view);
+    CachedTexture* cached = &textures_.emplace(key, entry).first->second;
+    uploads.push_back({cached, std::move(decoded), 0});
+    return cached;
+  }
+
+  void WarnOnce(const char* reason, uint32_t value) {
+    if (warned_.insert({reason, value}).second) {
+      REXLOG_WARN("[native view] texture not drawn: {} ({})", reason, value);
+    }
   }
 
   void DestroyImage(Image& image) {
@@ -445,33 +621,59 @@ class View {
     vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE);
     vkQueueWaitIdle(queue_);
 
-    VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-    sampler_info.magFilter = sampler_info.minFilter = VK_FILTER_LINEAR;
-    sampler_info.addressModeU = sampler_info.addressModeV = sampler_info.addressModeW =
-        VK_SAMPLER_ADDRESS_MODE_REPEAT;
-    sampler_info.maxLod = VK_LOD_CLAMP_NONE;
-    vkCreateSampler(device_, &sampler_info, nullptr, &sampler_);
+    // Samplers for every address mode pair and filter (SamplerIndex).
+    static constexpr VkSamplerAddressMode kModes[8] = {
+        VK_SAMPLER_ADDRESS_MODE_REPEAT,          VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,   VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT,
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER, VK_SAMPLER_ADDRESS_MODE_MIRRORED_REPEAT};
+    for (uint32_t i = 0; i < kSamplerCount; ++i) {
+      auto mode = [&](uint32_t xenos) {
+        VkSamplerAddressMode m = kModes[xenos];
+        return m == VK_SAMPLER_ADDRESS_MODE_MIRROR_CLAMP_TO_EDGE && !mirror_clamp_
+                   ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE
+                   : m;
+      };
+      VkSamplerCreateInfo sampler_info{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+      sampler_info.addressModeU = mode(i & 7);
+      sampler_info.addressModeV = mode((i >> 3) & 7);
+      sampler_info.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+      sampler_info.magFilter = (i >> 6) & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+      sampler_info.minFilter = (i >> 7) & 1 ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
+      sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK;
+      sampler_info.maxLod = VK_LOD_CLAMP_NONE;
+      vkCreateSampler(device_, &sampler_info, nullptr, &samplers_[i]);
+    }
 
     // Sets 0-2: 2D, 3D and cube textures; set 3: samplers (shader_common.h).
-    VkDescriptorBindingFlags binding_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
-    VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
-    flags_info.bindingCount = 1;
-    flags_info.pBindingFlags = &binding_flags;
-    VkDescriptorPoolSize pool_sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3},
-                                         {VK_DESCRIPTOR_TYPE_SAMPLER, 1}};
+    // Texture entries are written while other frames are in flight.
+    VkDescriptorBindingFlags texture_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT |
+                                             VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
+                                             VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
+    VkDescriptorBindingFlags sampler_flags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT;
+    VkDescriptorPoolSize pool_sizes[] = {
+        {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kHeapSizes[0] + kHeapSizes[1] + kHeapSizes[2]},
+        {VK_DESCRIPTOR_TYPE_SAMPLER, kSamplerCount}};
     VkDescriptorPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool_info.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     pool_info.maxSets = 4;
     pool_info.poolSizeCount = 2;
     pool_info.pPoolSizes = pool_sizes;
     vkCreateDescriptorPool(device_, &pool_info, nullptr, &descriptor_pool_);
     for (uint32_t set = 0; set < 4; ++set) {
-      VkDescriptorType type = set < 3 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                      : VK_DESCRIPTOR_TYPE_SAMPLER;
-      VkDescriptorSetLayoutBinding binding{0, type, 1, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
+      bool textures = set < 3;
+      VkDescriptorSetLayoutBindingFlagsCreateInfo flags_info{
+          VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
+      flags_info.bindingCount = 1;
+      flags_info.pBindingFlags = textures ? &texture_flags : &sampler_flags;
+      VkDescriptorSetLayoutBinding binding{
+          0, textures ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLER,
+          textures ? kHeapSizes[set] : kSamplerCount, VK_SHADER_STAGE_ALL_GRAPHICS, nullptr};
       VkDescriptorSetLayoutCreateInfo layout_info{
           VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
       layout_info.pNext = &flags_info;
+      layout_info.flags =
+          textures ? VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT : 0;
       layout_info.bindingCount = 1;
       layout_info.pBindings = &binding;
       vkCreateDescriptorSetLayout(device_, &layout_info, nullptr, &set_layouts_[set]);
@@ -483,23 +685,22 @@ class View {
     if (vkAllocateDescriptorSets(device_, &set_info, descriptor_sets_.data()) != VK_SUCCESS) {
       return false;
     }
-    std::array<VkDescriptorImageInfo, 4> image_infos{};
-    std::array<VkWriteDescriptorSet, 4> writes{};
-    for (uint32_t set = 0; set < 4; ++set) {
-      image_infos[set].imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      if (set < 3) {
-        image_infos[set].imageView = placeholders_[set].view;
-      } else {
-        image_infos[set].sampler = sampler_;
+    for (uint32_t heap = 0; heap < 3; ++heap) {
+      WriteTextureDescriptor(heap, 0, placeholders_[heap].view);
+      for (uint32_t index = kHeapSizes[heap] - 1; index > 0; --index) {
+        free_indices_[heap].push_back(index);
       }
-      writes[set] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-      writes[set].dstSet = descriptor_sets_[set];
-      writes[set].descriptorCount = 1;
-      writes[set].descriptorType = set < 3 ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE
-                                           : VK_DESCRIPTOR_TYPE_SAMPLER;
-      writes[set].pImageInfo = &image_infos[set];
     }
-    vkUpdateDescriptorSets(device_, 4, writes.data(), 0, nullptr);
+    std::vector<VkDescriptorImageInfo> sampler_infos(kSamplerCount);
+    for (uint32_t i = 0; i < kSamplerCount; ++i) {
+      sampler_infos[i].sampler = samplers_[i];
+    }
+    VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+    write.dstSet = descriptor_sets_[3];
+    write.descriptorCount = kSamplerCount;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;
+    write.pImageInfo = sampler_infos.data();
+    vkUpdateDescriptorSets(device_, 1, &write, 0, nullptr);
 
     VkPushConstantRange push{VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                              sizeof(PushConstants)};
@@ -704,7 +905,7 @@ class View {
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = new_size;
     info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
-                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     vkCreateBuffer(device_, &info, nullptr, &upload.buffer);
     VkMemoryRequirements requirements;
     vkGetBufferMemoryRequirements(device_, upload.buffer, &requirements);
@@ -746,9 +947,10 @@ class View {
   VkPipeline Pipeline(const FrameInfo& frame, const Draw& draw) {
     uint32_t depth_state = draw.depth_control & 0x76;  // test, write, function
     uint32_t color_mask = draw.color_mask & 0xF;
+    uint32_t cull_state = draw.mode_control & 7;  // cull front, cull back, clockwise front
     std::vector<uint32_t> key = {uint32_t(draw.vertex_shader), uint32_t(draw.pixel_shader),
                                  draw.topology, draw.primitive_restart, draw.alpha_test,
-                                 depth_state, draw.blend_control, color_mask};
+                                 depth_state, draw.blend_control, color_mask, cull_state};
     for (uint32_t i = 0; i < draw.binding_count; ++i) {
       key.push_back(frame.bindings[draw.first_binding + i].stride);
     }
@@ -806,8 +1008,18 @@ class View {
     VkPipelineRasterizationStateCreateInfo raster{
         VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
     raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    // PA_SU_SC_MODE_CNTL: bit 0 culls front faces, bit 1 back faces; bit 2
+    // makes clockwise triangles front-facing.
+    raster.cullMode = ((cull_state & 1) ? VK_CULL_MODE_FRONT_BIT : 0) |
+                      ((cull_state & 2) ? VK_CULL_MODE_BACK_BIT : 0);
+    if (DebugFlags() & 2) {
+      raster.cullMode = VK_CULL_MODE_NONE;
+    }
+    bool clockwise = (cull_state >> 2) & 1;
+    if (DebugFlags() & 4) {
+      clockwise = !clockwise;
+    }
+    raster.frontFace = clockwise ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE;
     raster.lineWidth = 1.0f;
     VkPipelineMultisampleStateCreateInfo multisample{
         VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
@@ -964,7 +1176,7 @@ class View {
                 info.clear_color[2], info.clear_color[3], info.clear_depth);
     uint32_t n = 0;
     for (const Draw& d : frame.captured) {
-      if (d.pass != pass || n++ >= 6) {
+      if (d.pass != pass || n++ >= 200) {
         continue;
       }
       const auto& shaders = shader_library::Shaders();
@@ -991,6 +1203,12 @@ class View {
                     a.location, element.usage, element.usage_index, a.binding, b.stride, a.offset,
                     a.format, values);
       }
+      for (uint32_t t = 0; t < d.texture_count; ++t) {
+        const TextureBinding& b = frame.textures[d.first_texture + t];
+        REXLOG_INFO("[native view]   sampler {}: fetch {:08x} {:08x} {:08x} {:08x} {:08x} {:08x}",
+                    b.sampler, b.fetch[0], b.fetch[1], b.fetch[2], b.fetch[3], b.fetch[4],
+                    b.fetch[5]);
+      }
       std::string constants;
       for (uint32_t c = 0; c < 8 * 4; ++c) {
         constants += fmt::format(" {:.3g}", f32(d.vertex_constants + c * 4));
@@ -1004,14 +1222,17 @@ class View {
       return;
     }
 
-    // The busiest pass is normally the 3D scene.
+    // The pass with the most indices is normally the 3D scene; HUD passes
+    // can have more draws.
     uint32_t pass_count = uint32_t(frame.passes.size());
     std::vector<uint32_t> pass_draws(pass_count);
+    std::vector<uint64_t> pass_indices(pass_count);
     for (const Draw& draw : frame.captured) {
       pass_draws[std::min(draw.pass, pass_count - 1)]++;
+      pass_indices[std::min(draw.pass, pass_count - 1)] += draw.index_count;
     }
-    uint32_t busiest = uint32_t(std::max_element(pass_draws.begin(), pass_draws.end()) -
-                                pass_draws.begin());
+    uint32_t busiest = uint32_t(std::max_element(pass_indices.begin(), pass_indices.end()) -
+                                pass_indices.begin());
     HandleKeys();
     uint32_t pass = uint32_t(((int64_t(busiest) + pass_offset_) % pass_count + pass_count) %
                              pass_count);
@@ -1024,8 +1245,40 @@ class View {
 
     VkFence fence = frame_done_[frame_index_];
     vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+    FreeRetired();
+
+    // Shared constants for each shown draw, with its textures' descriptor
+    // and sampler indices (XenosRecomp's layout: 2D, 3D and cube texture
+    // indices at 0, 64 and 128, sampler indices at 192, four bytes per
+    // sampler register).
+    std::vector<PendingUpload> texture_uploads;
+    size_t budget = kTextureUploadBudget;
+    shared_.clear();
+    for (const Draw& draw : frame.captured) {
+      if (draw.pass != pass) {
+        continue;
+      }
+      size_t at = shared_.size();
+      shared_.insert(shared_.end(), frame.data.begin() + draw.shared_constants,
+                     frame.data.begin() + draw.shared_constants + kSharedConstantsSize);
+      for (uint32_t t = 0; t < draw.texture_count; ++t) {
+        const TextureBinding& binding = frame.textures[draw.first_texture + t];
+        const CachedTexture* texture = Texture(frame, binding.fetch, texture_uploads, budget);
+        uint32_t heap = texture ? texture->heap : 0, index = texture ? texture->index : 0;
+        uint32_t sampler = SamplerIndex(binding.fetch);
+        std::memcpy(&shared_[at + heap * 64 + binding.sampler * 4], &index, 4);
+        std::memcpy(&shared_[at + 192 + binding.sampler * 4], &sampler, 4);
+      }
+    }
+    VkDeviceSize shared_offset = (frame.data.size() + 15) & ~VkDeviceSize(15);
+    VkDeviceSize total = shared_offset + shared_.size();
+    for (PendingUpload& pending : texture_uploads) {
+      pending.offset = (total + 15) & ~VkDeviceSize(15);
+      total = pending.offset + pending.decoded.data.size();
+      textures_uploaded_bytes_ += pending.decoded.data.size();
+    }
     Upload& upload = uploads_[frame_index_];
-    if (!ReserveUpload(upload, std::max<VkDeviceSize>(frame.data.size(), 1))) {
+    if (!ReserveUpload(upload, std::max<VkDeviceSize>(total, 1))) {
       REXLOG_ERROR("[native view] upload buffer allocation failed");
       return;
     }
@@ -1042,12 +1295,44 @@ class View {
     }
     vkResetFences(device_, 1, &fence);
     std::memcpy(upload.mapped, frame.data.data(), frame.data.size());
+    std::memcpy(upload.mapped + shared_offset, shared_.data(), shared_.size());
+    for (const PendingUpload& pending : texture_uploads) {
+      std::memcpy(upload.mapped + pending.offset, pending.decoded.data.data(),
+                  pending.decoded.data.size());
+    }
 
     VkCommandBuffer cmd = command_buffers_[frame_index_];
     vkResetCommandBuffer(cmd, 0);
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
+    for (const PendingUpload& pending : texture_uploads) {
+      const texture_decode::Texture& t = pending.decoded;
+      VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, t.layers};
+      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = pending.texture->image.image;
+      barrier.subresourceRange = range;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &barrier);
+      VkBufferImageCopy copy{};
+      copy.bufferOffset = pending.offset;
+      copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, t.layers};
+      copy.imageExtent = {t.width, t.height, t.depth};
+      vkCmdCopyBufferToImage(cmd, upload.buffer, barrier.image,
+                             VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+      barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+      barrier.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
     const PassInfo& pass_info = frame.passes[pass];
     VkClearValue clears[2] = {};
     if (pass_info.has_clear_color) {
@@ -1070,8 +1355,14 @@ class View {
     vkCmdSetScissor(cmd, 0, 1, &scissor);
     VkPipeline bound = VK_NULL_HANDLE;
     uint32_t drawn = 0;
+    VkDeviceSize draw_shared = shared_offset;
     for (const Draw& draw : frame.captured) {
-      if (draw.pass != pass || !draw.index_count) {
+      if (draw.pass != pass) {
+        continue;
+      }
+      VkDeviceAddress shared_address = upload.address + draw_shared;
+      draw_shared += kSharedConstantsSize;
+      if (!draw.index_count) {
         continue;
       }
       VkViewport viewport = Viewport(draw);
@@ -1099,7 +1390,7 @@ class View {
       vkCmdBindIndexBuffer(cmd, upload.buffer, draw.index_offset, VK_INDEX_TYPE_UINT32);
       PushConstants push{upload.address + draw.vertex_constants,
                          upload.address + draw.pixel_constants,
-                         upload.address + draw.shared_constants};
+                         shared_address};
       vkCmdPushConstants(cmd, pipeline_layout_,
                          VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                          sizeof(push), &push);
@@ -1141,9 +1432,12 @@ class View {
     if (seconds >= 10.0) {
       REXLOG_INFO(
           "[native view] {:.1f} fps, {:.1f} draws/frame in the shown pass, {} passes, "
-          "{:.1f} MB captured/frame, {} pipelines",
+          "{:.1f} MB captured/frame, {} pipelines, {} textures ({} not decodable), "
+          "{:.1f} MB of textures uploaded",
           frames_presented_ / seconds, double(draws_drawn_) / std::max<uint64_t>(frames_presented_, 1),
-          pass_count, frame.data.size() / 1048576.0, pipelines_.size());
+          pass_count, frame.data.size() / 1048576.0, pipelines_.size(), textures_.size(),
+          textures_failed_, textures_uploaded_bytes_ / 1048576.0);
+      textures_uploaded_bytes_ = 0;
       frames_presented_ = 0;
       draws_drawn_ = 0;
       log_start_ = now;
@@ -1195,7 +1489,15 @@ class View {
   uint32_t frame_index_ = 0;
 
   std::array<Image, 3> placeholders_{};
-  VkSampler sampler_ = VK_NULL_HANDLE;
+  std::array<VkSampler, kSamplerCount> samplers_{};
+  bool mirror_clamp_ = false;
+  std::map<std::array<uint32_t, 5>, CachedTexture> textures_;
+  std::array<std::vector<uint32_t>, 3> free_indices_;
+  std::vector<Retired> retired_;
+  uint64_t textures_failed_ = 0;
+  uint64_t textures_uploaded_bytes_ = 0;
+  std::vector<uint8_t> shared_;
+  std::set<std::pair<std::string, uint32_t>> warned_;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSetLayout, 4> set_layouts_{};
   std::array<VkDescriptorSet, 4> descriptor_sets_{};

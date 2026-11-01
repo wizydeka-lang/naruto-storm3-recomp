@@ -76,6 +76,20 @@ void ScanLibrary(const std::filesystem::path& path, const std::string& name) {
         }
       }
     }
+    // The D3DX constant table (after its size word) lists the sampler
+    // registers: count at +12, info array offset at +16, 20-byte entries of
+    // name, register set (3: sampler), register index.
+    uint32_t table = i + Load32(data, i + 16) + 4;
+    if (table + 28 <= i + virtual_size) {
+      uint32_t count = Load32(data, table + 12);
+      size_t info = table + Load32(data, table + 16);
+      for (uint32_t c = 0; c < count && info + (c + 1) * 20 <= i + virtual_size; ++c) {
+        uint32_t set_and_index = Load32(data, info + c * 20 + 4);
+        if ((set_and_index >> 16) == 3) {
+          shader.samplers.push_back(uint8_t(set_and_index & 0xFF));
+        }
+      }
+    }
     bool duplicate = std::any_of(g_shaders.begin(), g_shaders.end(), [&](const Shader& s) {
       return s.stage == shader.stage && s.microcode == shader.microcode;
     });

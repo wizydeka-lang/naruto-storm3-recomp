@@ -32,6 +32,7 @@ struct Shader {
   uint32_t offset;      // container offset in the library file
   std::vector<uint32_t> microcode;  // host-endian instruction words
   std::vector<VertexElement> vertex_elements;
+  std::vector<uint8_t> samplers;  // sampler registers, which are fetch constant slots
   std::vector<uint32_t> spirv;  // from the shader cache; empty if not built
 };
 

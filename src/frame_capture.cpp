@@ -27,6 +27,9 @@ constexpr uint32_t kDeviceFetchConstants = 0x480;
 constexpr uint32_t kDeviceVertexConstants = 0x780;
 constexpr uint32_t kDevicePixelConstants = 0x1780;
 constexpr uint32_t kDeviceIndexBuffer = 0x320C;
+// Boolean constants (registers 0x4900-0x4907): vertex shader b0-b127 in the
+// first four words, pixel shader b0-b127 in the next four.
+constexpr uint32_t kDeviceBooleans = 0x2780;
 constexpr uint32_t kConstantsSize = 256 * 16;
 
 // Register shadows the draw functions flush to the GPU: registers
@@ -39,6 +42,7 @@ constexpr uint32_t kRegViewport = 0x2908;      // PA_CL_VPORT_XSCALE (0x210F) on
 constexpr uint32_t kRegDepthControl = 0x2934;  // RB_DEPTHCONTROL (0x2200)
 constexpr uint32_t kRegBlendControl = 0x2938;  // RB_BLENDCONTROL0 (0x2201)
 constexpr uint32_t kRegColorControl = 0x293C;  // RB_COLORCONTROL (0x2202)
+constexpr uint32_t kRegScModeControl = 0x2948;  // PA_SU_SC_MODE_CNTL (0x2205)
 constexpr uint32_t kRegVteControl = 0x294C;    // PA_CL_VTE_CNTL (0x2206)
 constexpr uint32_t kRegModeControl = 0x2954;   // RB_MODECONTROL (0x2208)
 constexpr uint32_t kEdramModeDepthOnly = 5;
@@ -207,12 +211,20 @@ uint32_t CopyConstants(const uint8_t* source, size_t size, ConstantCopy& copy,
   return copy.offset;
 }
 
+// Vertex formats with 16-bit components: after the 32-bit swap, the first
+// component in memory (X) is in the high half of each word, where Vulkan
+// expects the second.
+bool HasHalfComponents(uint32_t xenos_format) {
+  return xenos_format == 25 || xenos_format == 26 || xenos_format == 31 || xenos_format == 32;
+}
+
 struct Fetch {
   uint32_t location;
   uint32_t fetch_constant;
   uint32_t stride;  // bytes
   int32_t offset;   // bytes
   VkFormat format;
+  uint32_t xenos_format;
 };
 
 }  // namespace
@@ -345,7 +357,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       WarnOnce("vertex fetch offset", uint32_t(offset));
       return false;
     }
-    fetches.push_back({element, full_constant, full_stride, offset, format});
+    fetches.push_back({element, full_constant, full_stride, offset, format, xenos_format});
   }
 
   bool new_frame = frame.captured.empty();
@@ -384,6 +396,23 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       frame.bindings.push_back({offset, fetch.stride});
     }
     frame.attributes.push_back({fetch.location, it->second, uint32_t(fetch.offset), fetch.format});
+    if (HasHalfComponents(fetch.xenos_format)) {
+      const native_view::VertexBinding& binding = frame.bindings[draw.first_binding + it->second];
+      size_t end = frame.data.size();
+      if (draw.first_binding + it->second + 1 < frame.bindings.size()) {
+        end = frame.bindings[draw.first_binding + it->second + 1].data_offset;
+      }
+      uint32_t words = (fetch.xenos_format == 26 || fetch.xenos_format == 32) ? 2 : 1;
+      for (size_t at = binding.data_offset + fetch.offset; at + words * 4 <= end;
+           at += binding.stride ? binding.stride : end) {
+        for (uint32_t w = 0; w < words; ++w) {
+          uint32_t value;
+          std::memcpy(&value, frame.data.data() + at + w * 4, 4);
+          value = std::rotl(value, 16);
+          std::memcpy(frame.data.data() + at + w * 4, &value, 4);
+        }
+      }
+    }
   }
   draw.binding_count = uint32_t(frame.bindings.size()) - draw.first_binding;
   draw.attribute_count = uint32_t(frame.attributes.size()) - draw.first_attribute;
@@ -421,6 +450,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   draw.blend_control = reg(kRegBlendControl);
   draw.color_mask = reg(kRegColorMask);
   draw.vte_control = reg(kRegVteControl);
+  draw.mode_control = reg(kRegScModeControl);
   if ((reg(kRegModeControl) & 7) == kEdramModeDepthOnly || call.pixel_shader_index < 0) {
     draw.color_mask = 0;
   }
@@ -429,19 +459,42 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   }
 
   // Shared constants (XenosRecomp's layout): texture and sampler indices,
-  // all 0 (the view's placeholder texture) for now, then booleans at 256
-  // and the alpha test threshold at 272. Stored guest-endian so the copy
-  // swaps them like the other constants.
+  // filled in by the view, then booleans at 256 (vertex shader b0-b15 in the
+  // low half, pixel shader b0-b15 in the high half) and the alpha test
+  // threshold at 272. Stored guest-endian so the copy swaps them like the
+  // other constants.
   uint32_t color_control = reg(kRegColorControl);
   uint32_t alpha_function = color_control & 7;
   draw.alpha_test = (color_control & 8) && (alpha_function == 4 || alpha_function == 6);
   uint8_t shared[288] = {};
+  uint32_t booleans = std::byteswap((reg(kDeviceBooleans) & 0xFFFF) |
+                                    (reg(kDeviceBooleans + 16) << 16));
+  std::memcpy(shared + 256, &booleans, 4);
   if (draw.alpha_test) {
     uint32_t threshold = std::byteswap(reg(kRegAlphaRef));
     std::memcpy(shared + 272, &threshold, 4);
   }
   draw.shared_constants = CopyConstants(shared, sizeof(shared), shared_constants, frame.data,
                                         new_frame);
+
+  // Texture fetch constants (type 2) for the pixel shader's samplers.
+  draw.first_texture = uint32_t(frame.textures.size());
+  if (call.pixel_shader_index >= 0) {
+    for (uint8_t sampler : shaders[call.pixel_shader_index].samplers) {
+      if (sampler >= 16) {
+        continue;
+      }
+      native_view::TextureBinding binding{sampler, {}};
+      for (int w = 0; w < 6; ++w) {
+        binding.fetch[w] = Load32(base, call.device + kDeviceFetchConstants + sampler * 24 + 4 * w);
+      }
+      if ((binding.fetch[0] & 3) == 2) {
+        frame.textures.push_back(binding);
+      }
+    }
+  }
+  draw.texture_count = uint32_t(frame.textures.size()) - draw.first_texture;
+  frame.guest_base = base;
 
   frame.captured.push_back(draw);
   return true;

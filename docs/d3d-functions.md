@@ -77,6 +77,17 @@ bound microcode describes the current vertex layout. A pixel shader's info
 block is at `shader + *(shader + 64)`; its microcode is at
 `*(shader + 24) + *(info + 40)`, `*(info + 44)` bytes long.
 
+## Textures and boolean constants
+
+Pixel shader sampler register *n* uses texture fetch constant slot *n* (device
+`+0x480 + 24n`, six words in the Xenos layout). Boolean constants (registers
+`0x4900`–`0x4907`) are shadowed at `+0x2780`: vertex shader `b0`–`b127` in the
+first four words, pixel shader `b0`–`b127` in the next four.
+
+Vertex buffers use the 8-in-32 endian swap. For formats with 16-bit components
+(`16_16`, `16_16_FLOAT`...), the component first in memory (X) then sits in
+the high half of each word, so a host renderer has to swap the halves.
+
 ## Resolve flags
 
 The game resolves with flags `0x0`, `0x1` and `0x14` (render target 0, 1,

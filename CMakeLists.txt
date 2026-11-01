@@ -37,6 +37,7 @@ set(NARUTO_SOURCES
     src/render_probe.cpp
     src/native_view.cpp
     src/frame_capture.cpp
+    src/texture_decode.cpp
     src/shader_library.cpp
 )
 
