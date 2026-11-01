@@ -4,12 +4,17 @@
 // (config/naruto_d3d_funcs.toml), records what each frame draws and which
 // device state it uses, then calls the original function, so the Xenia GPU
 // backend still renders. With NARUTO_RENDER_PROBE=1 in the environment, a
-// summary is logged every 10 seconds; otherwise the hooks only pass through.
+// summary is logged every 10 seconds; with NARUTO_NATIVE_VIEW=1, each frame is
+// handed to the native view (native_view.h). Otherwise the hooks only pass
+// through.
 
 #include <rex/hook.h>
 #include <rex/logging.h>
 #include <rex/memory/utils.h>
 
+#include "native_view.h"
+
+#include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -35,19 +40,23 @@ struct FrameStats {
   uint64_t vertices = 0;
   uint64_t clears = 0;
   uint64_t resolves = 0;
+  uint64_t resolves_with_clear_color = 0;
   uint64_t texture_binds = 0;
+  std::map<uint32_t, uint64_t> resolve_flags;
   std::map<uint32_t, uint64_t> primitive_types;
   std::set<uint32_t> vertex_shaders;
   std::set<uint32_t> pixel_shaders;
 };
 
-const bool g_enabled = [] {
+const bool g_logging = [] {
   const char* value = std::getenv("NARUTO_RENDER_PROBE");
   return value && *value && *value != '0';
 }();
+const bool g_enabled = g_logging || native_view::Enabled();
 
 std::mutex g_mutex;
 FrameStats g_stats;
+native_view::FrameInfo g_frame;
 std::set<uint32_t> g_all_vertex_shaders;
 std::set<uint32_t> g_all_pixel_shaders;
 auto g_window_start = std::chrono::steady_clock::now();
@@ -57,6 +66,7 @@ void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, b
   uint32_t vs = LoadGuest32(base, device + kDeviceVertexShader);
   uint32_t ps = LoadGuest32(base, device + kDevicePixelShader);
   std::lock_guard<std::mutex> lock(g_mutex);
+  g_frame.draws++;
   (indexed ? g_stats.indexed_draws : g_stats.vertex_draws)++;
   (indexed ? g_stats.indices : g_stats.vertices) += count;
   g_stats.primitive_types[primitive_type]++;
@@ -78,14 +88,18 @@ void LogWindow() {
   for (auto [type, n] : s.primitive_types) {
     primitives += fmt::format(" {}:{:.1f}", type, n / frames);
   }
+  std::string resolve_flags;
+  for (auto [flags, n] : s.resolve_flags) {
+    resolve_flags += fmt::format(" {:#x}:{:.1f}", flags, n / frames);
+  }
   REXLOG_INFO(
       "[render probe] {:.1f} fps | draws/frame {:.1f} indexed + {:.1f} non-indexed "
       "({:.0f} indices, {:.0f} vertices) | primitive types/frame{} | clears/frame {:.2f} "
-      "resolves/frame {:.2f} texture binds/frame {:.1f} | shaders this window {} VS {} PS, "
-      "all {} VS {} PS",
+      "resolves/frame {:.2f} (with clear color {:.2f}; flags{}) texture binds/frame {:.1f} | "
+      "shaders this window {} VS {} PS, all {} VS {} PS",
       s.frames / seconds, s.indexed_draws / frames, s.vertex_draws / frames, s.indices / frames,
       s.vertices / frames, primitives, s.clears / frames, s.resolves / frames,
-      s.texture_binds / frames, s.vertex_shaders.size(), s.pixel_shaders.size(),
+      s.resolves_with_clear_color / frames, resolve_flags, s.texture_binds / frames, s.vertex_shaders.size(), s.pixel_shaders.size(),
       g_all_vertex_shaders.size(), g_all_pixel_shaders.size());
   g_stats = {};
   g_window_start = now;
@@ -114,9 +128,17 @@ REX_FUNC(__imp__sub_8274D2C8);
 // D3DDevice_Swap
 REX_HOOK_RAW(sub_82746748) {
   if (g_enabled) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    g_stats.frames++;
-    LogWindow();
+    native_view::FrameInfo frame;
+    {
+      std::lock_guard<std::mutex> lock(g_mutex);
+      g_stats.frames++;
+      if (g_logging) {
+        LogWindow();
+      }
+      frame = g_frame;
+      g_frame = {};
+    }
+    native_view::SubmitFrame(frame);
   }
   __imp__sub_82746748(ctx, base);
 }
@@ -143,9 +165,23 @@ REX_HOOK_RAW(sub_8275D010) {
   __imp__sub_8275D010(ctx, base);
 }
 
-// D3DDevice_Resolve
+// D3DDevice_Resolve(device, flags, source rect, destination texture,
+// destination point, level, slice or face, clear color, clear Z (f1), ...)
 REX_HOOK_RAW(sub_8275BD48) {
-  Count(&FrameStats::resolves);
+  if (g_enabled) {
+    uint32_t flags = ctx.r4.u32;
+    uint32_t clear_color = ctx.r10.u32;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_stats.resolves++;
+    g_stats.resolve_flags[flags]++;
+    if (clear_color) {
+      g_stats.resolves_with_clear_color++;
+      g_frame.has_clear_color = true;
+      for (int i = 0; i < 4; ++i) {
+        g_frame.clear_color[i] = std::bit_cast<float>(LoadGuest32(base, clear_color + 4 * i));
+      }
+    }
+  }
   __imp__sub_8275BD48(ctx, base);
 }
 
