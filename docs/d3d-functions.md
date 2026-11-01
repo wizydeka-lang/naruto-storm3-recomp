@@ -88,12 +88,32 @@ Vertex buffers use the 8-in-32 endian swap. For formats with 16-bit components
 (`16_16`, `16_16_FLOAT`...), the component first in memory (X) then sits in
 the high half of each word, so a host renderer has to swap the halves.
 
-## Resolve flags
+## Resolve and present
+
+`D3DDevice_Resolve` (`sub_8275BD48`) wraps `sub_8275ABF0`. Its arguments are
+the device, flags, an optional source `D3DRECT`, the destination texture
+object, an optional destination `D3DPOINT`, the mip level, the slice, the
+clear color, and the clear depth in `f1`. Flag bits 0–2 select render target
+0–3, or 4 for the depth buffer; `0x100` clears the render target afterwards
+(`sub_8275A8B8`) and `0x200` the depth buffer (`sub_8275A320`). A texture
+object's fetch constant is at `+0x1C` (after the `D3DResource` header and
+`MipFlush`), and the resolve reads the destination's size and format from it.
 
 The game resolves with flags `0x0`, `0x1` and `0x14` (render target 0, 1,
-and the depth buffer). None include `D3DRESOLVE_CLEARRENDERTARGET` (`0x100`)
-or `D3DRESOLVE_CLEARDEPTHSTENCIL` (`0x200`), so the clear color and depth
-arguments are not used, and the game never calls `Clear`.
+and the depth buffer) and never clears: no resolve sets `0x100` or `0x200`,
+`Clear` is never called, and passes start drawing with depth testing on. Only
+`sub_8274B330`, D3D's per-tile resolve for predicated tiling, adds `0x200`,
+and the engine doesn't reach it in normal play. The native view clears each
+depth buffer to 1.0 the first time a frame uses it.
+
+`D3DDevice_Swap` (`sub_82746748`) takes the front buffer texture as its second
+argument and copies its fetch constant; the game resolves its final image
+into that texture (8888, 1280×640) just before.
+
+Render targets are configured by `RB_SURFACE_INFO` (pitch in bits 0–13),
+`RB_COLOR_INFO`/`RB_COLOR1_INFO`–`RB_COLOR3_INFO` (EDRAM base in bits 0–11,
+format in bits 16–19) and `RB_DEPTH_INFO`, all in the `0x2000` register
+shadow block.
 
 ## Resources are not created through Direct3D
 

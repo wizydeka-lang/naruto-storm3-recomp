@@ -36,6 +36,13 @@ constexpr uint32_t kConstantsSize = 256 * 16;
 // 0x2000-0x200F are at 0x2880, 0x2100-0x2114 at 0x28CC, 0x2200-0x220B at
 // 0x2934, four bytes each.
 constexpr uint32_t kRegSurfaceInfo = 0x2880;   // RB_SURFACE_INFO (0x2000)
+constexpr uint32_t kRegColorInfo = 0x2884;     // RB_COLOR_INFO (0x2001)
+constexpr uint32_t kRegDepthInfo = 0x2888;     // RB_DEPTH_INFO (0x2002)
+constexpr uint32_t kRegColor1Info = 0x288C;    // RB_COLOR1_INFO-RB_COLOR3_INFO (0x2003-5)
+constexpr uint32_t kRegBlendControl1 = 0x2958; // RB_BLENDCONTROL1-3 (0x2209-B)
+// A texture object's fetch constant (after the D3DResource header and
+// MipFlush).
+constexpr uint32_t kTextureFetchConstant = 0x1C;
 constexpr uint32_t kRegColorMask = 0x28DC;     // RB_COLOR_MASK (0x2104)
 constexpr uint32_t kRegAlphaRef = 0x2904;      // RB_ALPHA_REF (0x210E)
 constexpr uint32_t kRegViewport = 0x2908;      // PA_CL_VPORT_XSCALE (0x210F) onwards
@@ -447,7 +454,13 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   auto reg = [&](uint32_t offset) { return Load32(base, call.device + offset); };
   draw.surface_info = reg(kRegSurfaceInfo);
   draw.depth_control = reg(kRegDepthControl);
-  draw.blend_control = reg(kRegBlendControl);
+  draw.color_info[0] = reg(kRegColorInfo);
+  draw.depth_info = reg(kRegDepthInfo);
+  draw.blend_control[0] = reg(kRegBlendControl);
+  for (int i = 1; i < 4; ++i) {
+    draw.color_info[i] = reg(kRegColor1Info + 4 * (i - 1));
+    draw.blend_control[i] = reg(kRegBlendControl1 + 4 * (i - 1));
+  }
   draw.color_mask = reg(kRegColorMask);
   draw.vte_control = reg(kRegVteControl);
   draw.mode_control = reg(kRegScModeControl);
@@ -498,6 +511,48 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
 
   frame.captured.push_back(draw);
   return true;
+}
+
+void CaptureResolve(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t rect,
+                    uint32_t texture, uint32_t point, uint32_t level, uint32_t slice,
+                    uint32_t pass, native_view::FrameInfo& frame) {
+  if (!texture) {
+    return;
+  }
+  native_view::Resolve resolve;
+  resolve.pass = pass;
+  resolve.flags = flags;
+  resolve.surface_info = Load32(base, device + kRegSurfaceInfo);
+  uint32_t source = flags & 7;
+  resolve.source_info = source == 4   ? Load32(base, device + kRegDepthInfo)
+                        : source == 0 ? Load32(base, device + kRegColorInfo)
+                                      : Load32(base, device + kRegColor1Info + 4 * (source - 1));
+  if (rect) {
+    resolve.has_rect = true;
+    for (int i = 0; i < 4; ++i) {
+      resolve.rect[i] = int32_t(Load32(base, rect + 4 * i));
+    }
+  }
+  if (point) {
+    resolve.point[0] = int32_t(Load32(base, point));
+    resolve.point[1] = int32_t(Load32(base, point + 4));
+  }
+  resolve.level = level;
+  resolve.slice = slice;
+  for (int w = 0; w < 6; ++w) {
+    resolve.fetch[w] = Load32(base, texture + kTextureFetchConstant + 4 * w);
+  }
+  frame.resolves.push_back(resolve);
+}
+
+void CaptureFrontBuffer(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame) {
+  if (!texture) {
+    return;
+  }
+  frame.has_front_buffer = true;
+  for (int w = 0; w < 6; ++w) {
+    frame.front_buffer[w] = Load32(base, texture + kTextureFetchConstant + 4 * w);
+  }
 }
 
 }  // namespace frame_capture

@@ -198,12 +198,15 @@ REX_FUNC(__imp__sub_8275BD48);
 REX_FUNC(__imp__sub_8274D2C8);
 }
 
-// D3DDevice_Swap
+// D3DDevice_Swap(device, front buffer texture, ...)
 REX_HOOK_RAW(sub_82746748) {
   if (g_enabled) {
     native_view::FrameInfo frame;
     {
       std::lock_guard<std::mutex> lock(g_mutex);
+      if (native_view::Enabled()) {
+        frame_capture::CaptureFrontBuffer(base, ctx.r4.u32, g_frame);
+      }
       g_stats.frames++;
       if (g_logging) {
         LogWindow();
@@ -252,6 +255,10 @@ REX_HOOK_RAW(sub_8275BD48) {
     uint32_t clear_color = ctx.r10.u32;
     float clear_depth = float(ctx.f1.f64);
     std::lock_guard<std::mutex> lock(g_mutex);
+    if (native_view::Enabled()) {
+      frame_capture::CaptureResolve(base, ctx.r3.u32, flags, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,
+                                    ctx.r8.u32, ctx.r9.u32, g_pass, g_frame);
+    }
     g_stats.resolves++;
     g_stats.resolve_flags[flags]++;
     // The clear arguments only apply with D3DRESOLVE_CLEARRENDERTARGET

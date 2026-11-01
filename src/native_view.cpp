@@ -5,12 +5,21 @@
 // window is created on the main thread (SDL's requirement); Vulkan runs on
 // the view thread.
 //
+// The whole frame is drawn as the game issued it: each pass renders into
+// Vulkan images standing in for the Xenos EDRAM render targets (one per
+// EDRAM base, format and pitch, so they persist across passes like EDRAM),
+// each Resolve copies a render target into an image registered under the
+// destination texture's address, and the window shows the texture
+// D3DDevice_Swap presented. All of these images stay in the GENERAL layout,
+// with a full barrier between passes and resolves.
+//
 // Draws use the shaders XenosRecomp converted (tools/build-shaders.py), which
 // read their constants through buffer device addresses passed as push
-// constants and their textures from bindless descriptor arrays. Textures are
-// decoded from guest memory when a shown draw first uses them
-// (texture_decode.h) and kept while their memory is unchanged; textures the
-// view can't decode are a 1x1 white placeholder.
+// constants and their textures from bindless descriptor arrays. A texture is
+// a resolved image if one was resolved to its address; otherwise it is
+// decoded from guest memory on first use (texture_decode.h) and kept while
+// its memory is unchanged. Textures the view can't decode are a 1x1 white
+// placeholder.
 
 #include "native_view.h"
 
@@ -29,8 +38,10 @@
 #include <array>
 #include <chrono>
 #include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <set>
@@ -44,6 +55,12 @@ namespace {
 
 constexpr uint32_t kFramesInFlight = 2;
 constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
+constexpr VkImageUsageFlags kColorTargetUsage =
+    VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+    VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+constexpr VkImageUsageFlags kDepthTargetUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                VK_IMAGE_USAGE_TRANSFER_DST_BIT;
 constexpr VkDeviceSize kInitialUploadSize = 32ull << 20;
 // Descriptor array sizes for 2D, 3D and cube textures; entry 0 is the
 // placeholder.
@@ -103,16 +120,16 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCreatePipelineLayout)          \
   X(vkCreateShaderModule)            \
   X(vkCreateGraphicsPipelines)       \
-  X(vkCreateRenderPass)              \
-  X(vkCreateFramebuffer)             \
-  X(vkDestroyFramebuffer)            \
   X(vkCreateCommandPool)             \
   X(vkAllocateCommandBuffers)        \
   X(vkBeginCommandBuffer)            \
   X(vkEndCommandBuffer)              \
   X(vkResetCommandBuffer)            \
-  X(vkCmdBeginRenderPass)            \
-  X(vkCmdEndRenderPass)              \
+  X(vkCmdBeginRendering)             \
+  X(vkCmdEndRendering)               \
+  X(vkCmdBlitImage)                  \
+  X(vkCmdCopyImageToBuffer)          \
+  X(vkCmdClearDepthStencilImage)     \
   X(vkCmdPipelineBarrier)            \
   X(vkCmdClearColorImage)            \
   X(vkCmdCopyBufferToImage)          \
@@ -232,7 +249,7 @@ class View {
     const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&extension_count);
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.pApplicationName = "naruto native view";
-    app.apiVersion = VK_API_VERSION_1_2;
+    app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo instance_info{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
     instance_info.pApplicationInfo = &app;
     instance_info.enabledExtensionCount = extension_count;
@@ -252,7 +269,7 @@ class View {
   }
 
   // Prefers a discrete GPU with a queue that both draws and presents, and
-  // the Vulkan 1.2 features the converted shaders need.
+  // the Vulkan 1.3 features the view needs.
   bool PickDevice() {
     uint32_t count = 0;
     vkEnumeratePhysicalDevices(instance_, &count, nullptr);
@@ -262,18 +279,22 @@ class View {
     for (VkPhysicalDevice device : devices) {
       VkPhysicalDeviceProperties properties;
       vkGetPhysicalDeviceProperties(device, &properties);
+      VkPhysicalDeviceVulkan13Features features13{
+          VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
       VkPhysicalDeviceVulkan12Features features12{
           VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+      features12.pNext = &features13;
       VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
       features.pNext = &features12;
-      if (properties.apiVersion < VK_API_VERSION_1_2) {
+      if (properties.apiVersion < VK_API_VERSION_1_3) {
         continue;
       }
       vkGetPhysicalDeviceFeatures2(device, &features);
       if (!features.features.shaderInt64 || !features12.bufferDeviceAddress ||
           !features12.runtimeDescriptorArray || !features12.descriptorBindingPartiallyBound ||
           !features12.descriptorBindingSampledImageUpdateAfterBind ||
-          !features12.descriptorBindingUpdateUnusedWhilePending) {
+          !features12.descriptorBindingUpdateUnusedWhilePending ||
+          !features13.dynamicRendering) {
         REXLOG_INFO("[native view] {} lacks features the shaders need", properties.deviceName);
         continue;
       }
@@ -307,8 +328,12 @@ class View {
     queue_info.queueFamilyIndex = queue_family_;
     queue_info.queueCount = 1;
     queue_info.pQueuePriorities = &priority;
+    VkPhysicalDeviceVulkan13Features features13{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
+    features13.dynamicRendering = VK_TRUE;
     VkPhysicalDeviceVulkan12Features features12{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    features12.pNext = &features13;
     features12.bufferDeviceAddress = VK_TRUE;
     features12.runtimeDescriptorArray = VK_TRUE;
     features12.descriptorBindingPartiallyBound = VK_TRUE;
@@ -442,9 +467,9 @@ class View {
     VkDeviceSize offset;
   };
 
-  void WriteTextureDescriptor(uint32_t heap, uint32_t index, VkImageView view) {
-    VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view,
-                                     VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL};
+  void WriteTextureDescriptor(uint32_t heap, uint32_t index, VkImageView view,
+                              VkImageLayout layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    VkDescriptorImageInfo image_info{VK_NULL_HANDLE, view, layout};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = descriptor_sets_[heap];
     write.dstArrayElement = index;
@@ -474,7 +499,9 @@ class View {
     for (Retired& r : retired_) {
       if (done(r)) {
         DestroyImage(r.image);
-        free_indices_[r.heap].push_back(r.index);
+        if (r.index) {
+          free_indices_[r.heap].push_back(r.index);
+        }
       }
     }
     std::erase_if(retired_, done);
@@ -496,6 +523,10 @@ class View {
                                std::vector<PendingUpload>& uploads, size_t& budget) {
     // The fields that decide the image: pitch and tiling, format, endian and
     // address, size, swizzle, dimension.
+    auto resolved = resolved_.find(fetch[1] & 0x1FFFF000);
+    if (resolved != resolved_.end()) {
+      return &resolved->second.entry;
+    }
     std::array<uint32_t, 5> key = {fetch[0] & 0xFFC00000, fetch[1], fetch[2],
                                    fetch[3] & 0x1FFE, fetch[5] & 0x600};
     auto it = textures_.find(key);
@@ -568,6 +599,9 @@ class View {
   }
 
   void DestroyImage(Image& image) {
+    if (!image.image) {
+      return;
+    }
     vkDestroyImageView(device_, image.view, nullptr);
     vkDestroyImage(device_, image.image, nullptr);
     vkFreeMemory(device_, image.memory, nullptr);
@@ -713,7 +747,7 @@ class View {
            VK_SUCCESS;
   }
 
-  bool CreateRenderPass() {
+  void PickSurfaceFormat() {
     uint32_t count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &count, nullptr);
     std::vector<VkSurfaceFormatKHR> formats(count);
@@ -726,47 +760,9 @@ class View {
         break;
       }
     }
-    VkAttachmentDescription attachments[2] = {};
-    attachments[0].format = format_.format;
-    attachments[0].samples = VK_SAMPLE_COUNT_1_BIT;
-    attachments[0].loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    attachments[0].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    attachments[0].stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    attachments[0].stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[0].initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    attachments[0].finalLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    attachments[1] = attachments[0];
-    attachments[1].format = kDepthFormat;
-    attachments[1].storeOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    attachments[1].finalLayout = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference color_ref{0, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
-    VkAttachmentReference depth_ref{1, VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL};
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &color_ref;
-    subpass.pDepthStencilAttachment = &depth_ref;
-    // The depth image is shared by the frames in flight.
-    VkSubpassDependency dependency{};
-    dependency.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dependency.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT;
-    dependency.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT;
-    dependency.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    dependency.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                               VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-    VkRenderPassCreateInfo pass_info{VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO};
-    pass_info.attachmentCount = 2;
-    pass_info.pAttachments = attachments;
-    pass_info.subpassCount = 1;
-    pass_info.pSubpasses = &subpass;
-    pass_info.dependencyCount = 1;
-    pass_info.pDependencies = &dependency;
-    return vkCreateRenderPass(device_, &pass_info, nullptr, &render_pass_) == VK_SUCCESS;
   }
 
+  // The swapchain is only blitted to.
   bool CreateSwapchain() {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps);
@@ -782,8 +778,8 @@ class View {
     if (!extent_.width || !extent_.height) {
       return false;  // Minimized; try again on the next frame.
     }
-    if (!render_pass_ && !CreateRenderPass()) {
-      return false;
+    if (!format_.format) {
+      PickSurfaceFormat();
     }
 
     // Mailbox or immediate keep the view from pacing itself to the display.
@@ -814,7 +810,7 @@ class View {
     info.imageColorSpace = format_.colorSpace;
     info.imageExtent = extent_;
     info.imageArrayLayers = 1;
-    info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
     info.compositeAlpha = alpha;
@@ -831,9 +827,6 @@ class View {
       vkDestroySwapchainKHR(device_, old, nullptr);
     }
 
-    depth_ = CreateImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, kDepthFormat,
-                         {extent_.width, extent_.height, 1}, 1,
-                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT, VK_IMAGE_ASPECT_DEPTH_BIT);
     uint32_t image_count = 0;
     vkGetSwapchainImagesKHR(device_, swapchain_, &image_count, nullptr);
     std::vector<VkImage> images(image_count);
@@ -841,21 +834,7 @@ class View {
     VkSemaphoreCreateInfo semaphore_info{VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     for (VkImage image : images) {
       Target target;
-      VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-      view_info.image = image;
-      view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-      view_info.format = format_.format;
-      view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-      vkCreateImageView(device_, &view_info, nullptr, &target.view);
-      VkImageView views[] = {target.view, depth_.view};
-      VkFramebufferCreateInfo fb_info{VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO};
-      fb_info.renderPass = render_pass_;
-      fb_info.attachmentCount = 2;
-      fb_info.pAttachments = views;
-      fb_info.width = extent_.width;
-      fb_info.height = extent_.height;
-      fb_info.layers = 1;
-      vkCreateFramebuffer(device_, &fb_info, nullptr, &target.framebuffer);
+      target.image = image;
       // One per image: reacquiring the image is what makes reuse safe.
       vkCreateSemaphore(device_, &semaphore_info, nullptr, &target.render_done);
       targets_.push_back(target);
@@ -865,14 +844,9 @@ class View {
 
   void DestroySwapchainResources() {
     for (Target& target : targets_) {
-      vkDestroyFramebuffer(device_, target.framebuffer, nullptr);
-      vkDestroyImageView(device_, target.view, nullptr);
       vkDestroySemaphore(device_, target.render_done, nullptr);
     }
     targets_.clear();
-    if (depth_.image) {
-      DestroyImage(depth_);
-    }
   }
 
   void Recreate() {
@@ -942,15 +916,195 @@ class View {
     return module;
   }
 
-  // The pipeline for the draw's shaders, vertex layout and render state, or
-  // VK_NULL_HANDLE if it can't be created.
-  VkPipeline Pipeline(const FrameInfo& frame, const Draw& draw) {
-    uint32_t depth_state = draw.depth_control & 0x76;  // test, write, function
-    uint32_t color_mask = draw.color_mask & 0xF;
+  // A Vulkan image standing in for an EDRAM render target or depth buffer.
+  struct RenderTarget {
+    Image image;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0;
+    bool depth = false;
+  };
+
+  // The attachments of a pass: render targets 0-3 and the depth buffer.
+  struct PassTargets {
+    std::array<RenderTarget*, 4> color{};
+    RenderTarget* depth = nullptr;
+    uint32_t color_count = 0;  // highest used render target + 1
+    VkExtent2D extent{};
+  };
+
+  // A texture filled by resolves rather than from guest memory.
+  struct ResolvedTexture {
+    CachedTexture entry;  // its image and 2D descriptor
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t width = 0, height = 0;
+    bool depth = false;
+  };
+
+  // Render targets are identified by EDRAM base, format and pitch.
+  static uint64_t TargetKey(uint32_t surface_info, uint32_t info, bool depth) {
+    uint64_t pitch = surface_info & 0x3FFF;
+    uint64_t format = depth ? (info >> 16) & 1 : (info >> 16) & 0xF;
+    return (uint64_t(depth) << 63) | (pitch << 32) | (format << 16) | (info & 0xFFF);
+  }
+
+  // RB_COLOR_INFO color_format -> a Vulkan format holding the same values.
+  static VkFormat ColorFormat(uint32_t info) {
+    switch ((info >> 16) & 0xF) {
+      case 2:   // 2_10_10_10
+      case 10:  // 2_10_10_10_AS_10_10_10_10
+        return VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+      case 3:   // 2_10_10_10_FLOAT
+      case 5:   // 16_16_16_16
+      case 7:   // 16_16_16_16_FLOAT
+      case 12:  // 2_10_10_10_FLOAT_AS_16_16_16_16
+        return VK_FORMAT_R16G16B16A16_SFLOAT;
+      case 4:  // 16_16
+      case 6:  // 16_16_FLOAT
+        return VK_FORMAT_R16G16_SFLOAT;
+      case 14:
+        return VK_FORMAT_R32_SFLOAT;
+      case 15:
+        return VK_FORMAT_R32G32_SFLOAT;
+      default:  // 8_8_8_8, 8_8_8_8_GAMMA
+        return VK_FORMAT_R8G8B8A8_UNORM;
+    }
+  }
+
+  void InitializeImage(VkImage image, bool depth, uint32_t layers = 1) {
+    new_images_.push_back({image, depth, layers});
+  }
+
+  // The render target for key, at least `height` rows; recreated (losing
+  // its contents) if it has to grow.
+  RenderTarget* RenderTargetFor(uint64_t key, uint32_t info, uint32_t height) {
+    RenderTarget& target = render_targets_[key];
+    uint32_t width = std::max<uint32_t>(uint32_t(key >> 32) & 0x3FFF, 1);
+    if (target.image.image && target.height >= height && target.width == width) {
+      return &target;
+    }
+    if (target.image.image) {
+      retired_.push_back({target.image, 0, 0, frames_total_});
+    }
+    target.depth = key >> 63;
+    target.format = target.depth ? kDepthFormat : ColorFormat(info);
+    target.width = width;
+    target.height = std::max(height, target.height);
+    target.image = CreateImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, target.format,
+                               {target.width, target.height, 1}, 1,
+                               target.depth ? kDepthTargetUsage : kColorTargetUsage,
+                               target.depth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                            : VK_IMAGE_ASPECT_COLOR_BIT);
+    InitializeImage(target.image.image, target.depth);
+    return &target;
+  }
+
+  // The image a resolve writes: the destination texture's base level,
+  // registered under its address. Returns nullptr for destinations the view
+  // can't hold.
+  ResolvedTexture* ResolveDestination(const Resolve& resolve) {
+    if (resolve.level || ((resolve.fetch[5] >> 9) & 3) == 2 || ((resolve.fetch[5] >> 9) & 3) == 3) {
+      WarnOnce("resolve to a mip level, 3D or cube texture", resolve.fetch[1] & 0x3F);
+      return nullptr;
+    }
+    bool depth = (resolve.flags & 7) == 4;
+    texture_decode::Texture described;
+    const char* reason = nullptr;
+    VkFormat format;
+    VkComponentMapping components{};
+    uint32_t width = (resolve.fetch[2] & 0x1FFF) + 1, height = ((resolve.fetch[2] >> 13) & 0x1FFF) + 1;
+    if (depth) {
+      format = VK_FORMAT_R32_SFLOAT;
+      components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
+                    VK_COMPONENT_SWIZZLE_ONE};
+    } else if (texture_decode::Describe(resolve.fetch, described, &reason)) {
+      format = VkFormat(described.format);
+      // A copy into an 8-bit-per-channel texture stores the render target's
+      // red in Z and blue in X (the ARGB layout the game reads with a ZYXW
+      // swizzle); the image keeps red in R, so components are remapped.
+      uint32_t xenos_format = resolve.fetch[1] & 0x3F;
+      bool swap_red_blue = xenos_format == 6 || xenos_format == 50;
+      static constexpr uint32_t kChannel[2][4] = {{0, 1, 2, 3}, {2, 1, 0, 3}};
+      VkComponentSwizzle swizzles[4];
+      for (int c = 0; c < 4; ++c) {
+        uint32_t select = (resolve.fetch[3] >> (1 + 3 * c)) & 7;
+        swizzles[c] = select < 4 ? VkComponentSwizzle(VK_COMPONENT_SWIZZLE_R +
+                                                      kChannel[swap_red_blue][select])
+                      : select == 5 ? VK_COMPONENT_SWIZZLE_ONE
+                                    : VK_COMPONENT_SWIZZLE_ZERO;
+      }
+      components = {swizzles[0], swizzles[1], swizzles[2], swizzles[3]};
+    } else {
+      WarnOnce("resolve destination format", resolve.fetch[1] & 0x3F);
+      return nullptr;
+    }
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(physical_device_, format, &properties);
+    VkFormatFeatureFlags needed = depth ? VK_FORMAT_FEATURE_TRANSFER_DST_BIT
+                                        : VK_FORMAT_FEATURE_BLIT_DST_BIT;
+    if ((properties.optimalTilingFeatures & needed) != needed) {
+      WarnOnce("resolve destination format not writable", format);
+      return nullptr;
+    }
+    uint32_t address = resolve.fetch[1] & 0x1FFFF000;
+    ResolvedTexture& texture = resolved_[address];
+    if (texture.entry.image.image && texture.format == format && texture.width == width &&
+        texture.height == height) {
+      return &texture;
+    }
+    if (texture.entry.image.image) {
+      retired_.push_back({texture.entry.image, 0, texture.entry.index, frames_total_});
+    } else {
+      // Any texture decoded from this address is replaced.
+      for (auto it = textures_.begin(); it != textures_.end();) {
+        if (((it->first[1] & 0x1FFFF000) == address)) {
+          Retire(it->second);
+          it = textures_.erase(it);
+        } else {
+          ++it;
+        }
+      }
+    }
+    if (free_indices_[0].empty()) {
+      resolved_.erase(address);
+      return nullptr;
+    }
+    texture.format = format;
+    texture.width = width;
+    texture.height = height;
+    texture.depth = depth;
+    texture.entry = {};
+    texture.entry.image =
+        CreateImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, format, {width, height, 1}, 1,
+                    VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                    VK_IMAGE_ASPECT_COLOR_BIT, components);
+    texture.entry.index = free_indices_[0].back();
+    free_indices_[0].pop_back();
+    texture.entry.last_used = frames_total_;
+    WriteTextureDescriptor(0, texture.entry.index, texture.entry.image.view,
+                           VK_IMAGE_LAYOUT_GENERAL);
+    InitializeImage(texture.entry.image.image, false);
+    return &texture;
+  }
+
+  // The pipeline for the draw's shaders, vertex layout, render state and the
+  // pass's attachment formats, or VK_NULL_HANDLE if it can't be created.
+  VkPipeline Pipeline(const FrameInfo& frame, const Draw& draw, const PassTargets& targets) {
+    uint32_t depth_state = targets.depth ? draw.depth_control & 0x76 : 0;  // test, write, function
+    uint32_t color_mask = draw.color_mask & 0xFFFF;
     uint32_t cull_state = draw.mode_control & 7;  // cull front, cull back, clockwise front
+    std::array<VkFormat, 4> color_formats{};
+    for (uint32_t i = 0; i < targets.color_count; ++i) {
+      color_formats[i] = targets.color[i] ? targets.color[i]->format : VK_FORMAT_UNDEFINED;
+    }
+    VkFormat depth_format = targets.depth ? targets.depth->format : VK_FORMAT_UNDEFINED;
     std::vector<uint32_t> key = {uint32_t(draw.vertex_shader), uint32_t(draw.pixel_shader),
                                  draw.topology, draw.primitive_restart, draw.alpha_test,
-                                 depth_state, draw.blend_control, color_mask, cull_state};
+                                 depth_state, color_mask, cull_state, targets.color_count,
+                                 uint32_t(depth_format)};
+    for (uint32_t i = 0; i < targets.color_count; ++i) {
+      key.insert(key.end(), {uint32_t(color_formats[i]), draw.blend_control[i]});
+    }
     for (uint32_t i = 0; i < draw.binding_count; ++i) {
       key.push_back(frame.bindings[draw.first_binding + i].stride);
     }
@@ -1032,27 +1186,36 @@ class View {
     depth.depthWriteEnable = depth.depthTestEnable && ((depth_state >> 2) & 1);
     depth.depthCompareOp = VkCompareOp((depth_state >> 4) & 7);
     // RB_BLENDCONTROL: source factor, function and destination factor for
-    // color in bits 0-12, for alpha in bits 16-28.
-    uint32_t blend = draw.blend_control;
-    VkPipelineColorBlendAttachmentState attachment{};
-    attachment.srcColorBlendFactor = BlendFactor(blend & 0x1F);
-    attachment.colorBlendOp = BlendOp((blend >> 5) & 7);
-    attachment.dstColorBlendFactor = BlendFactor((blend >> 8) & 0x1F);
-    attachment.srcAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
-    attachment.alphaBlendOp = BlendOp((blend >> 21) & 7);
-    attachment.dstAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
-    attachment.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001;
-    attachment.colorWriteMask = color_mask;
+    // color in bits 0-12, for alpha in bits 16-28. RB_COLOR_MASK has four
+    // bits per render target.
+    std::array<VkPipelineColorBlendAttachmentState, 4> blend_attachments{};
+    for (uint32_t i = 0; i < targets.color_count; ++i) {
+      uint32_t blend = draw.blend_control[i];
+      VkPipelineColorBlendAttachmentState& attachment = blend_attachments[i];
+      attachment.srcColorBlendFactor = BlendFactor(blend & 0x1F);
+      attachment.colorBlendOp = BlendOp((blend >> 5) & 7);
+      attachment.dstColorBlendFactor = BlendFactor((blend >> 8) & 0x1F);
+      attachment.srcAlphaBlendFactor = BlendFactor((blend >> 16) & 0x1F);
+      attachment.alphaBlendOp = BlendOp((blend >> 21) & 7);
+      attachment.dstAlphaBlendFactor = BlendFactor((blend >> 24) & 0x1F);
+      attachment.blendEnable = (blend & 0x1FFF1FFF) != 0x00010001;
+      attachment.colorWriteMask = targets.color[i] ? (color_mask >> (4 * i)) & 0xF : 0;
+    }
     VkPipelineColorBlendStateCreateInfo color_blend{
         VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &attachment;
+    color_blend.attachmentCount = targets.color_count;
+    color_blend.pAttachments = blend_attachments.data();
     VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
     VkPipelineDynamicStateCreateInfo dynamic{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynamic_states;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.colorAttachmentCount = targets.color_count;
+    rendering.pColorAttachmentFormats = color_formats.data();
+    rendering.depthAttachmentFormat = depth_format;
 
     VkGraphicsPipelineCreateInfo info{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    info.pNext = &rendering;
     info.stageCount = stage_count;
     info.pStages = stages;
     info.pVertexInputState = &vertex_input;
@@ -1064,7 +1227,6 @@ class View {
     info.pColorBlendState = &color_blend;
     info.pDynamicState = &dynamic;
     info.layout = pipeline_layout_;
-    info.renderPass = render_pass_;
     VkResult result =
         vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &it->second);
     if (result != VK_SUCCESS) {
@@ -1088,35 +1250,15 @@ class View {
             (vte & 8) ? v[3] : 0.0f,  (vte & 16) ? v[4] : 1.0f, (vte & 32) ? v[5] : 0.0f};
   }
 
-  // The render target area a pass draws to, from its largest viewport; it is
-  // scaled to fill the window.
-  void FitPass(const FrameInfo& frame, uint32_t pass) {
-    target_width_ = target_height_ = 0.0f;
-    for (const Draw& draw : frame.captured) {
-      if (draw.pass == pass) {
-        XenosViewport v = ViewportOf(draw);
-        target_width_ = std::max(target_width_, v.x_offset + std::abs(v.x_scale));
-        target_height_ = std::max(target_height_, v.y_offset + std::abs(v.y_scale));
-      }
-    }
-    if (target_width_ < 16.0f || target_height_ < 16.0f) {
-      target_width_ = 1280.0f;
-      target_height_ = 720.0f;
-    }
-  }
-
-  VkViewport Viewport(const Draw& draw) {
+  static VkViewport Viewport(const Draw& draw) {
     XenosViewport v = ViewportOf(draw);
-    float x_scale = v.x_scale, x_offset = v.x_offset, y_scale = v.y_scale,
-          y_offset = v.y_offset, z_scale = v.z_scale, z_offset = v.z_offset;
-    float sx = extent_.width / target_width_, sy = extent_.height / target_height_;
     VkViewport viewport;
-    viewport.x = (x_offset - x_scale) * sx;
-    viewport.width = 2.0f * x_scale * sx;
-    viewport.y = (y_offset + y_scale) * sy;
-    viewport.height = -2.0f * y_scale * sy;
-    viewport.minDepth = std::clamp(z_offset, 0.0f, 1.0f);
-    viewport.maxDepth = std::clamp(z_offset + z_scale, 0.0f, 1.0f);
+    viewport.x = v.x_offset - v.x_scale;
+    viewport.width = 2.0f * v.x_scale;
+    viewport.y = v.y_offset + v.y_scale;
+    viewport.height = -2.0f * v.y_scale;
+    viewport.minDepth = std::clamp(v.z_offset, 0.0f, 1.0f);
+    viewport.maxDepth = std::clamp(v.z_offset + v.z_scale, 0.0f, 1.0f);
     return viewport;
   }
 
@@ -1170,6 +1312,36 @@ class View {
       std::memcpy(&v, frame.data.data() + offset, 4);
       return v;
     };
+    std::vector<std::map<std::string, uint32_t>> summaries(frame.passes.size());
+    for (const Draw& d : frame.captured) {
+      std::string targets;
+      for (int i = 0; i < 4; ++i) {
+        if ((d.color_mask >> (4 * i)) & 0xF) {
+          targets += fmt::format(" rt{}={:x}", i, d.color_info[i]);
+        }
+      }
+      if (d.depth_control & 6) {
+        targets += fmt::format(" depth={:x}/{:x}", d.depth_info, d.depth_control & 0x76);
+      }
+      targets += fmt::format(" surface={:x} vp=[{} {} {} {}]", d.surface_info, d.viewport[0],
+                             d.viewport[1], d.viewport[2], d.viewport[3]);
+      summaries[std::min<size_t>(d.pass, summaries.size() - 1)][targets]++;
+    }
+    for (size_t p = 0; p < summaries.size(); ++p) {
+      for (const auto& [targets, count] : summaries[p]) {
+        REXLOG_INFO("[native view] pass {}: {} draws{}", p, count, targets);
+      }
+    }
+    for (const Resolve& r : frame.resolves) {
+      REXLOG_INFO(
+          "[native view] resolve after pass {}: flags {:#x} surface {:#x} source {:#x} rect {} "
+          "[{} {} {} {}] point [{} {}] level {} slice {} to fetch {:08x} {:08x} {:08x} {:08x}",
+          r.pass, r.flags, r.surface_info, r.source_info, r.has_rect, r.rect[0], r.rect[1],
+          r.rect[2], r.rect[3], r.point[0], r.point[1], r.level, r.slice, r.fetch[0], r.fetch[1],
+          r.fetch[2], r.fetch[3]);
+    }
+    REXLOG_INFO("[native view] front buffer: {} {:08x} {:08x} {:08x}", frame.has_front_buffer,
+                frame.front_buffer[0], frame.front_buffer[1], frame.front_buffer[2]);
     const PassInfo& info = frame.passes[pass];
     REXLOG_INFO("[native view] pass {}: clear color {} ({} {} {} {}), clear depth {}", pass,
                 info.has_clear_color, info.clear_color[0], info.clear_color[1],
@@ -1186,7 +1358,7 @@ class View {
           "depth {:#x} blend {:#x} mask {:#x} vport [{} {} {} {} {} {}] -> {} {} {} {} {} {}",
           shaders[d.vertex_shader].library, shaders[d.vertex_shader].offset,
           d.pixel_shader >= 0 ? shaders[d.pixel_shader].offset : 0, d.topology, d.index_count,
-          d.surface_info, d.vte_control, d.depth_control, d.blend_control, d.color_mask,
+          d.surface_info, d.vte_control, d.depth_control, d.blend_control[0], d.color_mask,
           d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], d.viewport[4],
           d.viewport[5], vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
       for (uint32_t i = 0; i < d.attribute_count; ++i) {
@@ -1217,59 +1389,291 @@ class View {
     }
   }
 
+  static void Barrier(PFN_vkCmdPipelineBarrier barrier, VkCommandBuffer cmd) {
+    VkMemoryBarrier memory{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    memory.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    memory.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1,
+            &memory, 0, nullptr, 0, nullptr);
+  }
+
+  // Where each pass draws: the render targets its draws write and the depth
+  // buffer they test, sized to what the frame's viewports and resolves reach.
+  std::vector<PassTargets> PlanTargets(const FrameInfo& frame) {
+    uint32_t pass_count = uint32_t(frame.passes.size());
+    std::map<uint64_t, uint32_t> heights;
+    std::map<uint64_t, uint32_t> infos;
+    auto need = [&](uint64_t key, uint32_t info, float bottom) {
+      uint32_t height = uint32_t(std::clamp(std::ceil(bottom), 1.0f, 8192.0f));
+      heights[key] = std::max(heights[key], height);
+      infos[key] = info;
+    };
+    for (const Draw& draw : frame.captured) {
+      XenosViewport v = ViewportOf(draw);
+      float bottom = v.y_offset + std::abs(v.y_scale);
+      for (uint32_t i = 0; i < 4; ++i) {
+        if ((draw.color_mask >> (4 * i)) & 0xF) {
+          need(TargetKey(draw.surface_info, draw.color_info[i], false), draw.color_info[i], bottom);
+        }
+      }
+      if (draw.depth_control & 6) {
+        need(TargetKey(draw.surface_info, draw.depth_info, true), draw.depth_info, bottom);
+      }
+    }
+    for (const Resolve& r : frame.resolves) {
+      bool depth = (r.flags & 7) == 4;
+      float bottom = r.has_rect ? float(r.rect[3])
+                                : float(((r.fetch[2] >> 13) & 0x1FFF) + 1 + r.point[1]);
+      need(TargetKey(r.surface_info, r.source_info, depth), r.source_info, bottom);
+    }
+    for (auto& [key, height] : heights) {
+      RenderTargetFor(key, infos[key], height);
+    }
+
+    std::vector<PassTargets> passes(pass_count);
+    for (const Draw& draw : frame.captured) {
+      PassTargets& targets = passes[std::min(draw.pass, pass_count - 1)];
+      for (uint32_t i = 0; i < 4; ++i) {
+        if ((draw.color_mask >> (4 * i)) & 0xF) {
+          targets.color[i] = &render_targets_[TargetKey(draw.surface_info, draw.color_info[i], false)];
+          targets.color_count = std::max(targets.color_count, i + 1);
+        }
+      }
+      if (draw.depth_control & 6) {
+        targets.depth = &render_targets_[TargetKey(draw.surface_info, draw.depth_info, true)];
+      }
+    }
+    for (PassTargets& targets : passes) {
+      targets.extent = {UINT32_MAX, UINT32_MAX};
+      for (RenderTarget* target : targets.color) {
+        if (target) {
+          targets.extent.width = std::min(targets.extent.width, target->width);
+          targets.extent.height = std::min(targets.extent.height, target->height);
+        }
+      }
+      if (targets.depth) {
+        targets.extent.width = std::min(targets.extent.width, targets.depth->width);
+        targets.extent.height = std::min(targets.extent.height, targets.depth->height);
+      }
+    }
+    return passes;
+  }
+
+  // Copies a resolve's source rectangle into its destination texture.
+  void RecordResolve(VkCommandBuffer cmd, const Resolve& r, const RenderTarget& source,
+                     const ResolvedTexture& dest) {
+    int32_t x1 = 0, y1 = 0, x2 = int32_t(dest.width), y2 = int32_t(dest.height);
+    if (r.has_rect) {
+      x1 = r.rect[0], y1 = r.rect[1], x2 = r.rect[2], y2 = r.rect[3];
+    }
+    int32_t dx = r.point[0], dy = r.point[1];
+    x2 = std::min({x2, int32_t(source.width), x1 + int32_t(dest.width) - dx});
+    y2 = std::min({y2, int32_t(source.height), y1 + int32_t(dest.height) - dy});
+    if (x1 < 0 || y1 < 0 || dx < 0 || dy < 0 || x2 <= x1 || y2 <= y1) {
+      return;
+    }
+    uint32_t w = uint32_t(x2 - x1), h = uint32_t(y2 - y1);
+    if (!source.depth) {
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.srcOffsets[0] = {x1, y1, 0};
+      blit.srcOffsets[1] = {x2, y2, 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.dstOffsets[0] = {dx, dy, 0};
+      blit.dstOffsets[1] = {dx + int32_t(w), dy + int32_t(h), 1};
+      vkCmdBlitImage(cmd, source.image.image, VK_IMAGE_LAYOUT_GENERAL, dest.entry.image.image,
+                     VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_NEAREST);
+      return;
+    }
+    // Depth goes through a buffer: depth and color images can't be copied
+    // directly.
+    if (!ReserveScratch(VkDeviceSize(w) * h * 4)) {
+      return;
+    }
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    copy.imageOffset = {x1, y1, 0};
+    copy.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, source.image.image, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1,
+                           &copy);
+    Barrier(vkCmdPipelineBarrier, cmd);
+    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    copy.imageOffset = {dx, dy, 0};
+    vkCmdCopyBufferToImage(cmd, scratch_.buffer, dest.entry.image.image, VK_IMAGE_LAYOUT_GENERAL,
+                           1, &copy);
+  }
+
+  bool ReserveScratch(VkDeviceSize size) {
+    if (scratch_.size >= size) {
+      return true;
+    }
+    if (scratch_.buffer) {
+      vkDeviceWaitIdle(device_);
+      vkDestroyBuffer(device_, scratch_.buffer, nullptr);
+      vkFreeMemory(device_, scratch_.memory, nullptr);
+      scratch_ = {};
+    }
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = std::max<VkDeviceSize>(size, 16ull << 20);
+    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkCreateBuffer(device_, &info, nullptr, &scratch_.buffer);
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device_, scratch_.buffer, &requirements);
+    scratch_.memory = Allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    if (!scratch_.memory) {
+      vkDestroyBuffer(device_, scratch_.buffer, nullptr);
+      scratch_ = {};
+      return false;
+    }
+    vkBindBufferMemory(device_, scratch_.buffer, scratch_.memory, 0);
+    scratch_.size = info.size;
+    return true;
+  }
+
+  // NARUTO_NATIVE_VIEW_SNAPSHOTS=dir with NARUTO_NATIVE_VIEW_DUMP=n saves
+  // each pass's first render target (after the pass and its resolves) and
+  // the presented frame, downscaled, as PPM files in dir/<frame>/, for frame
+  // n and every 300th frame after it.
+  static constexpr uint32_t kSnapshotWidth = 320, kSnapshotHeight = 180;
+
+  bool PrepareSnapshots(uint32_t count) {
+    VkDeviceSize size = VkDeviceSize(count) * kSnapshotWidth * kSnapshotHeight * 4;
+    if (!snapshot_image_.image) {
+      snapshot_image_ = CreateImage(
+          VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+          {kSnapshotWidth, kSnapshotHeight, 1}, 1,
+          VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+          VK_IMAGE_ASPECT_COLOR_BIT);
+      InitializeImage(snapshot_image_.image, false);
+    }
+    if (snapshot_buffer_.size < size) {
+      if (snapshot_buffer_.buffer) {
+        vkDestroyBuffer(device_, snapshot_buffer_.buffer, nullptr);
+        vkFreeMemory(device_, snapshot_buffer_.memory, nullptr);
+        snapshot_buffer_ = {};
+      }
+      VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+      info.size = size;
+      info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+      vkCreateBuffer(device_, &info, nullptr, &snapshot_buffer_.buffer);
+      VkMemoryRequirements requirements;
+      vkGetBufferMemoryRequirements(device_, snapshot_buffer_.buffer, &requirements);
+      snapshot_buffer_.memory = Allocate(
+          requirements,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
+      if (!snapshot_buffer_.memory) {
+        return false;
+      }
+      vkBindBufferMemory(device_, snapshot_buffer_.buffer, snapshot_buffer_.memory, 0);
+      vkMapMemory(device_, snapshot_buffer_.memory, 0, VK_WHOLE_SIZE, 0,
+                  reinterpret_cast<void**>(&snapshot_buffer_.mapped));
+      snapshot_buffer_.size = size;
+    }
+    return true;
+  }
+
+  void RecordSnapshot(VkCommandBuffer cmd, VkImage source, VkExtent2D extent, uint32_t slot) {
+    VkImageBlit blit{};
+    blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.srcOffsets[1] = {int32_t(extent.width), int32_t(extent.height), 1};
+    blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blit.dstOffsets[1] = {int32_t(kSnapshotWidth), int32_t(kSnapshotHeight), 1};
+    vkCmdBlitImage(cmd, source, VK_IMAGE_LAYOUT_GENERAL, snapshot_image_.image,
+                   VK_IMAGE_LAYOUT_GENERAL, 1, &blit, VK_FILTER_LINEAR);
+    Barrier(vkCmdPipelineBarrier, cmd);
+    VkBufferImageCopy copy{};
+    copy.bufferOffset = VkDeviceSize(slot) * kSnapshotWidth * kSnapshotHeight * 4;
+    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    copy.imageExtent = {kSnapshotWidth, kSnapshotHeight, 1};
+    vkCmdCopyImageToBuffer(cmd, snapshot_image_.image, VK_IMAGE_LAYOUT_GENERAL,
+                           snapshot_buffer_.buffer, 1, &copy);
+    Barrier(vkCmdPipelineBarrier, cmd);
+  }
+
+  void WriteSnapshots(const char* root, uint32_t count) {
+    std::string dir = fmt::format("{}/{:06}", root, frames_total_);
+    std::error_code error;
+    std::filesystem::create_directories(dir, error);
+    for (uint32_t slot = 0; slot < count; ++slot) {
+      std::string path = slot + 1 == count ? fmt::format("{}/final.ppm", dir)
+                                           : fmt::format("{}/pass{:02}.ppm", dir, slot);
+      FILE* file = std::fopen(path.c_str(), "wb");
+      if (!file) {
+        continue;
+      }
+      std::fprintf(file, "P6 %u %u 255\n", kSnapshotWidth, kSnapshotHeight);
+      const uint8_t* pixels = snapshot_buffer_.mapped +
+                              size_t(slot) * kSnapshotWidth * kSnapshotHeight * 4;
+      for (uint32_t i = 0; i < kSnapshotWidth * kSnapshotHeight; ++i) {
+        std::fwrite(pixels + i * 4, 1, 3, file);
+      }
+      std::fclose(file);
+    }
+    REXLOG_INFO("[native view] wrote {} snapshots to {}", count, dir);
+  }
+
   void DrawFrame(const FrameInfo& frame) {
     if (!swapchain_ && !CreateSwapchain()) {
       return;
     }
-
-    // The pass with the most indices is normally the 3D scene; HUD passes
-    // can have more draws.
-    uint32_t pass_count = uint32_t(frame.passes.size());
-    std::vector<uint32_t> pass_draws(pass_count);
-    std::vector<uint64_t> pass_indices(pass_count);
-    for (const Draw& draw : frame.captured) {
-      pass_draws[std::min(draw.pass, pass_count - 1)]++;
-      pass_indices[std::min(draw.pass, pass_count - 1)] += draw.index_count;
-    }
-    uint32_t busiest = uint32_t(std::max_element(pass_indices.begin(), pass_indices.end()) -
-                                pass_indices.begin());
-    HandleKeys();
-    uint32_t pass = uint32_t(((int64_t(busiest) + pass_offset_) % pass_count + pass_count) %
-                             pass_count);
-    FitPass(frame, pass);
-    Dump(frame, pass);
-    frames_total_++;
-    SetTitle(fmt::format("Naruto - native renderer | pass {}/{}{} | {} of {} draws", pass + 1,
-                         pass_count, pass_offset_ ? "" : " (busiest)", pass_draws[pass],
-                         frame.draws));
-
     VkFence fence = frame_done_[frame_index_];
     vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+    frames_total_++;
     FreeRetired();
+    HandleKeys();
+    uint32_t pass_count = uint32_t(frame.passes.size());
+    // 0 shows the presented frame; n shows pass n's first render target.
+    uint32_t shown_pass = pass_offset_ ? uint32_t(((pass_offset_ - 1) % int64_t(pass_count) +
+                                                   pass_count) % pass_count)
+                                       : UINT32_MAX;
+    Dump(frame, shown_pass == UINT32_MAX ? 0 : shown_pass);
+    static const long dump_frame = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
+      return value ? std::atol(value) : -1;
+    }();
+    const char* snapshot_dir = std::getenv("NARUTO_NATIVE_VIEW_SNAPSHOTS");
+    bool snapshots = snapshot_dir && dump_frame >= 0 && long(frames_total_) >= dump_frame &&
+                     (long(frames_total_) - dump_frame) % 300 == 0;
 
-    // Shared constants for each shown draw, with its textures' descriptor
-    // and sampler indices (XenosRecomp's layout: 2D, 3D and cube texture
-    // indices at 0, 64 and 128, sampler indices at 192, four bytes per
-    // sampler register).
+    // Plan the frame on the CPU, in the game's order: resolves create their
+    // destination images before later draws look textures up.
+    new_images_.clear();
+    if (snapshots && !PrepareSnapshots(pass_count + 1)) {
+      snapshots = false;
+    }
+    std::vector<PassTargets> targets = PlanTargets(frame);
+    std::vector<ResolvedTexture*> resolve_destinations(frame.resolves.size());
     std::vector<PendingUpload> texture_uploads;
     size_t budget = kTextureUploadBudget;
-    shared_.clear();
-    for (const Draw& draw : frame.captured) {
-      if (draw.pass != pass) {
-        continue;
+    shared_.resize(frame.captured.size() * kSharedConstantsSize);
+    size_t next_resolve = 0;
+    auto plan_resolves = [&](uint32_t up_to_pass) {
+      for (; next_resolve < frame.resolves.size() &&
+             frame.resolves[next_resolve].pass <= up_to_pass;
+           ++next_resolve) {
+        resolve_destinations[next_resolve] = ResolveDestination(frame.resolves[next_resolve]);
       }
-      size_t at = shared_.size();
-      shared_.insert(shared_.end(), frame.data.begin() + draw.shared_constants,
-                     frame.data.begin() + draw.shared_constants + kSharedConstantsSize);
+    };
+    for (size_t d = 0; d < frame.captured.size(); ++d) {
+      const Draw& draw = frame.captured[d];
+      if (draw.pass) {
+        plan_resolves(draw.pass - 1);
+      }
+      uint8_t* shared = shared_.data() + d * kSharedConstantsSize;
+      std::memcpy(shared, frame.data.data() + draw.shared_constants, kSharedConstantsSize);
+      // XenosRecomp's layout: 2D, 3D and cube texture indices at 0, 64 and
+      // 128, sampler indices at 192, four bytes per sampler register.
       for (uint32_t t = 0; t < draw.texture_count; ++t) {
         const TextureBinding& binding = frame.textures[draw.first_texture + t];
         const CachedTexture* texture = Texture(frame, binding.fetch, texture_uploads, budget);
         uint32_t heap = texture ? texture->heap : 0, index = texture ? texture->index : 0;
         uint32_t sampler = SamplerIndex(binding.fetch);
-        std::memcpy(&shared_[at + heap * 64 + binding.sampler * 4], &index, 4);
-        std::memcpy(&shared_[at + 192 + binding.sampler * 4], &sampler, 4);
+        std::memcpy(shared + heap * 64 + binding.sampler * 4, &index, 4);
+        std::memcpy(shared + 192 + binding.sampler * 4, &sampler, 4);
       }
     }
+    plan_resolves(UINT32_MAX);
+
     VkDeviceSize shared_offset = (frame.data.size() + 15) & ~VkDeviceSize(15);
     VkDeviceSize total = shared_offset + shared_.size();
     for (PendingUpload& pending : texture_uploads) {
@@ -1306,6 +1710,29 @@ class View {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
+
+    // New render targets and resolve destinations start cleared, in GENERAL.
+    for (const NewImage& image : new_images_) {
+      VkImageAspectFlags aspect = image.depth ? VK_IMAGE_ASPECT_DEPTH_BIT
+                                              : VK_IMAGE_ASPECT_COLOR_BIT;
+      VkImageSubresourceRange range{aspect, 0, 1, 0, image.layers};
+      VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+      barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+      barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+      barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+      barrier.image = image.image;
+      barrier.subresourceRange = range;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           0, 0, nullptr, 0, nullptr, 1, &barrier);
+      if (image.depth) {
+        VkClearDepthStencilValue clear{1.0f, 0};
+        vkCmdClearDepthStencilImage(cmd, image.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+      } else {
+        VkClearColorValue clear{};
+        vkCmdClearColorImage(cmd, image.image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
+      }
+    }
     for (const PendingUpload& pending : texture_uploads) {
       const texture_decode::Texture& t = pending.decoded;
       VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, t.layers};
@@ -1333,74 +1760,178 @@ class View {
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                            0, 0, nullptr, 0, nullptr, 1, &barrier);
     }
-    const PassInfo& pass_info = frame.passes[pass];
-    VkClearValue clears[2] = {};
-    if (pass_info.has_clear_color) {
-      std::copy(pass_info.clear_color, pass_info.clear_color + 4, clears[0].color.float32);
-    } else {
-      clears[0].color = {{0.08f, 0.08f, 0.1f, 1.0f}};
-    }
-    clears[1].depthStencil = {pass_info.clear_depth, 0};
-    VkRenderPassBeginInfo pass_begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
-    pass_begin.renderPass = render_pass_;
-    pass_begin.framebuffer = targets_[image_index].framebuffer;
-    pass_begin.renderArea = {{0, 0}, extent_};
-    pass_begin.clearValueCount = 2;
-    pass_begin.pClearValues = clears;
-    vkCmdBeginRenderPass(cmd, &pass_begin, VK_SUBPASS_CONTENTS_INLINE);
+    Barrier(vkCmdPipelineBarrier, cmd);
 
+    // The passes, each followed by the resolves that end it.
     vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout_, 0, 4,
                             descriptor_sets_.data(), 0, nullptr);
-    VkRect2D scissor{{0, 0}, extent_};
-    vkCmdSetScissor(cmd, 0, 1, &scissor);
-    VkPipeline bound = VK_NULL_HANDLE;
     uint32_t drawn = 0;
-    VkDeviceSize draw_shared = shared_offset;
-    for (const Draw& draw : frame.captured) {
-      if (draw.pass != pass) {
-        continue;
+    size_t d = 0;
+    next_resolve = 0;
+    // The game never clears depth itself (its resolves don't set the clear
+    // flags), so each depth buffer starts the frame cleared.
+    std::set<const RenderTarget*> depth_cleared;
+    for (uint32_t pass = 0; pass < pass_count; ++pass) {
+      size_t first = d;
+      while (d < frame.captured.size() && frame.captured[d].pass <= pass) {
+        ++d;
       }
-      VkDeviceAddress shared_address = upload.address + draw_shared;
-      draw_shared += kSharedConstantsSize;
-      if (!draw.index_count) {
-        continue;
+      const PassTargets& pt = targets[pass];
+      if (d > first && (pt.color_count || pt.depth) && pt.extent.width != UINT32_MAX) {
+        std::array<VkRenderingAttachmentInfo, 4> colors{};
+        for (uint32_t i = 0; i < pt.color_count; ++i) {
+          colors[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+          colors[i].imageView = pt.color[i] ? pt.color[i]->image.view : VK_NULL_HANDLE;
+          colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+          colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+          colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingAttachmentInfo depth{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        if (pt.depth) {
+          depth.imageView = pt.depth->image.view;
+          depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+          depth.loadOp = depth_cleared.insert(pt.depth).second ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
+          depth.clearValue.depthStencil = {1.0f, 0};
+          depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+        }
+        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        rendering.renderArea = {{0, 0}, pt.extent};
+        rendering.layerCount = 1;
+        rendering.colorAttachmentCount = pt.color_count;
+        rendering.pColorAttachments = colors.data();
+        rendering.pDepthAttachment = pt.depth ? &depth : nullptr;
+        vkCmdBeginRendering(cmd, &rendering);
+        VkRect2D scissor{{0, 0}, pt.extent};
+        vkCmdSetScissor(cmd, 0, 1, &scissor);
+        VkPipeline bound = VK_NULL_HANDLE;
+        for (size_t i = first; i < d; ++i) {
+          const Draw& draw = frame.captured[i];
+          VkViewport viewport = Viewport(draw);
+          if (!draw.index_count || viewport.width <= 0.0f || viewport.height == 0.0f) {
+            continue;
+          }
+          VkPipeline pipeline = Pipeline(frame, draw, pt);
+          if (!pipeline) {
+            continue;
+          }
+          if (pipeline != bound) {
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+            bound = pipeline;
+          }
+          vkCmdSetViewport(cmd, 0, 1, &viewport);
+          std::array<VkBuffer, 16> buffers;
+          std::array<VkDeviceSize, 16> offsets;
+          for (uint32_t b = 0; b < draw.binding_count; ++b) {
+            buffers[b] = upload.buffer;
+            offsets[b] = frame.bindings[draw.first_binding + b].data_offset;
+          }
+          if (draw.binding_count) {
+            vkCmdBindVertexBuffers(cmd, 0, draw.binding_count, buffers.data(), offsets.data());
+          }
+          vkCmdBindIndexBuffer(cmd, upload.buffer, draw.index_offset, VK_INDEX_TYPE_UINT32);
+          PushConstants push{upload.address + draw.vertex_constants,
+                             upload.address + draw.pixel_constants,
+                             upload.address + shared_offset + i * kSharedConstantsSize};
+          vkCmdPushConstants(cmd, pipeline_layout_,
+                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                             sizeof(push), &push);
+          vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
+          drawn++;
+        }
+        vkCmdEndRendering(cmd);
+        Barrier(vkCmdPipelineBarrier, cmd);
       }
-      VkViewport viewport = Viewport(draw);
-      if (viewport.width <= 0.0f || viewport.height == 0.0f) {
-        continue;
+      for (; next_resolve < frame.resolves.size() && frame.resolves[next_resolve].pass <= pass;
+           ++next_resolve) {
+        const Resolve& r = frame.resolves[next_resolve];
+        ResolvedTexture* dest = resolve_destinations[next_resolve];
+        auto source = render_targets_.find(TargetKey(r.surface_info, r.source_info,
+                                                     (r.flags & 7) == 4));
+        if (dest && source != render_targets_.end()) {
+          RecordResolve(cmd, r, source->second, *dest);
+          Barrier(vkCmdPipelineBarrier, cmd);
+        }
       }
-      VkPipeline pipeline = Pipeline(frame, draw);
-      if (!pipeline) {
-        continue;
+      if (snapshots) {
+        for (uint32_t i = 0; i < pt.color_count; ++i) {
+          if (pt.color[i]) {
+            RecordSnapshot(cmd, pt.color[i]->image.image, {pt.color[i]->width, pt.color[i]->height},
+                           pass);
+            break;
+          }
+        }
       }
-      if (pipeline != bound) {
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-        bound = pipeline;
-      }
-      vkCmdSetViewport(cmd, 0, 1, &viewport);
-      std::array<VkBuffer, 16> buffers;
-      std::array<VkDeviceSize, 16> offsets;
-      for (uint32_t i = 0; i < draw.binding_count; ++i) {
-        buffers[i] = upload.buffer;
-        offsets[i] = frame.bindings[draw.first_binding + i].data_offset;
-      }
-      if (draw.binding_count) {
-        vkCmdBindVertexBuffers(cmd, 0, draw.binding_count, buffers.data(), offsets.data());
-      }
-      vkCmdBindIndexBuffer(cmd, upload.buffer, draw.index_offset, VK_INDEX_TYPE_UINT32);
-      PushConstants push{upload.address + draw.vertex_constants,
-                         upload.address + draw.pixel_constants,
-                         shared_address};
-      vkCmdPushConstants(cmd, pipeline_layout_,
-                         VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                         sizeof(push), &push);
-      vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
-      drawn++;
     }
-    vkCmdEndRenderPass(cmd);
+
+    // Present: the front buffer texture, or a pass's render target.
+    VkImage present_source = VK_NULL_HANDLE;
+    VkExtent2D present_extent{};
+    std::string shown;
+    if (shown_pass == UINT32_MAX) {
+      auto front = frame.has_front_buffer ? resolved_.find(frame.front_buffer[1] & 0x1FFFF000)
+                                          : resolved_.end();
+      if (front != resolved_.end()) {
+        present_source = front->second.entry.image.image;
+        present_extent = {front->second.width, front->second.height};
+      }
+      shown = "presented frame";
+    } else {
+      const PassTargets& pt = targets[shown_pass];
+      RenderTarget* target = nullptr;
+      for (uint32_t i = 0; i < pt.color_count && !target; ++i) {
+        target = pt.color[i];
+      }
+      if (target) {
+        present_source = target->image.image;
+        present_extent = {target->width, target->height};
+      }
+      shown = fmt::format("pass {}/{}", shown_pass + 1, pass_count);
+    }
+    SetTitle(fmt::format("Naruto - native renderer | {} | {} draws, {} resolves", shown,
+                         frame.draws, frame.resolves.size()));
+    if (snapshots && present_source) {
+      RecordSnapshot(cmd, present_source, present_extent, pass_count);
+    }
+    VkImage swap_image = targets_[image_index].image;
+    VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkImageMemoryBarrier to_dst{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    to_dst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_dst.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    to_dst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_dst.srcQueueFamilyIndex = to_dst.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_dst.image = swap_image;
+    to_dst.subresourceRange = range;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                         0, nullptr, 0, nullptr, 1, &to_dst);
+    VkClearColorValue background = {{0.08f, 0.08f, 0.1f, 1.0f}};
+    vkCmdClearColorImage(cmd, swap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1,
+                         &range);
+    if (present_source) {
+      // Fit the source's aspect ratio inside the window.
+      float scale = std::min(float(extent_.width) / present_extent.width,
+                             float(extent_.height) / present_extent.height);
+      int32_t w = int32_t(present_extent.width * scale), h = int32_t(present_extent.height * scale);
+      int32_t x = (int32_t(extent_.width) - w) / 2, y = (int32_t(extent_.height) - h) / 2;
+      VkImageBlit blit{};
+      blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.srcOffsets[1] = {int32_t(present_extent.width), int32_t(present_extent.height), 1};
+      blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+      blit.dstOffsets[0] = {x, y, 0};
+      blit.dstOffsets[1] = {x + w, y + h, 1};
+      vkCmdBlitImage(cmd, present_source, VK_IMAGE_LAYOUT_GENERAL, swap_image,
+                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+    }
+    VkImageMemoryBarrier to_present = to_dst;
+    to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_present.dstAccessMask = 0;
+    to_present.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                         0, 0, nullptr, 0, nullptr, 1, &to_present);
     vkEndCommandBuffer(cmd);
 
-    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkSemaphore render_done = targets_[image_index].render_done;
     VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submit.waitSemaphoreCount = 1;
@@ -1411,6 +1942,10 @@ class View {
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &render_done;
     vkQueueSubmit(queue_, 1, &submit, fence);
+    if (snapshots) {
+      vkQueueWaitIdle(queue_);
+      WriteSnapshots(snapshot_dir, pass_count + 1);
+    }
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     present.waitSemaphoreCount = 1;
@@ -1431,12 +1966,13 @@ class View {
     double seconds = std::chrono::duration<double>(now - log_start_).count();
     if (seconds >= 10.0) {
       REXLOG_INFO(
-          "[native view] {:.1f} fps, {:.1f} draws/frame in the shown pass, {} passes, "
-          "{:.1f} MB captured/frame, {} pipelines, {} textures ({} not decodable), "
-          "{:.1f} MB of textures uploaded",
+          "[native view] {:.1f} fps, {:.1f} draws/frame, {} passes, {} resolves, "
+          "{:.1f} MB captured/frame, {} pipelines, {} render targets, {} resolved textures, "
+          "{} textures ({} not decodable), {:.1f} MB of textures uploaded",
           frames_presented_ / seconds, double(draws_drawn_) / std::max<uint64_t>(frames_presented_, 1),
-          pass_count, frame.data.size() / 1048576.0, pipelines_.size(), textures_.size(),
-          textures_failed_, textures_uploaded_bytes_ / 1048576.0);
+          pass_count, frame.resolves.size(), frame.data.size() / 1048576.0, pipelines_.size(),
+          render_targets_.size(), resolved_.size(), textures_.size(), textures_failed_,
+          textures_uploaded_bytes_ / 1048576.0);
       textures_uploaded_bytes_ = 0;
       frames_presented_ = 0;
       draws_drawn_ = 0;
@@ -1445,9 +1981,20 @@ class View {
   }
 
   struct Target {
-    VkImageView view = VK_NULL_HANDLE;
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
+    VkImage image = VK_NULL_HANDLE;
     VkSemaphore render_done = VK_NULL_HANDLE;
+  };
+
+  struct NewImage {
+    VkImage image;
+    bool depth;
+    uint32_t layers;
+  };
+
+  struct Scratch {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
   };
 
   std::once_flag started_;
@@ -1459,8 +2006,6 @@ class View {
   SDL_Window* window_ = nullptr;
   std::string title_;
   int64_t pass_offset_ = 0;
-  float target_width_ = 1280.0f;
-  float target_height_ = 720.0f;
   bool key_left_ = false;
   bool key_right_ = false;
   uint64_t frames_presented_ = 0;
@@ -1505,11 +2050,21 @@ class View {
   std::vector<VkShaderModule> shader_modules_;
   std::map<std::vector<uint32_t>, VkPipeline> pipelines_;
 
-  VkRenderPass render_pass_ = VK_NULL_HANDLE;
+  std::map<uint64_t, RenderTarget> render_targets_;
+  std::map<uint32_t, ResolvedTexture> resolved_;
+  std::vector<NewImage> new_images_;
+  Scratch scratch_;
+  Image snapshot_image_;
+  struct {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkDeviceSize size = 0;
+    uint8_t* mapped = nullptr;
+  } snapshot_buffer_;
+
   VkSurfaceFormatKHR format_{};
   VkExtent2D extent_{};
   VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
-  Image depth_;
   std::vector<Target> targets_;
 };
 

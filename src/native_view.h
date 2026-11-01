@@ -60,13 +60,30 @@ struct Draw {
   uint32_t shared_constants = 0;
   // Xenos register values for the draw.
   uint32_t surface_info = 0;   // RB_SURFACE_INFO
+  uint32_t color_info[4] = {}; // RB_COLOR_INFO, RB_COLOR1_INFO...
+  uint32_t depth_info = 0;     // RB_DEPTH_INFO
   uint32_t depth_control = 0;  // RB_DEPTHCONTROL
-  uint32_t blend_control = 0;  // RB_BLENDCONTROL0
-  uint32_t color_mask = 0;     // RB_COLOR_MASK
+  uint32_t blend_control[4] = {};  // RB_BLENDCONTROL0-3
+  uint32_t color_mask = 0;     // RB_COLOR_MASK, four bits per render target
   uint32_t vte_control = 0;    // PA_CL_VTE_CNTL
   uint32_t mode_control = 0;   // PA_SU_SC_MODE_CNTL
   bool alpha_test = false;
   float viewport[6] = {};  // PA_CL_VPORT_{X,Y,Z}{SCALE,OFFSET}, interleaved
+};
+
+// A Resolve: copies a render target (or the depth buffer) into a texture.
+// It ends pass `pass`.
+struct Resolve {
+  uint32_t pass = 0;
+  uint32_t flags = 0;  // bits 0-2: render target 0-3, or 4 for depth
+  uint32_t surface_info = 0;
+  uint32_t source_info = 0;  // RB_COLOR*_INFO or RB_DEPTH_INFO of the source
+  bool has_rect = false;
+  int32_t rect[4] = {};  // source x1, y1, x2, y2
+  int32_t point[2] = {};  // destination x, y
+  uint32_t level = 0;
+  uint32_t slice = 0;
+  uint32_t fetch[6] = {};  // the destination texture's fetch constant
 };
 
 // How a pass's render target starts: the Resolve that ended the previous
@@ -84,6 +101,10 @@ struct FrameInfo {
   std::vector<VertexBinding> bindings;
   std::vector<VertexAttribute> attributes;
   std::vector<TextureBinding> textures;
+  std::vector<Resolve> resolves;
+  // The texture D3DDevice_Swap presented.
+  bool has_front_buffer = false;
+  uint32_t front_buffer[6] = {};
   std::vector<uint8_t> data;  // vertices, indices and constants
   // Guest memory, where the view reads texture data.
   const uint8_t* guest_base = nullptr;

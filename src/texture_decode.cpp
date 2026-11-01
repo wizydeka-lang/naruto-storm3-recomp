@@ -40,6 +40,12 @@ constexpr FormatInfo kFormats[] = {
     {20, VK_FORMAT_BC3_UNORM_BLOCK, 4, 16, {0, 1, 2, 3}},           // DXT4_5
     {25, VK_FORMAT_R16G16_UNORM, 1, 4, {0, 1, 2, 3}},               // 16_16
     {26, VK_FORMAT_R16G16B16A16_UNORM, 1, 8, {0, 1, 2, 3}},         // 16_16_16_16
+    // The _EXPAND formats read 16-bit values as floats; render target copies
+    // of 16-bit float targets use them.
+    {27, VK_FORMAT_R16_SFLOAT, 1, 2, {0, 1, 2, 3}},                 // 16_EXPAND
+    {28, VK_FORMAT_R16G16_SFLOAT, 1, 4, {0, 1, 2, 3}},              // 16_16_EXPAND
+    {29, VK_FORMAT_R16G16B16A16_SFLOAT, 1, 8, {0, 1, 2, 3}},        // 16_16_16_16_EXPAND
+    {30, VK_FORMAT_R16_SFLOAT, 1, 2, {0, 1, 2, 3}},                 // 16_FLOAT
     {31, VK_FORMAT_R16G16_SFLOAT, 1, 4, {0, 1, 2, 3}},              // 16_16_FLOAT
     {32, VK_FORMAT_R16G16B16A16_SFLOAT, 1, 8, {0, 1, 2, 3}},        // 16_16_16_16_FLOAT
     {36, VK_FORMAT_R32_SFLOAT, 1, 4, {0, 1, 2, 3}},                 // 32_FLOAT
