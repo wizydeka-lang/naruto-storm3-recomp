@@ -1,0 +1,115 @@
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index 698a418..ee7eeb1 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -1,3 +1,6 @@
++#include <set>
++#include <string>
++#include <string_view>
+ #include "shader_recompiler.h"
+ #include "shader_common.h"
+ 
+@@ -118,6 +121,24 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::Color, 1 }
+ };
+ 
++// Constant names come from the game's constant tables and become macros, so a
++// name that is also an HLSL intrinsic (Naruto has a constant named clip)
++// would replace that intrinsic. Such names get a c_ prefix; the returned
++// pointer stays valid for the thread's lifetime.
++static const char* hlslSafeConstantName(const char* name)
++{
++    static const std::set<std::string_view> intrinsics = {
++        "abs", "clamp", "clip", "cos", "cross", "ddx", "ddy", "degrees", "distance", "dot",
++        "exp", "exp2", "floor", "fmod", "frac", "length", "lerp", "lit", "log", "log2", "max",
++        "min", "mul", "normalize", "pow", "radians", "reflect", "refract", "round", "rsqrt",
++        "saturate", "select", "sign", "sin", "smoothstep", "sqrt", "step", "tan", "trunc" };
++    if (!intrinsics.count(name))
++        return name;
++    thread_local std::map<std::string, std::string> renamed;
++    auto& safe = renamed.try_emplace(name, std::string("c_") + name).first->second;
++    return safe.c_str();
++}
++
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+ {
+     "2D",
+@@ -307,7 +328,8 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+     switch (instr.dimension)
+     {
+     case TextureDimension::Texture1D:
+-        dimension = "1D";
++        // Sampled as an Nx1 2D texture; see below.
++        dimension = "2D";
+         componentCount = 1;
+         break;
+     case TextureDimension::Texture2D:
+@@ -332,10 +354,22 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
+ #endif
+ 
+     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+-    printSrcRegister(componentCount);
++    if (instr.dimension == TextureDimension::Texture1D)
++    {
++        out += "float2(";
++        printSrcRegister(1);
++        out += ", 0.5)";
++    }
++    else
++    {
++        printSrcRegister(componentCount);
++    }
+ 
+     switch (instr.dimension)
+     {
++    case TextureDimension::Texture1D:
++        print(", float2({}, 0.0)", instr.offsetX * 0.5f);
++        break;
+     case TextureDimension::Texture2D:
+         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
+         break;
+@@ -458,7 +492,7 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
+                 auto findResult = float4Constants.find(reg);
+                 if (findResult != float4Constants.end())
+                 {
+-                    const char* constantName = reinterpret_cast<const char*>(constantTableData + findResult->second->name);
++                    const char* constantName = hlslSafeConstantName(reinterpret_cast<const char*>(constantTableData + findResult->second->name));
+                     if (findResult->second->registerCount > 1)
+                     {
+                     #ifdef UNLEASHED_RECOMP
+@@ -1125,7 +1159,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         const auto constantInfo = reinterpret_cast<const ConstantInfo*>(
+             constantTableData + constantTableContainer->constantTable.constantInfo + i * sizeof(ConstantInfo));
+ 
+-        const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++        const char* constantName = hlslSafeConstantName(reinterpret_cast<const char*>(constantTableData + constantInfo->name));
+ 
+     #ifdef UNLEASHED_RECOMP
+         if (!isPixelShader)
+@@ -1199,7 +1233,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (constantInfo->registerSet == RegisterSet::Float4)
+         {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++            const char* constantName = hlslSafeConstantName(reinterpret_cast<const char*>(constantTableData + constantInfo->name));
+ 
+             print("\tfloat4 {}", constantName);
+ 
+@@ -1228,7 +1262,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (constantInfo->registerSet == RegisterSet::Sampler)
+         {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++            const char* constantName = hlslSafeConstantName(reinterpret_cast<const char*>(constantTableData + constantInfo->name));
+ 
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+@@ -1253,7 +1287,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+         if (constantInfo->registerSet == RegisterSet::Bool)
+         {
+-            const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
++            const char* constantName = hlslSafeConstantName(reinterpret_cast<const char*>(constantTableData + constantInfo->name));
+             println("\t#define {} (1 << {})", constantName, constantInfo->registerIndex + (isPixelShader ? 16 : 0));
+             boolConstants.emplace(constantInfo->registerIndex, constantName);
+         }
