@@ -34,6 +34,7 @@ endif()
 # Sources
 set(NARUTO_SOURCES
     src/main.cpp
+    src/render_probe.cpp
 )
 
 if(WIN32)
