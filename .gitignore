@@ -6,3 +6,9 @@
 /out/
 *.rdc
 __pycache__/
+
+# Android app build output
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
