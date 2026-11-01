@@ -1,0 +1,33 @@
+# Gameplay profile, copied beside the executable as naruto.toml on first build.
+# Errors and warnings remain visible. vulkan_* keys only apply to the Vulkan
+# backend (Linux); Windows uses Direct3D 12 and reports them as unknown.
+log_level = "info"
+log_flush_interval = 1
+log_max_file_size_mb = 8
+log_max_files = 2
+log_noisy = false
+
+async_shader_compilation = true
+gpu_debug_markers = false
+vulkan_validation_enabled = false
+vulkan_log_debug_messages = true
+draw_resolution_scale_x = 1
+draw_resolution_scale_y = 1
+vsync = true
+
+# Estimate the EDRAM extent of unclipped screen-space draws (clears) by running
+# their vertex shader on the CPU, as Xenia Canary does by default. Without it,
+# the 4x MSAA depth clear after the intro movie is assumed full-height, wraps
+# around EDRAM and takes over the movie's color target, so the trailer resolves
+# black (and character render targets get clobbered the same way).
+execute_unclipped_draw_vs_on_cpu = true
+
+# Pace host window presentation to the display instead of redrawing uncapped.
+# Keep guest VSync and the original guest resolution.
+vulkan_allow_present_mode_immediate = false
+vulkan_allow_present_mode_mailbox = false
+vulkan_allow_present_mode_fifo_relaxed = false
+
+[log.levels]
+gpu = "info"
+apu = "info"
