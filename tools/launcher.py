@@ -6,6 +6,7 @@ window (needs PySide6) or, failing that, a terminal menu; the options below
 launch directly.
 Usage: python3 tools/launcher.py [--xex PATH] [--gpu ID] [--keyboard | --no-keyboard]
                                  [--build release|debug] [--resolution 720p|1080p|1440p]
+                                 [--render-scale 1|2|3]
                                  [--fullscreen | --no-fullscreen] [--upscaler fsr|cas|bilinear]
                                  [--play] [--list-gpus] [--cli]
        (Windows: py -3 tools\\launcher.py ...)
@@ -33,13 +34,21 @@ VENDORS = {
     "0x1002": ("AMD", "radeon_icd"),
     "0x8086": ("Intel", "intel_icd"),
 }
-# Render scale and window size per choice. The SDK only scales by whole
-# numbers, so 1080p and 1440p both render at 2x (2560x1440) and differ in the
-# window size; the game still sees its own 1280x640 image either way.
+# Window size per choice. The game always draws its own 1280x720 frame; the
+# render scale below sets how many host pixels each of its pixels gets, and the
+# upscaler stretches the result to the window or screen.
 RESOLUTIONS = {
-    "720p": ("720p (original)", 1, None),
-    "1080p": ("1080p (sharper, slower)", 2, (1920, 1080)),
-    "1440p": ("1440p (sharper, slower)", 2, (2560, 1440)),
+    "720p": ("720p (original)", None),
+    "1080p": ("1080p", (1920, 1080)),
+    "1440p": ("1440p", (2560, 1440)),
+}
+# Internal render scale (draw_resolution_scale_x/y). The SDK's render target
+# and texture caches map each guest pixel to a whole block of host pixels, so
+# only whole numbers work; the GPU work grows with the square of the scale.
+RENDER_SCALES = {
+    1: "1x (1280x720)",
+    2: "2x (2560x1440, about 4x the GPU work)",
+    3: "3x (3840x2160, about 9x the GPU work)",
 }
 # Output upscalers (ReXGlue present_effect). They sharpen the 720p image as it
 # is scaled to the screen and cost almost nothing; they need an SDK set up
@@ -228,7 +237,8 @@ def prepare_launch(settings):
     command = [str(exe), f"--game_data_root={game_root}", "--gpu_plugin=xenos"]
     if settings["keyboard"]:
         command.append("--mnk_mode=true")
-    _, scale, window = RESOLUTIONS[settings["resolution"]]
+    _, window = RESOLUTIONS[settings["resolution"]]
+    scale = settings["render_scale"]
     command += [f"--draw_resolution_scale_x={scale}", f"--draw_resolution_scale_y={scale}",
                 f"--fullscreen={'true' if settings['fullscreen'] else 'false'}"]
     if window:
@@ -273,7 +283,7 @@ def launch(settings):
 def load_settings():
     settings = {"xex": str(ROOT / "assets" / "default.xex"), "gpu": "auto",
                 "keyboard": False, "build": "release", "resolution": "720p",
-                "fullscreen": True, "upscaler": "fsr"}
+                "render_scale": 1, "fullscreen": True, "upscaler": "fsr"}
     try:
         settings.update(json.loads(SETTINGS.read_text()))
     except (OSError, ValueError):
@@ -282,6 +292,8 @@ def load_settings():
         settings["gpu"] = "auto"
     if settings["resolution"] not in RESOLUTIONS:
         settings["resolution"] = "720p"
+    if settings["render_scale"] not in RENDER_SCALES:
+        settings["render_scale"] = 1
     if settings["upscaler"] not in UPSCALERS:
         settings["upscaler"] = "fsr"
     return settings
@@ -307,6 +319,7 @@ def menu(settings):
         print(f" 5) Resolution: {RESOLUTIONS[settings['resolution']][0]}")
         print(f" 6) Fullscreen: {'on' if settings['fullscreen'] else 'off'}")
         print(f" 7) Upscaler:   {UPSCALERS[settings['upscaler']]}")
+        print(f" 8) Render scale: {RENDER_SCALES[settings['render_scale']]}")
         print(" P) Play   Q) Quit")
         answer = input("> ").strip().lower()
         if answer == "1":
@@ -331,6 +344,9 @@ def menu(settings):
         elif answer == "7":
             keys = list(UPSCALERS)
             settings["upscaler"] = keys[(keys.index(settings["upscaler"]) + 1) % len(keys)]
+        elif answer == "8":
+            keys = list(RENDER_SCALES)
+            settings["render_scale"] = keys[(keys.index(settings["render_scale"]) + 1) % len(keys)]
         elif answer == "p":
             save_settings(settings)
             return launch(settings)
@@ -347,6 +363,7 @@ def main():
     parser.add_argument("--keyboard", action=argparse.BooleanOptionalAction, help="keyboard controls")
     parser.add_argument("--build", choices=("release", "debug"))
     parser.add_argument("--resolution", choices=tuple(RESOLUTIONS))
+    parser.add_argument("--render-scale", type=int, choices=tuple(RENDER_SCALES))
     parser.add_argument("--fullscreen", action=argparse.BooleanOptionalAction)
     parser.add_argument("--upscaler", choices=tuple(UPSCALERS))
     parser.add_argument("--play", action="store_true", help="launch now without the menu")
@@ -375,6 +392,8 @@ def main():
         settings["build"] = args.build
     if args.resolution:
         settings["resolution"] = args.resolution
+    if args.render_scale:
+        settings["render_scale"] = args.render_scale
     if args.fullscreen is not None:
         settings["fullscreen"] = args.fullscreen
     if args.upscaler:

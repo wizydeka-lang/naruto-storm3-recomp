@@ -1,5 +1,5 @@
 # Game files are supplied by each user and never committed.
-/assets/
+/assets
 # Translated game code, regenerated from assets/default.xex during the build.
 /generated/default/
 # Build outputs contain translated game code too.

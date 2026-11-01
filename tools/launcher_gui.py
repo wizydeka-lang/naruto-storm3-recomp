@@ -10,10 +10,11 @@ from PySide6.QtWidgets import (
 
 import launcher
 
-RESOLUTION_HELP = ("720p renders at the original 1280x720.\n"
-                   "1080p and 1440p render at 2x (2560x1440) for a sharper image, which\n"
-                   "takes about 4x the GPU work (an RTX 2050 drops from 30 to ~18 FPS).\n"
-                   "In fullscreen the image fills the screen; the size sets the window otherwise.")
+RESOLUTION_HELP = ("Window size. The image is scaled to it by the upscaler, so this costs\n"
+                   "almost nothing. In fullscreen the image fills the screen instead.")
+RENDER_SCALE_HELP = ("How many pixels the game is drawn at. 1x is the original 1280x720.\n"
+                     "2x is sharper but takes about 4x the GPU work (an RTX 2050 drops from\n"
+                     "30 to ~18 FPS). Only whole numbers are supported.")
 UPSCALER_HELP = ("Sharpens the image as it is scaled up to your screen, at almost no cost.\n"
                  "FSR 1 is the sharpest. Needs an SDK set up by tools/setup-sdk.")
 KEYBOARD_HELP = ("W A S D: left stick   Arrows: right stick   Space: A   Backspace: B\n"
@@ -51,7 +52,7 @@ class LauncherWindow(QWidget):
         self.keyboard.toggled.connect(self.changed)
 
         self.resolution = QComboBox()
-        for key, (label, _, _) in launcher.RESOLUTIONS.items():
+        for key, (label, _) in launcher.RESOLUTIONS.items():
             self.resolution.addItem(label, key)
         self.resolution.setCurrentIndex(max(self.resolution.findData(settings["resolution"]), 0))
         self.resolution.setToolTip(RESOLUTION_HELP)
@@ -62,6 +63,13 @@ class LauncherWindow(QWidget):
         resolution_row = QHBoxLayout()
         resolution_row.addWidget(self.resolution, 1)
         resolution_row.addWidget(self.fullscreen)
+
+        self.render_scale = QComboBox()
+        for key, label in launcher.RENDER_SCALES.items():
+            self.render_scale.addItem(label, key)
+        self.render_scale.setCurrentIndex(max(self.render_scale.findData(settings["render_scale"]), 0))
+        self.render_scale.setToolTip(RENDER_SCALE_HELP)
+        self.render_scale.currentIndexChanged.connect(self.changed)
 
         self.upscaler = QComboBox()
         for key, label in launcher.UPSCALERS.items():
@@ -83,6 +91,7 @@ class LauncherWindow(QWidget):
         if found:
             form.addRow("", QLabel(f"GPUs in this PC: {found}"))
         form.addRow("Resolution:", resolution_row)
+        form.addRow("Render scale:", self.render_scale)
         form.addRow("Upscaler:", self.upscaler)
         form.addRow("Controls:", self.keyboard)
         form.addRow("Build:", self.build)
@@ -113,6 +122,7 @@ class LauncherWindow(QWidget):
         self.settings["keyboard"] = self.keyboard.isChecked()
         self.settings["build"] = self.build.currentData()
         self.settings["resolution"] = self.resolution.currentData()
+        self.settings["render_scale"] = self.render_scale.currentData()
         self.settings["fullscreen"] = self.fullscreen.isChecked()
         self.settings["upscaler"] = self.upscaler.currentData()
         launcher.save_settings(self.settings)

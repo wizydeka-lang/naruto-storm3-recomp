@@ -153,6 +153,7 @@ Many Linux desktops (KDE, Bazzite) already include it. Without PySide6, or with 
  5) Resolution: 720p (original)
  6) Fullscreen: on
  7) Upscaler:   AMD FSR 1 (sharpest)
+ 8) Render scale: 1x (1280x720)
  P) Play   Q) Quit
 ```
 
@@ -160,15 +161,16 @@ Many Linux desktops (KDE, Bazzite) already include it. Without PySide6, or with 
 - **GPU:** pick which graphics card runs the game.
   - On Linux, each card is listed by name. The launcher makes Vulkan use only that card's driver.
   - On Windows, choose **High performance** (dedicated GPU), **Power saving** (integrated GPU) or **Let Windows decide**. The launcher saves this as Windows' per-app graphics preference for `naruto.exe`, the same setting as Settings › System › Display › Graphics.
-- **Resolution:**
+- **Resolution:** the window size: 720p, 1080p or 1440p. The game's image is scaled to it by the upscaler, which costs almost nothing. With **Fullscreen** on, the picture fills your screen and the window size doesn't matter.
+- **Render scale:** how many pixels the game is drawn at.
 
-  | Choice | Rendered at | Window |
+  | Choice | Rendered at | GPU work |
   | --- | --- | --- |
-  | 720p (original) | 1280×720 | default |
-  | 1080p | 2560×1440 (2×), scaled down | 1920×1080 |
-  | 1440p | 2560×1440 (2×) | 2560×1440 |
+  | 1x (default) | 1280×720 | original |
+  | 2x | 2560×1440 | about 4× |
+  | 3x | 3840×2160 | about 9× |
 
-  ReXGlue only scales by whole numbers, so 1080p and 1440p both render at 2×. That is sharper but about four times the GPU work: an RTX 2050 drops from 30 to about 18 FPS on the menus. With **Fullscreen** on, the picture fills your screen and the window size doesn't matter.
+  ReXGlue only scales by whole numbers: its render target and texture caches give each of the game's pixels a whole block of screen pixels, so steps such as 1.5x are not possible without rewriting them. 2x is sharper, but an RTX 2050 drops from 30 to about 18 FPS on the menus.
 - **Upscaler:** sharpens the picture as it is scaled up to your screen.
 
   | Choice | Effect |
@@ -177,7 +179,7 @@ Many Linux desktops (KDE, Bazzite) already include it. Without PySide6, or with 
   | AMD CAS | Light sharpening |
   | Off | Plain scaling, softest |
 
-  Both upscalers ran at the full 30 FPS on an RTX 2050, so **720p with FSR is the recommended setting**: sharper than plain 720p without the slowdown of the 2× resolutions. They need an SDK set up with `tools/setup-sdk.sh` or `.ps1`, which downloads AMD's FidelityFX headers (about 5 MB). With an older SDK the launcher quietly uses plain scaling.
+  Both upscalers ran at the full 30 FPS on an RTX 2050, so **render scale 1x with FSR is the recommended setting**, at any window size: sharper than plain scaling without the slowdown of 2x. They need an SDK set up with `tools/setup-sdk.sh` or `.ps1`, which downloads AMD's FidelityFX headers (about 5 MB). With an older SDK the launcher quietly uses plain scaling.
 - **Keyboard:** turns on keyboard controls (see [Playing](#playing)).
 - **Build:** switches between the Release and Debug builds.
 
@@ -189,7 +191,7 @@ Choices are saved in `out/launcher.json` and reused next time. To skip the windo
 python3 tools/launcher.py --list-gpus                  # show GPU ids
 python3 tools/launcher.py --gpu 10de:25ad --play       # launch on that GPU now
 python3 tools/launcher.py --xex /games/naruto/default.xex --keyboard --play
-python3 tools/launcher.py --resolution 1440p --no-fullscreen --play
+python3 tools/launcher.py --resolution 1440p --render-scale 2 --no-fullscreen --play
 python3 tools/launcher.py --resolution 720p --upscaler fsr --play
 ```
 
@@ -223,7 +225,7 @@ Settings are stored in `naruto.toml` next to the executable. The first build cre
 - **`assets/default.xex not found` during configure:** do step 1 first.
 - **`check-game.py` reports a different SHA-256:** your copy is a different version. It won't work with this function list.
 - **The first launch stutters:** shaders are compiled and cached the first time each effect appears. Later runs are smoother.
-- **Low FPS:** choose the dedicated GPU in the launcher, and use 720p with the FSR upscaler instead of 1080p or 1440p.
+- **Low FPS:** choose the dedicated GPU in the launcher, and use render scale 1x with the FSR upscaler.
 - **Updating:** after pulling new changes, run the setup script again if `patches/` changed. If `naruto_manifest.toml` changed, repeat all four build commands; otherwise only the last one.
 
 ## How the project is organised
