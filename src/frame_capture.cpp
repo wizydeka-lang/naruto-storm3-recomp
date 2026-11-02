@@ -229,6 +229,7 @@ struct Fetch {
   uint32_t xenos_format;
   uint32_t swizzle;          // destination swizzle Direct3D patched in
   uint32_t library_swizzle;  // the one the converted shader applies
+  bool is_signed;
 };
 
 // Component count and bytes per component of the vertex formats whose
@@ -259,38 +260,63 @@ std::pair<uint32_t, uint32_t> Components(uint32_t xenos_format) {
   }
 }
 
+// The bytes of a component holding 1 in the format.
+uint32_t One(const Fetch& fetch) {
+  switch (fetch.xenos_format) {
+    case 6:
+      return fetch.is_signed ? 0x7F : 0xFF;
+    case 25:
+    case 26:
+      return fetch.is_signed ? 0x7FFF : 0xFFFF;
+    case 31:
+    case 32:
+      return 0x3C00;  // half 1.0
+    case 33:
+    case 34:
+    case 35:
+      return 1;
+    default:
+      return 0x3F800000;  // float 1.0
+  }
+}
+
 // Reorders an attribute's components so that the converted shader, which
 // applies the library microcode's destination swizzle, sees what the patched
 // swizzle selects: Direct3D patches the swizzle for the vertex declaration
 // (16-bit components of a byte-swapped word come out second first). The
 // data itself is laid out as the GPU reads it, first component in the low
-// bits. Lanes the patched swizzle leaves unwritten or sets to a constant
-// keep the data's component.
+// bits. A lane the patched swizzle sets to 0 or 1 gets that constant; one it
+// leaves unwritten keeps the register's earlier value, 0 in the converted
+// shader, as does a component the format lacks (1 for w).
 void Reorder(std::vector<uint8_t>& data, size_t begin, size_t end, uint32_t stride,
              const Fetch& fetch) {
   auto [count, size] = Components(fetch.xenos_format);
-  int source[4] = {0, 1, 2, 3};
+  int source[4] = {0, 1, 2, 3};  // data component, or -1 for 0, -2 for 1
   bool identity = true;
   for (uint32_t d = 0; d < 4; ++d) {
     uint32_t wanted = (fetch.library_swizzle >> (3 * d)) & 7;
     uint32_t actual = (fetch.swizzle >> (3 * d)) & 7;
-    if (wanted >= 4 || wanted >= count || wanted == actual) {
+    if (wanted >= count || wanted == actual) {
       continue;
     }
-    if (actual >= count) {
-      continue;
-    }
-    source[wanted] = int(actual);
+    source[wanted] = actual < count ? int(actual) : (actual == 5 || actual == 3) ? -2 : -1;
     identity = false;
   }
   if (identity) {
     return;
   }
+  uint32_t one = One(fetch);
   uint8_t element[16];
   for (size_t at = begin; at + count * size <= end; at += stride ? stride : end) {
     std::memcpy(element, data.data() + at, count * size);
     for (uint32_t c = 0; c < count; ++c) {
-      std::memcpy(data.data() + at + c * size, element + source[c] * size, size);
+      uint8_t* out = data.data() + at + c * size;
+      if (source[c] >= 0) {
+        std::memcpy(out, element + source[c] * size, size);
+      } else {
+        uint32_t value = source[c] == -2 ? one : 0;
+        std::memcpy(out, &value, size);  // little-endian: the low bytes
+      }
     }
   }
 }
@@ -424,7 +450,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
     }
     uint32_t library_w1 = vs.microcode[address / 4 + 1];
     fetches.push_back({element, full_constant, full_stride, offset, format, xenos_format,
-                       w1 & 0xFFF, library_w1 & 0xFFF});
+                       w1 & 0xFFF, library_w1 & 0xFFF, bool((w1 >> 12) & 1)});
   }
 
   bool new_frame = frame.captured.empty();
