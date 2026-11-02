@@ -570,8 +570,18 @@ class View {
     }
     texture_decode::Decode(frame.guest_base, fetch, decoded);
     if (const char* dir = std::getenv("NARUTO_NATIVE_VIEW_TEXTURES")) {
-      texture_decode::WritePreview(
-          decoded, fmt::format("{}/{:08x}_{:08x}.ppm", dir, fetch[1], fetch[2]).c_str());
+      // A PPM where the format allows; otherwise the decoded data as is,
+      // named with its size, layers and VkFormat.
+      std::string name = fmt::format("{}/{:08x}_{:08x}", dir, fetch[1], fetch[2]);
+      if (!texture_decode::WritePreview(decoded, (name + ".ppm").c_str())) {
+        std::string path = fmt::format("{}_{}x{}x{}_f{}.raw", name, decoded.width,
+                                       decoded.height, decoded.layers * decoded.depth,
+                                       decoded.format);
+        if (FILE* file = std::fopen(path.c_str(), "wb")) {
+          std::fwrite(decoded.data.data(), 1, decoded.data.size(), file);
+          std::fclose(file);
+        }
+      }
     }
     budget = decoded.data.size() >= budget ? 0 : budget - decoded.data.size();
 
