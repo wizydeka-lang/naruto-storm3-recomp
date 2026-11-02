@@ -110,14 +110,32 @@ uint32_t Align(std::vector<uint8_t>& data, size_t alignment) {
   return uint32_t(data.size());
 }
 
+// One loop per endian mode, so the compiler can vectorize each.
+template <uint32_t kEndian>
+void SwapWords(uint8_t* out, const uint8_t* source, size_t size) {
+  for (size_t i = 0; i + 4 <= size; i += 4) {
+    uint32_t value = Swap32(RawLoad32(source + i), kEndian);
+    std::memcpy(out + i, &value, 4);
+  }
+}
+
 uint32_t AppendSwapped(std::vector<uint8_t>& data, const uint8_t* source, size_t size,
                        uint32_t endian) {
   uint32_t offset = Align(data, 16);
   data.resize(offset + size);
   uint8_t* out = data.data() + offset;
-  for (size_t i = 0; i + 4 <= size; i += 4) {
-    uint32_t value = Swap32(RawLoad32(source + i), endian);
-    std::memcpy(out + i, &value, 4);
+  switch (endian) {
+    case 1:
+      SwapWords<1>(out, source, size);
+      break;
+    case 2:
+      SwapWords<2>(out, source, size);
+      break;
+    case 3:
+      SwapWords<3>(out, source, size);
+      break;
+    default:
+      std::memcpy(out, source, size & ~size_t(3));
   }
   return offset;
 }
@@ -162,10 +180,10 @@ VkFormat VertexFormat(uint32_t format, bool is_signed, bool integer) {
 // as kRestart.
 bool ReadIndices(const uint8_t* base, const DrawCall& call, bool strip,
                  std::vector<uint32_t>& indices) {
-  indices.clear();
+  indices.resize(call.count);
   if (!call.indexed) {
     for (uint32_t i = 0; i < call.count; ++i) {
-      indices.push_back(call.start + i);
+      indices[i] = call.start + i;
     }
     return true;
   }
@@ -185,8 +203,7 @@ bool ReadIndices(const uint8_t* base, const DrawCall& call, bool strip,
       return false;
     }
     for (uint32_t i = 0; i < call.count; ++i) {
-      uint32_t value = Swap32(RawLoad32(data + size_t(call.start + i) * 4), endian);
-      indices.push_back(value);
+      indices[i] = Swap32(RawLoad32(data + size_t(call.start + i) * 4), endian);
     }
   } else {
     if (endian > 1) {
@@ -199,7 +216,7 @@ bool ReadIndices(const uint8_t* base, const DrawCall& call, bool strip,
       if (endian) {
         value = std::byteswap(value);
       }
-      indices.push_back(strip && value == 0xFFFF ? kRestart : value);
+      indices[i] = strip && value == 0xFFFF ? kRestart : value;
     }
   }
   return true;
@@ -280,6 +297,21 @@ uint32_t One(const Fetch& fetch) {
   }
 }
 
+template <typename T>
+void ReorderComponents(uint8_t* at, const uint8_t* end, size_t step, uint32_t count,
+                       const int source[4], T one) {
+  for (; at + count * sizeof(T) <= end; at += step) {
+    T in[4];
+    for (uint32_t c = 0; c < count; ++c) {
+      std::memcpy(&in[c], at + c * sizeof(T), sizeof(T));
+    }
+    for (uint32_t c = 0; c < count; ++c) {
+      T value = source[c] >= 0 ? in[source[c]] : source[c] == -2 ? one : T(0);
+      std::memcpy(at + c * sizeof(T), &value, sizeof(T));
+    }
+  }
+}
+
 // Reorders an attribute's components so that the converted shader, which
 // applies the library microcode's destination swizzle, sees what the patched
 // swizzle selects: Direct3D patches the swizzle for the vertex declaration
@@ -302,22 +334,22 @@ void Reorder(std::vector<uint8_t>& data, size_t begin, size_t end, uint32_t stri
     source[wanted] = actual < count ? int(actual) : (actual == 5 || actual == 3) ? -2 : -1;
     identity = false;
   }
-  if (identity) {
+  if (identity || begin >= end) {
     return;
   }
   uint32_t one = One(fetch);
-  uint8_t element[16];
-  for (size_t at = begin; at + count * size <= end; at += stride ? stride : end) {
-    std::memcpy(element, data.data() + at, count * size);
-    for (uint32_t c = 0; c < count; ++c) {
-      uint8_t* out = data.data() + at + c * size;
-      if (source[c] >= 0) {
-        std::memcpy(out, element + source[c] * size, size);
-      } else {
-        uint32_t value = source[c] == -2 ? one : 0;
-        std::memcpy(out, &value, size);  // little-endian: the low bytes
-      }
-    }
+  uint8_t* at = data.data() + begin;
+  const uint8_t* last = data.data() + end;
+  size_t step = stride ? stride : end - begin;
+  switch (size) {
+    case 1:
+      ReorderComponents<uint8_t>(at, last, step, count, source, uint8_t(one));
+      break;
+    case 2:
+      ReorderComponents<uint16_t>(at, last, step, count, source, uint16_t(one));
+      break;
+    default:
+      ReorderComponents<uint32_t>(at, last, step, count, source, one);
   }
 }
 
@@ -550,11 +582,13 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
 
   // Indices, rebased to the first copied vertex.
   draw.index_offset = Align(frame.data, 16);
+  draw.index_count = uint32_t(quads ? indices.size() / 4 * 6 : indices.size());
+  frame.data.resize(draw.index_offset + size_t(draw.index_count) * 4);
+  uint8_t* out = frame.data.data() + draw.index_offset;
   auto append_index = [&](uint32_t index) {
     uint32_t value = index == kRestart ? kRestart : index - min_index;
-    size_t at = frame.data.size();
-    frame.data.resize(at + 4);
-    std::memcpy(frame.data.data() + at, &value, 4);
+    std::memcpy(out, &value, 4);
+    out += 4;
   };
   if (quads) {
     for (size_t q = 0; q + 4 <= indices.size(); q += 4) {
@@ -567,7 +601,6 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       append_index(index);
     }
   }
-  draw.index_count = uint32_t((frame.data.size() - draw.index_offset) / 4);
 
   thread_local ConstantCopy vertex_constants, pixel_constants, shared_constants;
   draw.vertex_constants = CopyConstants(base + call.device + kDeviceVertexConstants,

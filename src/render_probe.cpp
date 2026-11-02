@@ -207,6 +207,7 @@ auto g_window_start = std::chrono::steady_clock::now();
 // state for it.
 void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, bool indexed,
                 int32_t base_vertex, uint32_t start, uint32_t count) {
+  auto began = std::chrono::steady_clock::now();
   uint32_t vs = LoadGuest32(base, device + kDeviceVertexShader);
   uint32_t ps = LoadGuest32(base, device + kDevicePixelShader);
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -231,6 +232,8 @@ void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, b
   g_stats.primitive_types[primitive_type]++;
   g_stats.vertex_shaders.insert(vs);
   g_stats.pixel_shaders.insert(ps);
+  g_frame.capture_seconds +=
+      std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
 }
 
 void LogWindow() {
@@ -379,6 +382,7 @@ REX_HOOK_RAW(sub_82746748) {
       }
       frame = std::move(g_frame);
       g_frame = {};
+      g_frame.data = native_view::RecycledData();
       g_pass = 0;
     }
     native_view::SubmitFrame(std::move(frame));

@@ -36,6 +36,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -146,6 +147,7 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCmdResetQueryPool)             \
   X(vkCmdBeginQuery)                 \
   X(vkCmdEndQuery)                   \
+  X(vkCmdWriteTimestamp)             \
   X(vkGetQueryPoolResults)           \
   X(vkCreateSemaphore)               \
   X(vkDestroySemaphore)              \
@@ -210,6 +212,10 @@ class View {
   void Submit(FrameInfo&& frame) {
     std::call_once(started_, [this] { std::thread([this] { Run(); }).detach(); });
     std::lock_guard<std::mutex> lock(mutex_);
+    frames_submitted_++;
+    if (pending_) {
+      Recycle(std::move(latest_.data));  // never drawn
+    }
     latest_ = std::move(frame);
     pending_ = true;
     wake_.notify_one();
@@ -231,6 +237,28 @@ class View {
         frame = std::move(latest_);
       }
       DrawFrame(frame);
+      std::lock_guard<std::mutex> lock(mutex_);
+      Recycle(std::move(frame.data));
+    }
+  }
+
+ public:
+  std::vector<uint8_t> RecycledData() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (spare_data_.empty()) {
+      return {};
+    }
+    std::vector<uint8_t> data = std::move(spare_data_.back());
+    spare_data_.pop_back();
+    data.clear();
+    return data;
+  }
+
+ private:
+  // Keeps a few frames' data buffers for reuse; mutex_ is held.
+  void Recycle(std::vector<uint8_t>&& data) {
+    if (spare_data_.size() < 3) {
+      spare_data_.push_back(std::move(data));
     }
   }
 
@@ -322,6 +350,8 @@ class View {
           physical_device_ = device;
           queue_family_ = family;
           device_name_ = properties.deviceName;
+          timestamp_period_ =
+              families[family].timestampValidBits ? properties.limits.timestampPeriod : 0.0f;
           mirror_clamp_ = features12.samplerMirrorClampToEdge;
         }
         break;
@@ -1697,6 +1727,57 @@ class View {
                            1, &copy);
   }
 
+  // GPU timestamps at the start of each pass, after the last pass and after
+  // presenting, for the timing log. Returns how many the frame records (0
+  // when off).
+  uint32_t StartTimestamps(VkCommandBuffer cmd, uint32_t count) {
+    timestamp_counts_[frame_index_] = 0;
+    if (!timestamp_period_ || count > kTimestamps) {
+      return 0;
+    }
+    if (!timestamp_pool_) {
+      VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+      info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+      info.queryCount = kTimestamps * kFramesInFlight;
+      if (vkCreateQueryPool(device_, &info, nullptr, &timestamp_pool_) != VK_SUCCESS) {
+        timestamp_period_ = 0;
+        return 0;
+      }
+    }
+    vkCmdResetQueryPool(cmd, timestamp_pool_, frame_index_ * kTimestamps, count);
+    timestamp_counts_[frame_index_] = count;
+    return count;
+  }
+
+  void WriteTimestamp(VkCommandBuffer cmd, uint32_t count, uint32_t index) {
+    if (index < count) {
+      vkCmdWriteTimestamp(cmd, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_pool_,
+                          frame_index_ * kTimestamps + index);
+    }
+  }
+
+  // Adds the timestamps of the frame last recorded in this slot, whose fence
+  // has been waited on, to the per-pass GPU times.
+  void ReadTimestamps() {
+    uint32_t count = timestamp_counts_[frame_index_];
+    if (count < 2) {
+      return;
+    }
+    uint64_t values[kTimestamps];
+    if (vkGetQueryPoolResults(device_, timestamp_pool_, frame_index_ * kTimestamps, count,
+                              sizeof(values), values, 8, VK_QUERY_RESULT_64_BIT) != VK_SUCCESS) {
+      return;
+    }
+    if (pass_gpu_ms_.size() < count - 1) {
+      pass_gpu_ms_.resize(count - 1);
+    }
+    for (uint32_t i = 0; i + 1 < count; ++i) {
+      pass_gpu_ms_[i] += (values[i + 1] - values[i]) * timestamp_period_ / 1e6;
+    }
+    gpu_ms_ += (values[count - 1] - values[0]) * timestamp_period_ / 1e6;
+    gpu_frames_++;
+  }
+
   bool ReserveScratch(VkDeviceSize size) {
     if (scratch_.size >= size) {
       return true;
@@ -1825,11 +1906,15 @@ class View {
       return;
     }
     VkFence fence = frame_done_[frame_index_];
+    auto wait_start = std::chrono::steady_clock::now();
     VkResult waited = vkWaitForFences(device_, 1, &fence, VK_TRUE, 5'000'000'000ull);
     if (waited != VK_SUCCESS) {
       REXLOG_ERROR("[native view] waiting for frame {} failed: {}", frames_total_, int(waited));
       return;
     }
+    auto cpu_start = std::chrono::steady_clock::now();
+    wait_seconds_ += std::chrono::duration<double>(cpu_start - wait_start).count();
+    ReadTimestamps();
     frames_total_++;
     FreeRetired();
     HandleKeys();
@@ -1949,6 +2034,7 @@ class View {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
+    uint32_t timestamps = StartTimestamps(cmd, pass_count + 2);
     std::vector<size_t> statistics_draws;
     if (snapshots && statistics_) {
       if (!statistics_pool_) {
@@ -2028,6 +2114,7 @@ class View {
     size_t next_clear = 0;
     std::set<const RenderTarget*> depth_cleared;  // debug bit 8 only
     for (uint32_t pass = 0; pass < pass_count; ++pass) {
+      WriteTimestamp(cmd, timestamps, pass);
       size_t first = d;
       while (d < frame.captured.size() && frame.captured[d].pass <= pass) {
         ++d;
@@ -2187,6 +2274,8 @@ class View {
       }
     }
 
+    WriteTimestamp(cmd, timestamps, pass_count);
+
     // Present: the front buffer texture, or a pass's render target.
     VkImage present_source = VK_NULL_HANDLE;
     VkExtent2D present_extent{};
@@ -2252,6 +2341,7 @@ class View {
     to_present.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
                          0, 0, nullptr, 0, nullptr, 1, &to_present);
+    WriteTimestamp(cmd, timestamps, pass_count + 1);
     vkEndCommandBuffer(cmd);
 
     VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
@@ -2268,6 +2358,8 @@ class View {
     if (submitted != VK_SUCCESS) {
       REXLOG_ERROR("[native view] submitting frame {} failed: {}", frames_total_, int(submitted));
     }
+    cpu_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_start).count();
+    capture_seconds_ += frame.capture_seconds;
     if (snapshots) {
       vkQueueWaitIdle(queue_);
       for (uint32_t q = 0; q < statistics_draws.size(); ++q) {
@@ -2309,6 +2401,35 @@ class View {
           pass_count, frame.resolves.size(), frame.data.size() / 1048576.0, pipelines_.size(),
           render_targets_.size(), resolved_.size(), textures_.size(), textures_failed_,
           textures_uploaded_bytes_ / 1048576.0);
+      uint64_t submitted = frames_submitted_.exchange(0);
+      uint64_t presented = std::max<uint64_t>(frames_presented_, 1);
+      REXLOG_INFO("[native view] timing: {:.1f} game frames/s, capture {:.2f} ms/frame (game "
+                  "thread), view CPU {:.2f} ms/frame, GPU wait {:.2f} ms/frame",
+                  submitted / seconds, capture_seconds_ * 1000 / presented,
+                  cpu_seconds_ * 1000 / presented, wait_seconds_ * 1000 / presented);
+      wait_seconds_ = 0;
+      if (gpu_frames_) {
+        // The costliest passes; the last entry is the present.
+        std::vector<uint32_t> order(pass_gpu_ms_.size());
+        for (uint32_t i = 0; i < order.size(); ++i) {
+          order[i] = i;
+        }
+        std::sort(order.begin(), order.end(),
+                  [&](uint32_t a, uint32_t b) { return pass_gpu_ms_[a] > pass_gpu_ms_[b]; });
+        std::string top;
+        for (uint32_t i = 0; i < order.size() && i < 40; ++i) {
+          top += fmt::format(" {}{}: {:.2f}", order[i] + 1 == order.size() ? "present" : "pass ",
+                             order[i] + 1 == order.size() ? "" : std::to_string(order[i]),
+                             pass_gpu_ms_[order[i]] / gpu_frames_);
+        }
+        REXLOG_INFO("[native view] GPU {:.2f} ms/frame; costliest (ms):{}", gpu_ms_ / gpu_frames_,
+                    top);
+        pass_gpu_ms_.clear();
+        gpu_ms_ = 0;
+        gpu_frames_ = 0;
+      }
+      capture_seconds_ = 0;
+      cpu_seconds_ = 0;
       textures_uploaded_bytes_ = 0;
       frames_presented_ = 0;
       draws_drawn_ = 0;
@@ -2338,6 +2459,7 @@ class View {
   std::condition_variable wake_;
   bool pending_ = false;
   FrameInfo latest_;
+  std::vector<std::vector<uint8_t>> spare_data_;
 
   SDL_Window* window_ = nullptr;
   std::string title_;
@@ -2384,6 +2506,17 @@ class View {
   std::vector<Retired> retired_;
   uint64_t textures_failed_ = 0;
   uint64_t textures_uploaded_bytes_ = 0;
+  std::atomic<uint64_t> frames_submitted_ = 0;
+  double capture_seconds_ = 0;  // of the presented frames
+  double cpu_seconds_ = 0;
+  double wait_seconds_ = 0;  // for the frame's fence
+  static constexpr uint32_t kTimestamps = 128;  // per frame in flight
+  VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
+  float timestamp_period_ = 0;  // ns per tick, 0 without timestamps
+  uint32_t timestamp_counts_[kFramesInFlight] = {};
+  std::vector<double> pass_gpu_ms_;  // per pass, summed over the log period
+  double gpu_ms_ = 0;
+  uint64_t gpu_frames_ = 0;
   std::vector<uint8_t> shared_;
   std::set<std::pair<std::string, uint32_t>> warned_;
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
@@ -2431,6 +2564,10 @@ void SubmitFrame(FrameInfo&& frame) {
   if (Enabled()) {
     GetView().Submit(std::move(frame));
   }
+}
+
+std::vector<uint8_t> RecycledData() {
+  return Enabled() ? GetView().RecycledData() : std::vector<uint8_t>();
 }
 
 }  // namespace native_view

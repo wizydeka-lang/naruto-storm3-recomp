@@ -140,11 +140,17 @@ struct FrameInfo {
   std::vector<uint8_t> data;  // vertices, indices and constants
   // Guest memory, where the view reads texture data.
   const uint8_t* guest_base = nullptr;
+  // Game thread time spent recording the frame's draws.
+  double capture_seconds = 0;
 };
 
 bool Enabled();
 
 // Called from the game's D3DDevice_Swap; never blocks on the view.
 void SubmitFrame(FrameInfo&& frame);
+
+// An empty buffer for the next frame's data, reusing the memory of a frame
+// the view is done with so capture doesn't grow a new one each frame.
+std::vector<uint8_t> RecycledData();
 
 }  // namespace native_view
