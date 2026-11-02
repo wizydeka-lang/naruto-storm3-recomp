@@ -535,6 +535,14 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       }
       if ((binding.fetch[0] & 3) == 2) {
         frame.textures.push_back(binding);
+      } else {
+        static std::set<std::pair<int, uint8_t>> warned;
+        if (warned.insert({call.pixel_shader_index, sampler}).second) {
+          REXLOG_WARN("[native view] pixel shader {} sampler {} has no texture: fetch {:08x} "
+                      "{:08x} {:08x} {:08x} {:08x} {:08x}",
+                      call.pixel_shader_index, sampler, binding.fetch[0], binding.fetch[1],
+                      binding.fetch[2], binding.fetch[3], binding.fetch[4], binding.fetch[5]);
+        }
       }
     }
   }
