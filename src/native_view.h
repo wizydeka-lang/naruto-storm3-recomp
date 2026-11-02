@@ -60,6 +60,9 @@ struct Draw {
   bool primitive_restart = false;
   uint32_t index_offset = 0;  // in FrameInfo::data, 32-bit indices
   uint32_t index_count = 0;
+  // For the dump: the vertices the indices reach, and the bytes of them the
+  // vertex buffers lacked (read as zero).
+  uint32_t first_vertex = 0, vertex_count = 0, missing_bytes = 0;
   uint32_t first_binding = 0;
   uint32_t binding_count = 0;
   uint32_t first_attribute = 0;

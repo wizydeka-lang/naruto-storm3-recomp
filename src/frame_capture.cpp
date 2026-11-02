@@ -428,6 +428,8 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   }
 
   bool new_frame = frame.captured.empty();
+  draw.first_vertex = first_vertex;
+  draw.vertex_count = last_vertex - first_vertex + 1;
   draw.first_binding = uint32_t(frame.bindings.size());
   draw.first_attribute = uint32_t(frame.attributes.size());
   size_t data_size = frame.data.size();
@@ -454,6 +456,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       if (fetch.stride) {
         begin = uint64_t(first_vertex) * fetch.stride;
         end = std::min<uint64_t>(size, uint64_t(last_vertex + 1) * fetch.stride);
+        draw.missing_bytes += uint32_t(uint64_t(last_vertex + 1) * fetch.stride - end);
       }
       if (begin >= end) {
         return fail();
