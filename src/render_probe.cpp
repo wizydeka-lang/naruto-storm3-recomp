@@ -311,6 +311,7 @@ REX_FUNC(__imp__sub_8275BD48);
 REX_FUNC(__imp__sub_8274D2C8);
 REX_FUNC(__imp__sub_82749EF0);
 REX_FUNC(__imp__sub_8274A0F8);
+REX_FUNC(__imp__sub_828BAB38);
 }
 
 // Patches a vertex shader variant in place for the vertex declaration:
@@ -339,6 +340,26 @@ REX_HOOK_RAW(sub_82749EF0) {
     uint32_t end = LoadGuest32(base, device + 48);
     std::lock_guard<std::mutex> lock(g_mutex);
     g_bound_vertex_shaders[device][variant] = {object, end + 4 - size, size};
+  }
+}
+
+// XInputGetState(user, state): the game's controller read. With
+// NARUTO_LOG_INPUT=1, logs the buttons (XINPUT_GAMEPAD bits; 0x40 is L3,
+// 0x80 R3) whenever they change.
+REX_HOOK_RAW(sub_828BAB38) {
+  static const bool log_input = [] {
+    const char* value = std::getenv("NARUTO_LOG_INPUT");
+    return value && *value && *value != '0';
+  }();
+  uint32_t user = ctx.r3.u32, state = ctx.r4.u32;
+  __imp__sub_828BAB38(ctx, base);
+  if (log_input && ctx.r3.u32 == 0 && user < 4) {
+    static uint16_t last[4] = {};
+    uint16_t buttons = rex::memory::load_and_swap<uint16_t>(base + state + 4);
+    if (buttons != last[user]) {
+      REXLOG_INFO("[input] user {} buttons {:04X}", user, buttons);
+      last[user] = buttons;
+    }
   }
 }
 
