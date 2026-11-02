@@ -1708,6 +1708,9 @@ class View {
           requirements,
           VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, false);
       if (!snapshot_buffer_.memory) {
+        REXLOG_ERROR("[native view] no memory for {} snapshots ({} MB)", count, size >> 20);
+        vkDestroyBuffer(device_, snapshot_buffer_.buffer, nullptr);
+        snapshot_buffer_ = {};
         return false;
       }
       vkBindBufferMemory(device_, snapshot_buffer_.buffer, snapshot_buffer_.memory, 0);
@@ -1788,6 +1791,9 @@ class View {
     // snapshot.
     std::error_code error;
     bool requested = snapshot_requested_ || std::filesystem::remove("out/snapshot-request", error);
+    if (requested) {
+      REXLOG_INFO("[native view] snapshot requested at frame {}", frames_total_);
+    }
     snapshot_requested_ = false;
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
