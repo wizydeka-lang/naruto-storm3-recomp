@@ -69,11 +69,16 @@ vertex fetch constants at `+0x480` (physical address, size, endian swap).
 ## Shader objects
 
 A vertex shader object keeps variants at `+896`, eight bytes each. The
-per-draw commit `sub_8274A238` uses the first variant, or the one at `+904`
-when bit `0x20` of `+872` is set. A variant's microcode is at
-`*(shader + 32) + *(variant + 872)`, `*(variant + 876)` bytes long. Binding a
-vertex declaration patches the vertex fetch instructions in place, so the
-bound microcode describes the current vertex layout. A pixel shader's info
+per-draw commit `sub_8274A238` uses the first variant, or, when bit `0x20` of
+`+872` is set and the edram mode is depth-only (`RB_MODECONTROL` 5), the
+second, at `+904`. A variant's microcode is at
+`*(shader + 32) + *(variant + 872)`, `*(variant + 876)` bytes long. The commit
+patches the variant's vertex fetch instructions for the vertex declaration:
+in place (`sub_8274A0F8`, per-variant state at `shader + 416 * variant`), or,
+when the GPU may still read that microcode, in a copy it writes into the
+command buffer (`sub_82749EF0`, which leaves the device's write pointer at
+`+48` on the copy's last word). After a copy, the microcode in memory still
+describes an earlier declaration. A pixel shader's info
 block is at `shader + *(shader + 64)`; its microcode is at
 `*(shader + 24) + *(info + 40)`, `*(info + 44)` bytes long.
 
