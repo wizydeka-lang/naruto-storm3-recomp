@@ -1,5 +1,5 @@
 diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
-index 698a418..a8ff7fb 100644
+index 698a418..0b8d337 100644
 --- a/XenosRecomp/shader_recompiler.cpp
 +++ b/XenosRecomp/shader_recompiler.cpp
 @@ -1,3 +1,6 @@
@@ -179,3 +179,22 @@ index 698a418..a8ff7fb 100644
  
              println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
                  uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
+@@ -1433,14 +1438,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+         if (isPixelShader)
+         {
+             value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
+-            println("\tfloat4 r{} = i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
++            // The GPU links vertex shader exports to pixel shader inputs by
++            // register, not by semantic, so interpolators are named by register.
++            println("\tfloat4 r{} = iTexCoord{};", uint32_t(interpolator.reg), uint32_t(interpolator.reg));
+             printedRegisters[interpolator.reg] = true;
+         }
+         else
+         {
+             auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
+             value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
+-            interpolators.emplace(i, fmt::format("o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
++            interpolators.emplace(i, fmt::format("oTexCoord{}", uint32_t(interpolator.reg)));
+         }
+     }
+ 
