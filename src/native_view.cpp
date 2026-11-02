@@ -1551,6 +1551,21 @@ class View {
         constants += fmt::format(" {:.3g}", f32(d.vertex_constants + c * 4));
       }
       REXLOG_INFO("[native view]   c0-c7:{}", constants);
+      // NARUTO_NATIVE_VIEW_DUMP_VS=offset logs all vertex shader constants of
+      // the draws using that library vertex shader.
+      static const long dump_vs = [] {
+        const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP_VS");
+        return value ? std::strtol(value, nullptr, 0) : -1;
+      }();
+      if (long(shaders[d.vertex_shader].offset) == dump_vs) {
+        for (uint32_t c = 0; c < 256; c += 4) {
+          std::string row;
+          for (uint32_t i = c * 4; i < (c + 4) * 4; ++i) {
+            row += fmt::format(" {:.6g}", f32(d.vertex_constants + i * 4));
+          }
+          REXLOG_INFO("[native view]   c{}-c{}:{}", c, c + 3, row);
+        }
+      }
     }
   }
 
