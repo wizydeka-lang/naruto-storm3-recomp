@@ -125,8 +125,23 @@ render targets 0–3, `0x10` depth, `0x20` stencil), no rectangles, a pointer to
 four floats, Z in `f1` and stencil in `r8`, a few times a frame.
 `D3DDevice_Clear` (`sub_8275D010`, which converts a `D3DCOLOR`) also ends up
 there but is barely used. D3D draws the clear as rectangles in the bound
-targets' EDRAM, so the native view clears every render target at the bound
-EDRAM bases.
+targets' EDRAM, and three details matter for replaying it:
+
+- Only bound targets are cleared. The device keeps render targets 0–3 at
+  `+0x3210` and the depth surface at `+0x3220`; `ClearF` is called with flags
+  `0xF` while only render target 0 is bound, and the `RB_COLOR1_INFO` shadow
+  still names an earlier target.
+- The clear covers the viewport set at the time (the `PA_CL_VPORT_*` shadow is
+  current when `ClearF` runs), not the whole surface: the rectangle `ClearF`
+  builds starts at 0,0 and the GPU offsets it like the draws. The title
+  screen's blur chain packs small images into one render target and clears
+  only the one it's about to draw.
+- Other surfaces at the same EDRAM base (another format or pitch) are left
+  alone.
+
+Comparing against Xenia's own results needs `--vulkan_readback_resolve=true`
+(`bash tools/run-radeon.sh -- --vulkan_readback_resolve=true`); otherwise
+Xenia keeps resolved textures in its GPU memory and guest memory stays empty.
 
 `D3DDevice_Swap` (`sub_82746748`) takes the front buffer texture as its second
 argument and copies its fetch constant; the game resolves its final image

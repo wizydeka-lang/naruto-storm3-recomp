@@ -93,11 +93,13 @@ struct Resolve {
 };
 
 // A D3DDevice_ClearF: fills the render targets and depth buffer bound at the
-// time, which the view finds by EDRAM base, before captured draw before_draw.
+// time, before captured draw before_draw.
 struct Clear {
   uint32_t pass = 0;
   uint32_t before_draw = 0;  // index into FrameInfo::captured
   uint32_t flags = 0;        // bits 0-3: render targets 0-3, 0x10 depth, 0x20 stencil
+  uint32_t surface_info = 0;    // RB_SURFACE_INFO
+  float viewport[6] = {};       // PA_CL_VPORT_* at the time
   uint32_t color_info[4] = {};  // RB_COLOR*_INFO
   uint32_t depth_info = 0;      // RB_DEPTH_INFO
   float color[4] = {};

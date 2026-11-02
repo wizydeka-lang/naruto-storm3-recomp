@@ -8,6 +8,7 @@ profile=false
 check=false
 gpu=nvidia
 native_only=false
+extra_args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --debug) build_type=debug ;;
@@ -16,8 +17,9 @@ while [[ $# -gt 0 ]]; do
     --radeon) gpu=radeon ;;
     --nvidia) gpu=nvidia ;;
     --native-only) native_only=true ;;
+    --) shift; extra_args=("$@"); break ;;
     --help|-h)
-      printf '%s\n' 'Usage: bash tools/run-radeon.sh [--debug] [--profile] [--check] [--radeon|--nvidia] [--native-only]' \
+      printf '%s\n' 'Usage: bash tools/run-radeon.sh [--debug] [--profile] [--check] [--radeon|--nvidia] [--native-only] [-- game options]' \
         'Default: optimized Release build, NVIDIA RTX 2050, PipeWire audio.' \
         '--radeon: use the integrated Radeon 660M instead (menus run at ~25 FPS vs 30).' \
         '--profile: isolated run with per-guest-update GPU logs under out/performance/runs/.' \
@@ -79,4 +81,5 @@ exec "$run_dir/naruto" \
   --vulkan_allow_present_mode_immediate=false \
   --vulkan_allow_present_mode_mailbox=false \
   --vulkan_allow_present_mode_fifo_relaxed=false \
-  --vulkan_validation_enabled=false --gpu_debug_markers=false "${native_args[@]}"
+  --vulkan_validation_enabled=false --gpu_debug_markers=false "${native_args[@]}" \
+  "${extra_args[@]}"

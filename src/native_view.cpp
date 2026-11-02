@@ -184,7 +184,8 @@ VkBlendFactor BlendFactor(uint32_t factor) {
 }
 
 // NARUTO_NATIVE_VIEW_DEBUG bits: 1 disables depth testing, 2 face culling;
-// 4 flips which winding is front-facing.
+// 4 flips which winding is front-facing; 8 skips the game's clears and
+// clears depth when a frame first uses it instead.
 uint32_t DebugFlags() {
   static const uint32_t flags = [] {
     const char* value = std::getenv("NARUTO_NATIVE_VIEW_DEBUG");
@@ -922,7 +923,6 @@ class View {
     Image image;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
-    uint32_t base = 0;  // EDRAM tile
     bool depth = false;
   };
 
@@ -988,7 +988,6 @@ class View {
       retired_.push_back({target.image, 0, 0, frames_total_});
     }
     target.depth = key >> 63;
-    target.base = uint32_t(key & 0xFFF);
     target.format = target.depth ? kDepthFormat : ColorFormat(info);
     target.width = width;
     target.height = std::max(height, target.height);
@@ -1090,19 +1089,44 @@ class View {
     return &texture;
   }
 
+  // The area a clear covers: the viewport set when the game cleared (the
+  // GPU offsets the clear like the draws, so small blur and bloom passes
+  // clear only their part of a shared render target).
+  static VkRect2D ClearArea(const Clear& clear) {
+    float x = clear.viewport[1] - clear.viewport[0];
+    float y = clear.viewport[3] + clear.viewport[2];
+    float width = 2.0f * clear.viewport[0], height = -2.0f * clear.viewport[2];
+    if (height < 0.0f) {
+      y += height;
+      height = -height;
+    }
+    return {{int32_t(std::max(0.0f, std::round(x))), int32_t(std::max(0.0f, std::round(y)))},
+            {uint32_t(std::max(0.0f, std::round(width))),
+             uint32_t(std::max(0.0f, std::round(height)))}};
+  }
+
+  static VkRect2D Clamp(VkRect2D area, VkExtent2D extent) {
+    uint32_t x = std::min<uint32_t>(area.offset.x, extent.width);
+    uint32_t y = std::min<uint32_t>(area.offset.y, extent.height);
+    return {{int32_t(x), int32_t(y)},
+            {std::min(area.extent.width, extent.width - x),
+             std::min(area.extent.height, extent.height - y)}};
+  }
+
   // Clears the clear's targets with vkCmdClearAttachments if all of them are
   // attachments of the current pass; false if some aren't.
-  bool ClearAttachments(VkCommandBuffer cmd, const Clear& clear, const PassTargets& pt) {
+  bool ClearAttachments(VkCommandBuffer cmd, const Clear& clear, VkRect2D area,
+                        const PassTargets& pt) {
     std::array<VkClearAttachment, 5> attachments{};
     uint32_t count = 0;
     for (int i = 0; i < 4; ++i) {
       if (!(clear.flags & (1u << i))) {
         continue;
       }
-      uint32_t base = clear.color_info[i] & 0xFFF;
+      auto target = render_targets_.find(TargetKey(clear.surface_info, clear.color_info[i], false));
       bool found = false;
       for (uint32_t a = 0; a < pt.color_count && !found; ++a) {
-        if (pt.color[a] && pt.color[a]->base == base) {
+        if (target != render_targets_.end() && pt.color[a] == &target->second) {
           VkClearAttachment& attachment = attachments[count++];
           attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
           attachment.colorAttachment = a;
@@ -1115,46 +1139,67 @@ class View {
       }
     }
     if (clear.flags & 0x10) {
-      if (!pt.depth || pt.depth->base != (clear.depth_info & 0xFFF)) {
+      auto target = render_targets_.find(TargetKey(clear.surface_info, clear.depth_info, true));
+      if (target == render_targets_.end() || pt.depth != &target->second) {
         return false;
       }
       VkClearAttachment& attachment = attachments[count++];
       attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
       attachment.clearValue.depthStencil = {clear.depth, clear.stencil};
     }
-    if (count) {
-      VkClearRect rect{{{0, 0}, pt.extent}, 0, 1};
+    VkClearRect rect{Clamp(area, pt.extent), 0, 1};
+    if (count && rect.rect.extent.width && rect.rect.extent.height) {
       vkCmdClearAttachments(cmd, count, attachments.data(), 1, &rect);
     }
     return true;
   }
 
-  // Fills every render target at the EDRAM bases the clear names. Targets
-  // are keyed by base, format and pitch, so all views of a base are cleared.
-  void RecordClear(VkCommandBuffer cmd, const Clear& clear) {
-    for (auto& [key, target] : render_targets_) {
-      if (!target.image.image) {
-        continue;
+  // Clears the clear's targets outside the pass's rendering: the ones for the
+  // bound surface (EDRAM base, format and pitch), each in a rendering of its
+  // own. Other targets sharing the EDRAM base are different surfaces whose
+  // contents the game still uses.
+  void RecordClear(VkCommandBuffer cmd, const Clear& clear, VkRect2D area) {
+    auto clear_target = [&](const RenderTarget& target, const VkClearAttachment& attachment) {
+      VkRect2D rect = Clamp(area, {target.width, target.height});
+      if (!target.image.image || !rect.extent.width || !rect.extent.height) {
+        return;
       }
-      uint32_t base = target.base;
+      VkRenderingAttachmentInfo info{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+      info.imageView = target.image.view;
+      info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+      info.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      info.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+      VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
+      rendering.renderArea = rect;
+      rendering.layerCount = 1;
       if (target.depth) {
-        if ((clear.flags & 0x10) && base == (clear.depth_info & 0xFFF)) {
-          VkClearDepthStencilValue value{clear.depth, clear.stencil};
-          VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
-          vkCmdClearDepthStencilImage(cmd, target.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1,
-                                      &range);
-        }
+        rendering.pDepthAttachment = &info;
+      } else {
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &info;
+      }
+      vkCmdBeginRendering(cmd, &rendering);
+      VkClearRect clear_rect{rect, 0, 1};
+      vkCmdClearAttachments(cmd, 1, &attachment, 1, &clear_rect);
+      vkCmdEndRendering(cmd);
+    };
+    for (int i = 0; i < 4; ++i) {
+      if (!(clear.flags & (1u << i))) {
         continue;
       }
-      for (int i = 0; i < 4; ++i) {
-        if ((clear.flags & (1u << i)) && base == (clear.color_info[i] & 0xFFF)) {
-          VkClearColorValue value;
-          std::memcpy(value.float32, clear.color, sizeof(clear.color));
-          VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-          vkCmdClearColorImage(cmd, target.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1,
-                               &range);
-          break;
-        }
+      auto target = render_targets_.find(TargetKey(clear.surface_info, clear.color_info[i], false));
+      if (target != render_targets_.end()) {
+        VkClearAttachment attachment{VK_IMAGE_ASPECT_COLOR_BIT, 0};
+        std::memcpy(attachment.clearValue.color.float32, clear.color, sizeof(clear.color));
+        clear_target(target->second, attachment);
+      }
+    }
+    if (clear.flags & 0x10) {
+      auto target = render_targets_.find(TargetKey(clear.surface_info, clear.depth_info, true));
+      if (target != render_targets_.end()) {
+        VkClearAttachment attachment{VK_IMAGE_ASPECT_DEPTH_BIT, 0};
+        attachment.clearValue.depthStencil = {clear.depth, clear.stencil};
+        clear_target(target->second, attachment);
       }
     }
   }
@@ -1419,6 +1464,13 @@ class View {
           r.rect[2], r.rect[3], r.point[0], r.point[1], r.level, r.slice, r.fetch[0], r.fetch[1],
           r.fetch[2], r.fetch[3]);
     }
+    for (const Clear& c : frame.clears) {
+      REXLOG_INFO("[native view] clear in pass {} before draw {}: flags {:#x} color {:x} {:x} "
+                  "depth {:x} values ({} {} {} {}) z {} viewport [{} {} {} {}]",
+                  c.pass, c.before_draw, c.flags, c.color_info[0], c.color_info[1], c.depth_info,
+                  c.color[0], c.color[1], c.color[2], c.color[3], c.depth, c.viewport[0],
+                  c.viewport[1], c.viewport[2], c.viewport[3]);
+    }
     REXLOG_INFO("[native view] front buffer: {} {:08x} {:08x} {:08x}", frame.has_front_buffer,
                 frame.front_buffer[0], frame.front_buffer[1], frame.front_buffer[2]);
     if (pass != UINT32_MAX) {
@@ -1625,9 +1677,9 @@ class View {
   // each pass's first render target (after the pass and its resolves) and
   // the presented frame, downscaled, as PPM files in dir/<frame>/, for frame
   // n and every 300th frame after it (NARUTO_NATIVE_VIEW_SNAPSHOT_EVERY
-  // changes the interval). F12 in the view saves the current frame the same
-  // way, to dir or out/snapshots. Each snapshot also logs all of the frame's
-  // draws.
+  // changes the interval). F12 in the view (or creating out/snapshot-request)
+  // saves the current frame the same way, to dir or out/snapshots. Each
+  // snapshot also logs all of the frame's draws.
   static constexpr uint32_t kSnapshotWidth = 320, kSnapshotHeight = 180;
 
   bool PrepareSnapshots(uint32_t count) {
@@ -1724,7 +1776,10 @@ class View {
     uint32_t shown_pass = pass_offset_ ? uint32_t(((pass_offset_ - 1) % int64_t(pass_count) +
                                                    pass_count) % pass_count)
                                        : UINT32_MAX;
-    bool requested = snapshot_requested_;
+    // F12, or out/snapshot-request appearing (for scripts), asks for a
+    // snapshot.
+    std::error_code error;
+    bool requested = snapshot_requested_ || std::filesystem::remove("out/snapshot-request", error);
     snapshot_requested_ = false;
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
@@ -1878,6 +1933,7 @@ class View {
     size_t d = 0;
     next_resolve = 0;
     size_t next_clear = 0;
+    std::set<const RenderTarget*> depth_cleared;  // debug bit 8 only
     for (uint32_t pass = 0; pass < pass_count; ++pass) {
       size_t first = d;
       while (d < frame.captured.size() && frame.captured[d].pass <= pass) {
@@ -1899,7 +1955,10 @@ class View {
         if (pt.depth) {
           depth.imageView = pt.depth->image.view;
           depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-          depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+          depth.loadOp = (DebugFlags() & 8) && depth_cleared.insert(pt.depth).second
+                             ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                             : VK_ATTACHMENT_LOAD_OP_LOAD;
+          depth.clearValue.depthStencil = {1.0f, 0};
           depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
         VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
@@ -1922,7 +1981,11 @@ class View {
                frame.clears[next_clear].before_draw <= before_draw;
              ++next_clear) {
           const Clear& clear = frame.clears[next_clear];
-          if (rendering && ClearAttachments(cmd, clear, pt)) {
+          if (DebugFlags() & 8) {
+            continue;
+          }
+          VkRect2D area = ClearArea(clear);
+          if (rendering && ClearAttachments(cmd, clear, area, pt)) {
             continue;
           }
           if (rendering) {
@@ -1932,7 +1995,7 @@ class View {
           if (!cleared) {
             Barrier(vkCmdPipelineBarrier, cmd);
           }
-          RecordClear(cmd, clear);
+          RecordClear(cmd, clear, area);
           cleared = true;
         }
         if (cleared) {

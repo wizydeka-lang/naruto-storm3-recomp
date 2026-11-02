@@ -27,6 +27,8 @@ constexpr uint32_t kDeviceFetchConstants = 0x480;
 constexpr uint32_t kDeviceVertexConstants = 0x780;
 constexpr uint32_t kDevicePixelConstants = 0x1780;
 constexpr uint32_t kDeviceIndexBuffer = 0x320C;
+constexpr uint32_t kDeviceRenderTargets = 0x3210;  // render target 0-3 surfaces
+constexpr uint32_t kDeviceDepthStencil = 0x3220;   // depth/stencil surface
 // Boolean constants (registers 0x4900-0x4907): vertex shader b0-b127 in the
 // first four words, pixel shader b0-b127 in the next four.
 constexpr uint32_t kDeviceBooleans = 0x2780;
@@ -550,7 +552,21 @@ void CaptureClear(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t
   native_view::Clear clear;
   clear.pass = pass;
   clear.before_draw = uint32_t(frame.captured.size());
+  // Only bound targets are cleared; the RB_COLOR*_INFO shadows of unbound
+  // ones still describe earlier targets.
+  for (int i = 0; i < 4; ++i) {
+    if (!Load32(base, device + kDeviceRenderTargets + 4 * i)) {
+      flags &= ~(1u << i);
+    }
+  }
+  if (!Load32(base, device + kDeviceDepthStencil)) {
+    flags &= ~0x30u;
+  }
   clear.flags = flags;
+  clear.surface_info = Load32(base, device + kRegSurfaceInfo);
+  for (int i = 0; i < 6; ++i) {
+    clear.viewport[i] = std::bit_cast<float>(Load32(base, device + kRegViewport + 4 * i));
+  }
   clear.color_info[0] = Load32(base, device + kRegColorInfo);
   for (int i = 1; i < 4; ++i) {
     clear.color_info[i] = Load32(base, device + kRegColor1Info + 4 * (i - 1));
