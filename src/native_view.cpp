@@ -1736,8 +1736,9 @@ class View {
     Barrier(vkCmdPipelineBarrier, cmd);
   }
 
-  // Slots: one per pass, the presented frame, then one per draw of the
-  // pass NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS names (first_draw_slot onwards).
+  // Slots: one per pass, the presented frame, then two per draw of the pass
+  // NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS names (first_draw_slot onwards): its
+  // first and second color targets.
   void WriteSnapshots(const char* root, uint32_t count, uint32_t first_draw_slot,
                       uint32_t draw_pass) {
     std::string dir = fmt::format("{}/{:06}", root, frames_total_);
@@ -1745,8 +1746,9 @@ class View {
     std::filesystem::create_directories(dir, error);
     for (uint32_t slot = 0; slot < count; ++slot) {
       std::string path =
-          slot >= first_draw_slot ? fmt::format("{}/pass{:02}_draw{:03}.ppm", dir, draw_pass,
-                                                slot - first_draw_slot)
+          slot >= first_draw_slot ? fmt::format("{}/pass{:02}_draw{:03}_rt{}.ppm", dir, draw_pass,
+                                                (slot - first_draw_slot) / 2,
+                                                (slot - first_draw_slot) % 2)
           : slot + 1 == first_draw_slot ? fmt::format("{}/final.ppm", dir)
                                         : fmt::format("{}/pass{:02}.ppm", dir, slot);
       FILE* file = std::fopen(path.c_str(), "wb");
@@ -1815,7 +1817,7 @@ class View {
     uint32_t draw_snapshots = 0;
     if (snapshots) {
       for (const Draw& draw : frame.captured) {
-        draw_snapshots += draw.pass == draw_pass;
+        draw_snapshots += draw.pass == draw_pass ? 2 : 0;
       }
     }
     if (snapshots && !PrepareSnapshots(pass_count + 1 + draw_snapshots)) {
@@ -2064,8 +2066,13 @@ class View {
           vkCmdEndRendering(cmd);
           rendering = false;
           Barrier(vkCmdPipelineBarrier, cmd);
-          RecordSnapshot(cmd, pt.color[0]->image.image, {pt.color[0]->width, pt.color[0]->height},
-                         pass_count + 1 + uint32_t(i - first));
+          for (uint32_t c = 0; c < 2 && c < pt.color_count; ++c) {
+            if (pt.color[c]) {
+              RecordSnapshot(cmd, pt.color[c]->image.image,
+                             {pt.color[c]->width, pt.color[c]->height},
+                             pass_count + 1 + 2 * uint32_t(i - first) + c);
+            }
+          }
         }
       }
       if (rendering) {

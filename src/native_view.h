@@ -18,7 +18,8 @@
 // DUMP and every NARUTO_NATIVE_VIEW_SNAPSHOT_EVERY (300) frames after it. F12
 // does the same for the current frame (into out/snapshots without SNAPSHOTS)
 // and logs all its draws. NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS=p also saves pass
-// p after each of its draws (pass<p>_draw<k>.ppm, k in the logged order).
+// p after each of its draws (pass<p>_draw<k>_rt<0|1>.ppm, its first two color
+// targets, k in the logged order).
 
 #pragma once
 
