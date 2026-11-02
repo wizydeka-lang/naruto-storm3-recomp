@@ -14,9 +14,14 @@
 #include <bit>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#define XXH_INLINE_ALL
+#include <xxhash.h>
 
 namespace frame_capture {
 
@@ -353,6 +358,93 @@ void Reorder(std::vector<uint8_t>& data, size_t begin, size_t end, uint32_t stri
   }
 }
 
+
+// A vertex buffer range a draw reads, and the components to reorder in it.
+struct VertexRange {
+  uint32_t address;  // physical
+  uint32_t size;
+  uint32_t endian;
+  uint32_t stride;
+  std::vector<Fetch> reorders;
+};
+
+// Appends a vertex range to data, little-endian and with its components in
+// the order the converted shaders expect; returns its offset.
+uint32_t AppendVertices(std::vector<uint8_t>& data, const uint8_t* source,
+                        const VertexRange& range) {
+  uint32_t offset = AppendSwapped(data, source, range.size, range.endian);
+  for (const Fetch& fetch : range.reorders) {
+    Reorder(data, offset + fetch.offset, offset + range.size, range.stride, fetch);
+  }
+  return offset;
+}
+
+// Frames a vertex range has to stay unchanged before it is cached, and may
+// go unused before it is dropped.
+constexpr uint64_t kVertexStableFrames = 2;
+constexpr uint64_t kVertexIdleFrames = 600;
+
+// Converted vertex ranges, by where they are and how they're converted.
+struct CachedVertices {
+  uint64_t content = 0;       // hash of the guest bytes
+  uint64_t stable_since = 0;  // frame the content last changed
+  uint64_t last_used = 0;     // frame
+  std::shared_ptr<const native_view::VertexData> data;
+  native_view::VertexBinding binding{};  // in frame last_used
+};
+std::unordered_map<uint64_t, CachedVertices> g_vertex_cache;
+uint64_t g_vertex_data_ids = 0;
+
+// The binding for a vertex range: cached data if it has been unchanged for
+// a few frames, else a copy in the frame's data. Ranges a frame binds again
+// reuse the first binding.
+native_view::VertexBinding BindVertices(const uint8_t* base, const VertexRange& range,
+                                        native_view::FrameInfo& frame) {
+  XXH3_state_t key_state;
+  XXH3_64bits_reset(&key_state);
+  uint32_t where[4] = {range.address, range.size, range.endian, range.stride};
+  XXH3_64bits_update(&key_state, where, sizeof(where));
+  for (const Fetch& fetch : range.reorders) {
+    uint32_t how[4] = {uint32_t(fetch.offset), fetch.xenos_format | fetch.is_signed << 8,
+                       fetch.swizzle, fetch.library_swizzle};
+    XXH3_64bits_update(&key_state, how, sizeof(how));
+  }
+  auto [it, added] = g_vertex_cache.try_emplace(XXH3_64bits_digest(&key_state));
+  CachedVertices& cached = it->second;
+  if (!added && cached.last_used == frame.number) {
+    return cached.binding;
+  }
+  const uint8_t* source = Physical(base, range.address);
+  uint64_t content = XXH3_64bits(source, range.size);
+  if (added || content != cached.content) {
+    cached.content = content;
+    cached.stable_since = frame.number;
+    cached.data.reset();
+  }
+  cached.last_used = frame.number;
+  if (!cached.data && frame.number - cached.stable_since >= kVertexStableFrames) {
+    auto data = std::make_shared<native_view::VertexData>();
+    data->id = ++g_vertex_data_ids;
+    AppendVertices(data->bytes, source, range);
+    cached.data = std::move(data);
+  }
+  if (cached.data) {
+    cached.binding = {0, range.stride, int32_t(frame.vertex_data.size())};
+    frame.vertex_data.push_back(cached.data);
+  } else {
+    cached.binding = {AppendVertices(frame.data, source, range), range.stride, -1};
+  }
+
+  static uint64_t swept = 0;
+  if (frame.number >= swept + 300) {
+    swept = frame.number;
+    std::erase_if(g_vertex_cache, [&](const auto& entry) {
+      return entry.second.last_used + kVertexIdleFrames < frame.number;
+    });
+  }
+  return cached.binding;
+}
+
 }  // namespace
 
 bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& frame) {
@@ -527,18 +619,13 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   bool new_frame = frame.captured.empty();
   draw.first_vertex = first_vertex;
   draw.vertex_count = last_vertex - first_vertex + 1;
-  draw.first_binding = uint32_t(frame.bindings.size());
+  // The vertex buffers the fetches read, each the range of vertices the
+  // indices reach.
+  std::vector<VertexRange> ranges;
+  std::map<uint32_t, uint32_t> range_of;  // fetch constant -> binding
   draw.first_attribute = uint32_t(frame.attributes.size());
-  size_t data_size = frame.data.size();
-  auto fail = [&] {
-    frame.data.resize(data_size);
-    frame.bindings.resize(draw.first_binding);
-    frame.attributes.resize(draw.first_attribute);
-    return false;
-  };
-  std::map<uint32_t, uint32_t> bindings;  // fetch constant -> binding
   for (const Fetch& fetch : fetches) {
-    auto [it, added] = bindings.try_emplace(fetch.fetch_constant, uint32_t(bindings.size()));
+    auto [it, added] = range_of.try_emplace(fetch.fetch_constant, uint32_t(ranges.size()));
     if (added) {
       // Vertex fetch constant: address | 3 (type), then size in words << 2 |
       // endian; the address is physical.
@@ -547,7 +634,8 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       uint32_t size = ((d1 >> 2) & 0xFFFFFF) * 4;
       if ((d0 & 3) != 3) {
         WarnOnce("fetch constant is not a vertex buffer", fetch.fetch_constant);
-        return fail();
+        frame.attributes.resize(draw.first_attribute);
+        return false;
       }
       uint64_t begin = 0, end = std::min<uint64_t>(size, 256);
       if (fetch.stride) {
@@ -556,28 +644,27 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
         draw.missing_bytes += uint32_t(uint64_t(last_vertex + 1) * fetch.stride - end);
       }
       if (begin >= end) {
-        return fail();
+        frame.attributes.resize(draw.first_attribute);
+        return false;
       }
-      uint32_t offset = AppendSwapped(frame.data, Physical(base, (d0 & ~3u) + uint32_t(begin)),
-                                      size_t(end - begin), d1 & 3);
-      frame.bindings.push_back({offset, fetch.stride});
+      ranges.push_back({(d0 & ~3u) + uint32_t(begin), uint32_t(end - begin), d1 & 3,
+                        fetch.stride, {}});
     }
     frame.attributes.push_back({fetch.location, it->second, uint32_t(fetch.offset), fetch.format,
                                 fetch.xenos_format, fetch.swizzle, fetch.library_swizzle});
     if (fetch.swizzle != fetch.library_swizzle) {
-      const native_view::VertexBinding& binding = frame.bindings[draw.first_binding + it->second];
-      size_t end = frame.data.size();
-      if (draw.first_binding + it->second + 1 < frame.bindings.size()) {
-        end = frame.bindings[draw.first_binding + it->second + 1].data_offset;
-      }
       if (Components(fetch.xenos_format).first) {
-        Reorder(frame.data, binding.data_offset + fetch.offset, end, binding.stride, fetch);
+        ranges[it->second].reorders.push_back(fetch);
       } else {
         WarnOnce("vertex fetch swizzle", fetch.swizzle | fetch.xenos_format << 12);
       }
     }
   }
-  draw.binding_count = uint32_t(frame.bindings.size()) - draw.first_binding;
+  draw.first_binding = uint32_t(frame.bindings.size());
+  for (const VertexRange& range : ranges) {
+    frame.bindings.push_back(BindVertices(base, range, frame));
+  }
+  draw.binding_count = uint32_t(ranges.size());
   draw.attribute_count = uint32_t(frame.attributes.size()) - draw.first_attribute;
 
   // Indices, rebased to the first copied vertex.

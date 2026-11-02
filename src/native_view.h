@@ -24,13 +24,22 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 namespace native_view {
 
+// Vertex data converted once and reused while the guest's is unchanged.
+// The view uploads it to the GPU the first time a frame uses it.
+struct VertexData {
+  uint64_t id;  // unique for each conversion
+  std::vector<uint8_t> bytes;
+};
+
 struct VertexBinding {
-  uint32_t data_offset;  // in FrameInfo::data
+  uint32_t data_offset;  // in FrameInfo::data, or in the cached data
   uint32_t stride;       // bytes
+  int32_t cached = -1;   // index into FrameInfo::vertex_data, -1 for none
 };
 
 struct VertexAttribute {
@@ -138,8 +147,10 @@ struct FrameInfo {
   bool has_front_buffer = false;
   uint32_t front_buffer[6] = {};
   std::vector<uint8_t> data;  // vertices, indices and constants
+  std::vector<std::shared_ptr<const VertexData>> vertex_data;
   // Guest memory, where the view reads texture data.
   const uint8_t* guest_base = nullptr;
+  uint64_t number = 0;  // counts the game's frames
   // Game thread time spent recording the frame's draws.
   double capture_seconds = 0;
 };

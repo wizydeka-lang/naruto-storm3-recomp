@@ -382,6 +382,7 @@ REX_HOOK_RAW(sub_82746748) {
       }
       frame = std::move(g_frame);
       g_frame = {};
+      g_frame.number = frame.number + 1;
       g_frame.data = native_view::RecycledData();
       g_pass = 0;
     }

@@ -73,6 +73,11 @@ constexpr uint32_t kSamplerCount = 256;
 constexpr size_t kTextureUploadBudget = 96u << 20;
 // Size of XenosRecomp's shared constants.
 constexpr uint32_t kSharedConstantsSize = 288;
+// Device-local memory for cached vertex data is allocated in chunks of at
+// least this size.
+constexpr VkDeviceSize kVertexChunkSize = 32ull << 20;
+// Frames cached vertex data may go unused before it is freed.
+constexpr uint64_t kVertexIdleFrames = 600;
 // Frames a texture may go unused before it is freed.
 constexpr uint64_t kTextureIdleFrames = 1800;
 
@@ -135,6 +140,7 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCmdClearColorImage)            \
   X(vkCmdClearAttachments)           \
   X(vkCmdCopyBufferToImage)          \
+  X(vkCmdCopyBuffer)                 \
   X(vkCmdBindPipeline)               \
   X(vkCmdBindDescriptorSets)         \
   X(vkCmdBindVertexBuffers)          \
@@ -545,6 +551,13 @@ class View {
     }
     std::erase_if(retired_, done);
     if (frames_total_ % 300 == 0) {
+      std::erase_if(vertex_data_, [&](const auto& entry) {
+        if (entry.second.last_used + kVertexIdleFrames >= frames_total_) {
+          return false;
+        }
+        FreeVertexMemory(entry.second);
+        return true;
+      });
       for (auto it = textures_.begin(); it != textures_.end();) {
         if (it->second.last_used + kTextureIdleFrames < frames_total_) {
           Retire(it->second);
@@ -910,6 +923,75 @@ class View {
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
   };
+
+  // Cached vertex data on the GPU, in a chunk of device-local memory.
+  struct ResidentVertices {
+    uint32_t chunk;
+    VkDeviceSize offset, size;
+    uint64_t last_used;  // frame
+  };
+  struct VertexChunk {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    std::map<VkDeviceSize, VkDeviceSize> free;  // offset -> size
+  };
+
+  // Finds room for size bytes of vertex data, first fit, adding a chunk if
+  // none has room. Returns false if memory runs out.
+  bool AllocateVertexMemory(VkDeviceSize size, ResidentVertices& resident) {
+    size = (size + 255) & ~VkDeviceSize(255);
+    for (uint32_t c = 0; c < vertex_chunks_.size(); ++c) {
+      auto& free = vertex_chunks_[c].free;
+      for (auto it = free.begin(); it != free.end(); ++it) {
+        if (it->second >= size) {
+          resident = {c, it->first, size, 0};
+          if (it->second > size) {
+            free[it->first + size] = it->second - size;
+          }
+          free.erase(it);
+          return true;
+        }
+      }
+    }
+    VertexChunk chunk;
+    VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    info.size = std::max(size, kVertexChunkSize);
+    info.usage = VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    vkCreateBuffer(device_, &info, nullptr, &chunk.buffer);
+    VkMemoryRequirements requirements;
+    vkGetBufferMemoryRequirements(device_, chunk.buffer, &requirements);
+    chunk.memory = Allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    if (!chunk.memory) {
+      vkDestroyBuffer(device_, chunk.buffer, nullptr);
+      return false;
+    }
+    vkBindBufferMemory(device_, chunk.buffer, chunk.memory, 0);
+    if (info.size > size) {
+      chunk.free[size] = info.size - size;
+    }
+    resident = {uint32_t(vertex_chunks_.size()), 0, size, 0};
+    vertex_chunks_.push_back(std::move(chunk));
+    return true;
+  }
+
+  // Returns vertex data's memory to its chunk, merging it with free
+  // neighbors. No frame in flight may still use it.
+  void FreeVertexMemory(const ResidentVertices& resident) {
+    auto& free = vertex_chunks_[resident.chunk].free;
+    auto [it, added] = free.emplace(resident.offset, resident.size);
+    auto next = std::next(it);
+    if (next != free.end() && it->first + it->second == next->first) {
+      it->second += next->second;
+      free.erase(next);
+    }
+    if (it != free.begin()) {
+      auto previous = std::prev(it);
+      if (previous->first + previous->second == it->first) {
+        previous->second += it->second;
+        free.erase(it);
+      }
+    }
+  }
 
   // Grows the frame's upload buffer; the frame's fence has been waited on.
   bool ReserveUpload(Upload& upload, VkDeviceSize size) {
@@ -1469,6 +1551,13 @@ class View {
   // NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws of the n-th frame,
   // for checking capture against what the game set; pass UINT32_MAX logs
   // every pass's draws.
+  // A binding's vertices on the CPU.
+  static const uint8_t* BindingData(const FrameInfo& frame, const VertexBinding& binding) {
+    const uint8_t* data = binding.cached >= 0 ? frame.vertex_data[binding.cached]->bytes.data()
+                                              : frame.data.data();
+    return data + binding.data_offset;
+  }
+
   void Dump(const FrameInfo& frame, uint32_t pass, bool forced) {
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
@@ -1548,10 +1637,17 @@ class View {
         const VertexBinding& b = frame.bindings[d.first_binding + a.binding];
         const auto& element = shaders[d.vertex_shader].vertex_elements[a.location];
         std::string values;
+        const uint8_t* vertices = BindingData(frame, b);
+        auto vertex_f32 = [&](uint32_t at) {
+          float value;
+          std::memcpy(&value, vertices + at, 4);
+          return value;
+        };
         for (uint32_t v = 0; v < 2; ++v) {
-          uint32_t at = b.data_offset + v * b.stride + a.offset;
-          values += fmt::format(" ({} {} {} | {:08x})", f32(at), f32(at + 4), f32(at + 8),
-                                *reinterpret_cast<const uint32_t*>(frame.data.data() + at));
+          uint32_t at = v * b.stride + a.offset;
+          values += fmt::format(" ({} {} {} | {:08x})", vertex_f32(at), vertex_f32(at + 4),
+                                vertex_f32(at + 8),
+                                *reinterpret_cast<const uint32_t*>(vertices + at));
         }
         auto swizzle = [](uint32_t s) {
           std::string text;
@@ -1572,7 +1668,7 @@ class View {
           std::string words;
           for (uint32_t w = 0; w < binding.stride / 4 && w < 16; ++w) {
             words += fmt::format(" {:08x}", *reinterpret_cast<const uint32_t*>(
-                                                 frame.data.data() + binding.data_offset +
+                                                 BindingData(frame, binding) +
                                                  v * binding.stride + w * 4));
           }
           REXLOG_INFO("[native view]   binding {} vertex {}:{}", b, v, words);
@@ -2005,9 +2101,57 @@ class View {
       total = pending.offset + pending.decoded.data.size();
       textures_uploaded_bytes_ += pending.decoded.data.size();
     }
+    // Cached vertex data new to the GPU goes through the upload buffer into
+    // device-local memory; past the budget, or without memory, it is drawn
+    // from the upload buffer this frame.
+    struct VertexSource {
+      VkBuffer buffer;  // VK_NULL_HANDLE: the upload buffer
+      VkDeviceSize offset;
+    };
+    struct StagedVertices {
+      size_t index;  // into frame.vertex_data
+      VkDeviceSize offset;  // in the upload buffer
+      const ResidentVertices* resident;  // where to copy it, or nullptr
+    };
+    std::vector<VertexSource> vertex_sources(frame.vertex_data.size());
+    std::vector<StagedVertices> staged_vertices;
+    size_t vertex_budget = kTextureUploadBudget;
+    for (size_t i = 0; i < frame.vertex_data.size(); ++i) {
+      const VertexData& data = *frame.vertex_data[i];
+      auto it = vertex_data_.find(data.id);
+      if (it != vertex_data_.end()) {
+        it->second.last_used = frames_total_;
+        vertex_sources[i] = {vertex_chunks_[it->second.chunk].buffer, it->second.offset};
+        continue;
+      }
+      VkDeviceSize offset = (total + 15) & ~VkDeviceSize(15);
+      total = offset + data.bytes.size();
+      vertex_sources[i] = {VK_NULL_HANDLE, offset};
+      ResidentVertices resident;
+      if (data.bytes.size() <= vertex_budget &&
+          AllocateVertexMemory(data.bytes.size(), resident)) {
+        vertex_budget -= data.bytes.size();
+        resident.last_used = frames_total_;
+        it = vertex_data_.emplace(data.id, resident).first;
+        vertex_sources[i] = {vertex_chunks_[resident.chunk].buffer, resident.offset};
+        vertices_uploaded_bytes_ += data.bytes.size();
+      }
+      staged_vertices.push_back(
+          {i, offset, it != vertex_data_.end() ? &it->second : nullptr});
+    }
+    // Without a submit, vertex data made resident here never gets copied.
+    auto abandon_vertices = [&] {
+      for (const StagedVertices& staged : staged_vertices) {
+        if (staged.resident) {
+          FreeVertexMemory(*staged.resident);
+          vertex_data_.erase(frame.vertex_data[staged.index]->id);
+        }
+      }
+    };
     Upload& upload = uploads_[frame_index_];
     if (!ReserveUpload(upload, std::max<VkDeviceSize>(total, 1))) {
       REXLOG_ERROR("[native view] upload buffer allocation failed");
+      abandon_vertices();
       return;
     }
     uint32_t image_index = 0;
@@ -2015,10 +2159,12 @@ class View {
                                               image_acquired_[frame_index_], VK_NULL_HANDLE,
                                               &image_index);
     if (acquired == VK_ERROR_OUT_OF_DATE_KHR) {
+      abandon_vertices();
       Recreate();
       return;
     }
     if (acquired != VK_SUCCESS && acquired != VK_SUBOPTIMAL_KHR) {
+      abandon_vertices();
       return;
     }
     vkResetFences(device_, 1, &fence);
@@ -2027,6 +2173,10 @@ class View {
     for (const PendingUpload& pending : texture_uploads) {
       std::memcpy(upload.mapped + pending.offset, pending.decoded.data.data(),
                   pending.decoded.data.size());
+    }
+    for (const StagedVertices& staged : staged_vertices) {
+      const std::vector<uint8_t>& bytes = frame.vertex_data[staged.index]->bytes;
+      std::memcpy(upload.mapped + staged.offset, bytes.data(), bytes.size());
     }
 
     VkCommandBuffer cmd = command_buffers_[frame_index_];
@@ -2102,6 +2252,14 @@ class View {
                            VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                            0, 0, nullptr, 0, nullptr, 1, &barrier);
+    }
+    for (const StagedVertices& staged : staged_vertices) {
+      if (staged.resident) {
+        VkBufferCopy copy{staged.offset, staged.resident->offset,
+                          frame.vertex_data[staged.index]->bytes.size()};
+        vkCmdCopyBuffer(cmd, upload.buffer, vertex_chunks_[staged.resident->chunk].buffer, 1,
+                        &copy);
+      }
     }
     Barrier(vkCmdPipelineBarrier, cmd);
 
@@ -2209,8 +2367,14 @@ class View {
         std::array<VkBuffer, 16> buffers;
         std::array<VkDeviceSize, 16> offsets;
         for (uint32_t b = 0; b < draw.binding_count; ++b) {
+          const VertexBinding& binding = frame.bindings[draw.first_binding + b];
           buffers[b] = upload.buffer;
-          offsets[b] = frame.bindings[draw.first_binding + b].data_offset;
+          offsets[b] = binding.data_offset;
+          if (binding.cached >= 0) {
+            const VertexSource& source = vertex_sources[binding.cached];
+            buffers[b] = source.buffer ? source.buffer : upload.buffer;
+            offsets[b] += source.offset;
+          }
         }
         if (draw.binding_count) {
           vkCmdBindVertexBuffers(cmd, 0, draw.binding_count, buffers.data(), offsets.data());
@@ -2396,11 +2560,14 @@ class View {
       REXLOG_INFO(
           "[native view] {:.1f} fps, {:.1f} draws/frame, {} passes, {} resolves, "
           "{:.1f} MB captured/frame, {} pipelines, {} render targets, {} resolved textures, "
-          "{} textures ({} not decodable), {:.1f} MB of textures uploaded",
+          "{} textures ({} not decodable), {:.1f} MB of textures uploaded, {:.1f} MB of "
+          "vertices cached ({} ranges in {} chunks)",
           frames_presented_ / seconds, double(draws_drawn_) / std::max<uint64_t>(frames_presented_, 1),
           pass_count, frame.resolves.size(), frame.data.size() / 1048576.0, pipelines_.size(),
           render_targets_.size(), resolved_.size(), textures_.size(), textures_failed_,
-          textures_uploaded_bytes_ / 1048576.0);
+          textures_uploaded_bytes_ / 1048576.0, vertices_uploaded_bytes_ / 1048576.0,
+          vertex_data_.size(), vertex_chunks_.size());
+      vertices_uploaded_bytes_ = 0;
       uint64_t submitted = frames_submitted_.exchange(0);
       uint64_t presented = std::max<uint64_t>(frames_presented_, 1);
       REXLOG_INFO("[native view] timing: {:.1f} game frames/s, capture {:.2f} ms/frame (game "
@@ -2506,6 +2673,9 @@ class View {
   std::vector<Retired> retired_;
   uint64_t textures_failed_ = 0;
   uint64_t textures_uploaded_bytes_ = 0;
+  std::unordered_map<uint64_t, ResidentVertices> vertex_data_;  // by VertexData::id
+  std::vector<VertexChunk> vertex_chunks_;
+  uint64_t vertices_uploaded_bytes_ = 0;
   std::atomic<uint64_t> frames_submitted_ = 0;
   double capture_seconds_ = 0;  // of the presented frames
   double cpu_seconds_ = 0;
