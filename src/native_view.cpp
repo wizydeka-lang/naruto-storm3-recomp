@@ -1736,13 +1736,19 @@ class View {
     Barrier(vkCmdPipelineBarrier, cmd);
   }
 
-  void WriteSnapshots(const char* root, uint32_t count) {
+  // Slots: one per pass, the presented frame, then one per draw of the
+  // pass NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS names (first_draw_slot onwards).
+  void WriteSnapshots(const char* root, uint32_t count, uint32_t first_draw_slot,
+                      uint32_t draw_pass) {
     std::string dir = fmt::format("{}/{:06}", root, frames_total_);
     std::error_code error;
     std::filesystem::create_directories(dir, error);
     for (uint32_t slot = 0; slot < count; ++slot) {
-      std::string path = slot + 1 == count ? fmt::format("{}/final.ppm", dir)
-                                           : fmt::format("{}/pass{:02}.ppm", dir, slot);
+      std::string path =
+          slot >= first_draw_slot ? fmt::format("{}/pass{:02}_draw{:03}.ppm", dir, draw_pass,
+                                                slot - first_draw_slot)
+          : slot + 1 == first_draw_slot ? fmt::format("{}/final.ppm", dir)
+                                        : fmt::format("{}/pass{:02}.ppm", dir, slot);
       FILE* file = std::fopen(path.c_str(), "wb");
       if (!file) {
         continue;
@@ -1802,7 +1808,17 @@ class View {
     // Plan the frame on the CPU, in the game's order: resolves create their
     // destination images before later draws look textures up.
     new_images_.clear();
-    if (snapshots && !PrepareSnapshots(pass_count + 1)) {
+    static const uint32_t draw_pass = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS");
+      return value ? uint32_t(std::strtoul(value, nullptr, 10)) : UINT32_MAX;
+    }();
+    uint32_t draw_snapshots = 0;
+    if (snapshots) {
+      for (const Draw& draw : frame.captured) {
+        draw_snapshots += draw.pass == draw_pass;
+      }
+    }
+    if (snapshots && !PrepareSnapshots(pass_count + 1 + draw_snapshots)) {
       snapshots = false;
     }
     std::vector<PassTargets> targets = PlanTargets(frame);
@@ -2044,6 +2060,13 @@ class View {
                            sizeof(push), &push);
         vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
         drawn++;
+        if (snapshots && pass == draw_pass && pt.color_count && pt.color[0]) {
+          vkCmdEndRendering(cmd);
+          rendering = false;
+          Barrier(vkCmdPipelineBarrier, cmd);
+          RecordSnapshot(cmd, pt.color[0]->image.image, {pt.color[0]->width, pt.color[0]->height},
+                         pass_count + 1 + uint32_t(i - first));
+        }
       }
       if (rendering) {
         vkCmdEndRendering(cmd);
@@ -2156,7 +2179,7 @@ class View {
     }
     if (snapshots) {
       vkQueueWaitIdle(queue_);
-      WriteSnapshots(snapshot_dir, pass_count + 1);
+      WriteSnapshots(snapshot_dir, pass_count + 1 + draw_snapshots, pass_count + 1, draw_pass);
     }
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
