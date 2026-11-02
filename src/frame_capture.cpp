@@ -340,13 +340,10 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   uint32_t first_vertex = uint32_t(int64_t(min_index) + call.base_vertex);
   uint32_t last_vertex = uint32_t(int64_t(max_index) + call.base_vertex);
 
-  // The bound variant's microcode, as the per-draw commit picks it: the
-  // second variant if flag 0x20 is set, else the first.
-  uint32_t object = call.vertex_shader;
-  uint32_t variant =
-      object + Load32(base, object + ((Load32(base, object + 872) & 0x20) ? 904 : 896));
-  uint32_t code = Load32(base, object + 32) + Load32(base, variant + 872);
-  uint32_t code_size = Load32(base, variant + 876);
+  // The vertex fetches come from the bound variant's microcode as Direct3D
+  // last patched it for a vertex declaration.
+  uint32_t code = call.vertex_code;
+  uint32_t code_size = call.vertex_code_size;
 
   // Decode each element's vertex fetch in program order: a mini fetch reuses
   // the fetch constant and stride of the full fetch before it.

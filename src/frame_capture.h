@@ -27,6 +27,10 @@ struct DrawCall {
   int vertex_shader_index;  // shader_library matches, -1 for none
   int pixel_shader_index;
   uint32_t pass;
+  // The bound vertex shader variant's patched microcode (guest address and
+  // bytes).
+  uint32_t vertex_code;
+  uint32_t vertex_code_size;
 };
 
 // Appends the draw to frame.captured; returns false (and appends nothing) if

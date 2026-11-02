@@ -18,6 +18,7 @@
 #include "shader_library.h"
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cstdint>
@@ -40,8 +41,10 @@ uint32_t LoadGuest32(const uint8_t* base, uint32_t address) {
 }
 
 // Where a bound shader object keeps its microcode (docs/d3d-functions.md). A
-// vertex shader holds variants patched for different vertex layouts; variant
-// 0 is enough to identify it. A pixel shader has one copy. The object embeds
+// vertex shader holds variants (offsets at +896, eight bytes apart); the one
+// bound is copied into the command buffer and its vertex fetches patched
+// there for the vertex declaration (BoundVertexShader). A pixel shader has
+// one copy. The object embeds
 // its container's virtual part (header, constant table, element table) at
 // `header`; the microcode is the container's physical part.
 struct ShaderLocation {
@@ -50,11 +53,12 @@ struct ShaderLocation {
   uint32_t size = 0;
 };
 
-ShaderLocation LocateShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage) {
+ShaderLocation LocateShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage,
+                            uint32_t vertex_variant = 0) {
   ShaderLocation location;
   if (stage == shader_library::Stage::kVertex) {
     location.header = shader + 872;
-    uint32_t variant = shader + LoadGuest32(base, shader + 896);
+    uint32_t variant = shader + LoadGuest32(base, shader + 896 + 8 * vertex_variant);
     location.address = LoadGuest32(base, shader + 32) + LoadGuest32(base, variant + 872);
     location.size = LoadGuest32(base, variant + 876);
   } else {
@@ -111,11 +115,12 @@ struct ShaderMatch {
 std::unordered_map<uint32_t, ShaderMatch> g_shader_matches;
 bool g_library_loaded = false;
 
-int MatchShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage) {
+int MatchShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage,
+                uint32_t vertex_variant = 0) {
   if (!shader) {
     return -1;
   }
-  ShaderLocation location = LocateShader(base, shader, stage);
+  ShaderLocation location = LocateShader(base, shader, stage, vertex_variant);
   uint32_t first_words[4] = {};
   for (uint32_t i = 0; i < 4 && i * 4 < location.size; ++i) {
     first_words[i] = LoadGuest32(base, location.address + i * 4);
@@ -173,6 +178,27 @@ std::mutex g_mutex;
 FrameStats g_stats;
 native_view::FrameInfo g_frame;
 uint32_t g_pass = 0;  // index of g_frame.passes being drawn
+
+// Where each device's vertex shader variants were last patched for a vertex
+// declaration: in place in the object's microcode (sub_8274A0F8), or, while
+// the GPU may still read that, in a copy in the command buffer
+// (sub_82749EF0). The patched vertex fetches give the layout draws use.
+// Variant 1 is the depth-only one (RB_MODECONTROL edram mode 5) of objects
+// with flag 0x20.
+struct BoundVertexShader {
+  uint32_t object = 0;
+  uint32_t code = 0;
+  uint32_t size = 0;
+};
+std::unordered_map<uint32_t, std::array<BoundVertexShader, 2>> g_bound_vertex_shaders;
+constexpr uint32_t kRegModeControl = 0x2954;  // RB_MODECONTROL shadow
+
+uint32_t VariantMicrocode(const uint8_t* base, uint32_t object, uint32_t variant,
+                          uint32_t* size) {
+  uint32_t header = object + LoadGuest32(base, object + 896 + 8 * variant);
+  *size = LoadGuest32(base, header + 876);
+  return LoadGuest32(base, object + 32) + LoadGuest32(base, header + 872);
+}
 std::set<uint32_t> g_all_vertex_shaders;
 std::set<uint32_t> g_all_pixel_shaders;
 auto g_window_start = std::chrono::steady_clock::now();
@@ -184,13 +210,19 @@ void RecordDraw(const uint8_t* base, uint32_t device, uint32_t primitive_type, b
   uint32_t vs = LoadGuest32(base, device + kDeviceVertexShader);
   uint32_t ps = LoadGuest32(base, device + kDevicePixelShader);
   std::lock_guard<std::mutex> lock(g_mutex);
-  int vs_index = MatchShader(base, vs, shader_library::Stage::kVertex);
+  uint32_t variant = vs && (LoadGuest32(base, vs + 872) & 0x20) &&
+                             (LoadGuest32(base, device + kRegModeControl) & 7) == 5;
+  BoundVertexShader bound = g_bound_vertex_shaders[device][variant];
+  if (vs && bound.object != vs) {
+    bound = {vs, VariantMicrocode(base, vs, variant, &bound.size), bound.size};
+  }
+  int vs_index = MatchShader(base, vs, shader_library::Stage::kVertex, variant);
   int ps_index = MatchShader(base, ps, shader_library::Stage::kPixel);
   g_frame.draws++;
   if (native_view::Enabled() &&
       frame_capture::Capture(base,
                              {device, primitive_type, indexed, base_vertex, start, count, vs, ps,
-                              vs_index, ps_index, g_pass},
+                              vs_index, ps_index, g_pass, bound.code, bound.size},
                              g_frame)) {
     g_stats.captured_draws++;
   }
@@ -256,6 +288,37 @@ REX_FUNC(__imp__sub_827514C0);
 REX_FUNC(__imp__sub_8275CED8);
 REX_FUNC(__imp__sub_8275BD48);
 REX_FUNC(__imp__sub_8274D2C8);
+REX_FUNC(__imp__sub_82749EF0);
+REX_FUNC(__imp__sub_8274A0F8);
+}
+
+// Patches a vertex shader variant in place for the vertex declaration:
+// (device, object, declaration, variant); returns 0 if the GPU may still read
+// the microcode.
+REX_HOOK_RAW(sub_8274A0F8) {
+  uint32_t device = ctx.r3.u32, object = ctx.r4.u32, variant = ctx.r6.u32;
+  __imp__sub_8274A0F8(ctx, base);
+  if (g_enabled && ctx.r3.u32 && variant < 2) {
+    uint32_t size;
+    uint32_t code = VariantMicrocode(base, object, variant, &size);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_bound_vertex_shaders[device][variant] = {object, code, size};
+  }
+}
+
+// Loads a vertex shader variant through the command buffer: (device, ...,
+// object r5, ..., variant r10). It copies the microcode there, patches the
+// copy and leaves the device's write pointer (+48) on its last word.
+REX_HOOK_RAW(sub_82749EF0) {
+  uint32_t device = ctx.r3.u32, object = ctx.r5.u32, variant = ctx.r10.u32;
+  __imp__sub_82749EF0(ctx, base);
+  if (g_enabled && variant < 2) {
+    uint32_t size;
+    VariantMicrocode(base, object, variant, &size);
+    uint32_t end = LoadGuest32(base, device + 48);
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_bound_vertex_shaders[device][variant] = {object, end + 4 - size, size};
+  }
 }
 
 // D3DDevice_Swap(device, front buffer texture, ...)
