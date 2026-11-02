@@ -38,6 +38,11 @@ struct VertexAttribute {
   uint32_t binding;  // index into the draw's bindings
   uint32_t offset;
   uint32_t format;  // VkFormat
+  // For the dump: the Xenos format and the patched and library destination
+  // swizzles of the vertex fetch.
+  uint32_t xenos_format = 0;
+  uint32_t swizzle = 0;
+  uint32_t library_swizzle = 0;
 };
 
 // A texture a draw's pixel shader samples: its sampler register and the

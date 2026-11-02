@@ -1498,11 +1498,12 @@ class View {
       VkViewport vp = Viewport(d);
       REXLOG_INFO(
           "[native view] draw in pass {}: vs {}@{:#x} ps {} topology {} indices {} surface {:#x} vte {:#x} "
-          "depth {:#x} blend {:#x} mask {:#x} vport [{} {} {} {} {} {}] -> {} {} {} {} {} {}",
+          "depth {:#x} blend {:#x} mask {:#x} mode {:#x} alpha test {} vport [{} {} {} {} {} {}] -> "
+          "{} {} {} {} {} {}",
           d.pass, shaders[d.vertex_shader].library, shaders[d.vertex_shader].offset,
           d.pixel_shader >= 0 ? shaders[d.pixel_shader].offset : 0, d.topology, d.index_count,
           d.surface_info, d.vte_control, d.depth_control, d.blend_control[0], d.color_mask,
-          d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], d.viewport[4],
+          d.mode_control, d.alpha_test, d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], d.viewport[4],
           d.viewport[5], vp.x, vp.y, vp.width, vp.height, vp.minDepth, vp.maxDepth);
       for (uint32_t i = 0; i < d.attribute_count; ++i) {
         const VertexAttribute& a = frame.attributes[d.first_attribute + i];
@@ -1514,16 +1515,27 @@ class View {
           values += fmt::format(" ({} {} {} | {:08x})", f32(at), f32(at + 4), f32(at + 8),
                                 *reinterpret_cast<const uint32_t*>(frame.data.data() + at));
         }
-        REXLOG_INFO("[native view]   input {} usage {}.{} binding {} stride {} offset {} format {}:{}",
+        auto swizzle = [](uint32_t s) {
+          std::string text;
+          for (int c = 0; c < 4; ++c) {
+            text += "xyzw01?_"[(s >> (3 * c)) & 7];
+          }
+          return text;
+        };
+        REXLOG_INFO("[native view]   input {} usage {}.{} binding {} stride {} offset {} format {} "
+                    "(xenos {}, swizzle {} library {}):{}",
                     a.location, element.usage, element.usage_index, a.binding, b.stride, a.offset,
-                    a.format, values);
+                    a.format, a.xenos_format, swizzle(a.swizzle), swizzle(a.library_swizzle),
+                    values);
       }
       for (uint32_t b = 0; b < d.binding_count; ++b) {
         const VertexBinding& binding = frame.bindings[d.first_binding + b];
         for (uint32_t v = 0; v < 2; ++v) {
           std::string words;
           for (uint32_t w = 0; w < binding.stride / 4 && w < 16; ++w) {
-            words += fmt::format(" {}", f32(binding.data_offset + v * binding.stride + w * 4));
+            words += fmt::format(" {:08x}", *reinterpret_cast<const uint32_t*>(
+                                                 frame.data.data() + binding.data_offset +
+                                                 v * binding.stride + w * 4));
           }
           REXLOG_INFO("[native view]   binding {} vertex {}:{}", b, v, words);
         }

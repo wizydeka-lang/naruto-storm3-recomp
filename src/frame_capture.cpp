@@ -462,7 +462,8 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
                                       size_t(end - begin), d1 & 3);
       frame.bindings.push_back({offset, fetch.stride});
     }
-    frame.attributes.push_back({fetch.location, it->second, uint32_t(fetch.offset), fetch.format});
+    frame.attributes.push_back({fetch.location, it->second, uint32_t(fetch.offset), fetch.format,
+                                fetch.xenos_format, fetch.swizzle, fetch.library_swizzle});
     if (fetch.swizzle != fetch.library_swizzle) {
       const native_view::VertexBinding& binding = frame.bindings[draw.first_binding + it->second];
       size_t end = frame.data.size();
