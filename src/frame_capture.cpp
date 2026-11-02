@@ -400,8 +400,23 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   uint32_t code = call.vertex_code;
   uint32_t code_size = call.vertex_code_size;
 
-  // Decode each element's vertex fetch in program order: a mini fetch reuses
-  // the fetch constant and stride of the full fetch before it.
+  // Decode the patched vertex fetches in program order: a mini fetch reuses
+  // the fetch constant and stride of the full fetch before it. Direct3D
+  // rewrites the fetches in the vertex declaration's order, so an element's
+  // fetch is the one writing its library fetch's destination register and
+  // lanes, not necessarily the one at its address.
+  struct Patched {
+    uint32_t w0, w1, w2;
+    uint32_t constant, stride;
+    bool used;
+  };
+  auto destination = [](uint32_t w0, uint32_t w1) {
+    uint32_t lanes = 0;
+    for (uint32_t c = 0; c < 4; ++c) {
+      lanes |= (((w1 >> (3 * c)) & 7) != 7) << c;
+    }
+    return ((w0 >> 12) & 0x3F) | lanes << 8;  // register and written lanes
+  };
   std::vector<uint32_t> order(vs.vertex_elements.size());
   for (uint32_t i = 0; i < order.size(); ++i) {
     order[i] = i;
@@ -409,7 +424,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   std::sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
     return vs.vertex_elements[a].address < vs.vertex_elements[b].address;
   });
-  std::vector<Fetch> fetches;
+  std::vector<Patched> patched;
   bool have_full = false;
   uint32_t full_constant = 0, full_stride = 0;
   for (uint32_t element : order) {
@@ -433,6 +448,31 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       WarnOnce("mini vertex fetch without a full fetch", w1);
       return false;
     }
+    patched.push_back({w0, w1, w2, full_constant, full_stride, false});
+  }
+  std::vector<Fetch> fetches;
+  for (uint32_t i = 0; i < order.size(); ++i) {
+    uint32_t element = order[i];
+    uint32_t address = vs.vertex_elements[element].address * 12;
+    uint32_t library_w0 = vs.microcode[address / 4], library_w1 = vs.microcode[address / 4 + 1];
+    uint32_t wanted = destination(library_w0, library_w1);
+    // The fetch at the element's address if it matches, else the first
+    // unused one that does.
+    Patched* match = nullptr;
+    if (!patched[i].used && destination(patched[i].w0, patched[i].w1) == wanted) {
+      match = &patched[i];
+    }
+    for (uint32_t j = 0; j < patched.size() && !match; ++j) {
+      if (!patched[j].used && destination(patched[j].w0, patched[j].w1) == wanted) {
+        match = &patched[j];
+      }
+    }
+    if (!match) {
+      WarnOnce("no patched vertex fetch for element", vs.vertex_elements[element].address);
+      return false;
+    }
+    match->used = true;
+    uint32_t w1 = match->w1, w2 = match->w2;
     if (SignExtend((w1 >> 24) & 0x3F, 6) != 0) {
       WarnOnce("vertex fetch exponent adjust", w1);
       return false;
@@ -448,8 +488,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       WarnOnce("vertex fetch offset", uint32_t(offset));
       return false;
     }
-    uint32_t library_w1 = vs.microcode[address / 4 + 1];
-    fetches.push_back({element, full_constant, full_stride, offset, format, xenos_format,
+    fetches.push_back({element, match->constant, match->stride, offset, format, xenos_format,
                        w1 & 0xFFF, library_w1 & 0xFFF, bool((w1 >> 12) & 1)});
   }
 
