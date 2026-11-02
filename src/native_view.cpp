@@ -142,6 +142,11 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCmdSetViewport)                \
   X(vkCmdSetScissor)                 \
   X(vkCmdDrawIndexed)                \
+  X(vkCreateQueryPool)               \
+  X(vkCmdResetQueryPool)             \
+  X(vkCmdBeginQuery)                 \
+  X(vkCmdEndQuery)                   \
+  X(vkGetQueryPoolResults)           \
   X(vkCreateSemaphore)               \
   X(vkDestroySemaphore)              \
   X(vkCreateFence)                   \
@@ -300,6 +305,7 @@ class View {
         REXLOG_INFO("[native view] {} lacks features the shaders need", properties.deviceName);
         continue;
       }
+      statistics_ = features.features.pipelineStatisticsQuery;
       uint32_t family_count = 0;
       vkGetPhysicalDeviceQueueFamilyProperties(device, &family_count, nullptr);
       std::vector<VkQueueFamilyProperties> families(family_count);
@@ -346,6 +352,7 @@ class View {
     features.pNext = &features12;
     features.features.shaderInt64 = VK_TRUE;
     features.features.shaderSampledImageArrayDynamicIndexing = VK_TRUE;
+    features.features.pipelineStatisticsQuery = statistics_;
     const char* extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME};
     VkDeviceCreateInfo device_info{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     device_info.pNext = &features;
@@ -1554,11 +1561,7 @@ class View {
       REXLOG_INFO("[native view]   c0-c7:{}", constants);
       // NARUTO_NATIVE_VIEW_DUMP_VS=offset logs all vertex shader constants of
       // the draws using that library vertex shader.
-      static const long dump_vs = [] {
-        const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP_VS");
-        return value ? std::strtol(value, nullptr, 0) : -1;
-      }();
-      if (long(shaders[d.vertex_shader].offset) == dump_vs) {
+      if (DumpedVertexShader(d)) {
         for (uint32_t c = 0; c < 256; c += 4) {
           std::string row;
           for (uint32_t i = c * 4; i < (c + 4) * 4; ++i) {
@@ -1568,6 +1571,16 @@ class View {
         }
       }
     }
+  }
+
+  // NARUTO_NATIVE_VIEW_DUMP_VS=offset: the library vertex shader whose draws
+  // the dump details.
+  static bool DumpedVertexShader(const Draw& draw) {
+    static const long dump_vs = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP_VS");
+      return value ? std::strtol(value, nullptr, 0) : -1;
+    }();
+    return long(shader_library::Shaders()[draw.vertex_shader].offset) == dump_vs;
   }
 
   static void Barrier(PFN_vkCmdPipelineBarrier barrier, VkCommandBuffer cmd) {
@@ -1936,6 +1949,24 @@ class View {
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cmd, &begin);
+    std::vector<size_t> statistics_draws;
+    if (snapshots && statistics_) {
+      if (!statistics_pool_) {
+        VkQueryPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        pool_info.queryType = VK_QUERY_TYPE_PIPELINE_STATISTICS;
+        pool_info.queryCount = kStatisticsQueries;
+        pool_info.pipelineStatistics =
+            VK_QUERY_PIPELINE_STATISTIC_INPUT_ASSEMBLY_PRIMITIVES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_VERTEX_SHADER_INVOCATIONS_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_INVOCATIONS_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_CLIPPING_PRIMITIVES_BIT |
+            VK_QUERY_PIPELINE_STATISTIC_FRAGMENT_SHADER_INVOCATIONS_BIT;
+        vkCreateQueryPool(device_, &pool_info, nullptr, &statistics_pool_);
+      }
+      if (statistics_pool_) {
+        vkCmdResetQueryPool(cmd, statistics_pool_, 0, kStatisticsQueries);
+      }
+    }
 
     // New render targets and resolve destinations start cleared, in GENERAL.
     for (const NewImage& image : new_images_) {
@@ -2104,7 +2135,16 @@ class View {
         vkCmdPushConstants(cmd, pipeline_layout_,
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);
+        bool measured = statistics_pool_ && snapshots && DumpedVertexShader(draw) &&
+                        statistics_draws.size() < kStatisticsQueries;
+        if (measured) {
+          vkCmdBeginQuery(cmd, statistics_pool_, uint32_t(statistics_draws.size()), 0);
+        }
         vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
+        if (measured) {
+          vkCmdEndQuery(cmd, statistics_pool_, uint32_t(statistics_draws.size()));
+          statistics_draws.push_back(i);
+        }
         drawn++;
         if (snapshots && pass == draw_pass && pt.color_count && pt.color[0]) {
           vkCmdEndRendering(cmd);
@@ -2230,6 +2270,16 @@ class View {
     }
     if (snapshots) {
       vkQueueWaitIdle(queue_);
+      for (uint32_t q = 0; q < statistics_draws.size(); ++q) {
+        uint64_t values[5] = {};
+        if (vkGetQueryPoolResults(device_, statistics_pool_, q, 1, sizeof(values), values,
+                                  sizeof(values), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+          REXLOG_INFO("[native view] draw {} statistics: {} primitives in, {} vertex shader runs, "
+                      "{} clipping in, {} clipping out, {} fragment shader runs",
+                      statistics_draws[q], values[0], values[1], values[2], values[3],
+                      values[4]);
+        }
+      }
       WriteSnapshots(snapshot_dir, pass_count + 1 + draw_snapshots, pass_count + 1, draw_pass);
     }
 
@@ -2324,6 +2374,11 @@ class View {
   std::array<Image, 3> placeholders_{};
   std::array<VkSampler, kSamplerCount> samplers_{};
   bool mirror_clamp_ = false;
+  // Pipeline statistics for the draws NARUTO_NATIVE_VIEW_DUMP_VS names, on
+  // snapshot frames.
+  bool statistics_ = false;
+  VkQueryPool statistics_pool_ = VK_NULL_HANDLE;
+  static constexpr uint32_t kStatisticsQueries = 64;
   std::map<std::array<uint32_t, 5>, CachedTexture> textures_;
   std::array<std::vector<uint32_t>, 3> free_indices_;
   std::vector<Retired> retired_;
