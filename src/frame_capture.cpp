@@ -122,6 +122,36 @@ uint32_t AppendSwapped(std::vector<uint8_t>& data, const uint8_t* source, size_t
   return offset;
 }
 
+// Moves the first 16-bit component of each word to the low half, as
+// Vulkan's 16-bit vertex formats expect, for one attribute of a binding.
+void SwapHalves(std::vector<uint8_t>& data, size_t begin, size_t end, uint32_t stride,
+                uint32_t words) {
+  for (size_t at = begin; at + words * 4 <= end; at += stride ? stride : end) {
+    for (uint32_t w = 0; w < words; ++w) {
+      uint32_t value;
+      std::memcpy(&value, data.data() + at + w * 4, 4);
+      value = std::rotl(value, 16);
+      std::memcpy(data.data() + at + w * 4, &value, 4);
+    }
+  }
+}
+
+// A vertex range copied for the frame. The game writes some vertices (CPU
+// skinned characters) after recording the draw that uses them, before the
+// GPU reads them, so the ranges are copied again when the frame is swapped.
+struct VertexCopy {
+  uint32_t data_offset;
+  uint32_t size;
+  uint32_t address;  // physical
+  uint32_t endian;
+};
+struct HalfSwap {
+  size_t begin, end;
+  uint32_t stride, words;
+};
+std::vector<VertexCopy> g_vertex_copies;
+std::vector<HalfSwap> g_half_swaps;
+
 // The format a vertex fetch returns, as a Vulkan vertex format: fraction
 // formats normalize, integer formats convert to float unnormalized.
 VkFormat VertexFormat(uint32_t format, bool is_signed, bool integer) {
@@ -370,9 +400,22 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
   }
 
   bool new_frame = frame.captured.empty();
+  if (new_frame) {
+    g_vertex_copies.clear();
+    g_half_swaps.clear();
+  }
+  size_t vertex_copies = g_vertex_copies.size(), half_swaps = g_half_swaps.size();
   draw.first_binding = uint32_t(frame.bindings.size());
   draw.first_attribute = uint32_t(frame.attributes.size());
   size_t data_size = frame.data.size();
+  auto fail = [&] {
+    frame.data.resize(data_size);
+    frame.bindings.resize(draw.first_binding);
+    frame.attributes.resize(draw.first_attribute);
+    g_vertex_copies.resize(vertex_copies);
+    g_half_swaps.resize(half_swaps);
+    return false;
+  };
   std::map<uint32_t, uint32_t> bindings;  // fetch constant -> binding
   for (const Fetch& fetch : fetches) {
     auto [it, added] = bindings.try_emplace(fetch.fetch_constant, uint32_t(bindings.size()));
@@ -384,10 +427,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
       uint32_t size = ((d1 >> 2) & 0xFFFFFF) * 4;
       if ((d0 & 3) != 3) {
         WarnOnce("fetch constant is not a vertex buffer", fetch.fetch_constant);
-        frame.data.resize(data_size);
-        frame.bindings.resize(draw.first_binding);
-        frame.attributes.resize(draw.first_attribute);
-        return false;
+        return fail();
       }
       uint64_t begin = 0, end = std::min<uint64_t>(size, 256);
       if (fetch.stride) {
@@ -395,14 +435,13 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
         end = std::min<uint64_t>(size, uint64_t(last_vertex + 1) * fetch.stride);
       }
       if (begin >= end) {
-        frame.data.resize(data_size);
-        frame.bindings.resize(draw.first_binding);
-        frame.attributes.resize(draw.first_attribute);
-        return false;
+        return fail();
       }
-      uint32_t offset = AppendSwapped(frame.data, Physical(base, (d0 & ~3u) + uint32_t(begin)),
-                                      size_t(end - begin), d1 & 3);
+      uint32_t address = (d0 & ~3u) + uint32_t(begin);
+      uint32_t offset =
+          AppendSwapped(frame.data, Physical(base, address), size_t(end - begin), d1 & 3);
       frame.bindings.push_back({offset, fetch.stride});
+      g_vertex_copies.push_back({offset, uint32_t(end - begin), address, d1 & 3});
     }
     frame.attributes.push_back({fetch.location, it->second, uint32_t(fetch.offset), fetch.format});
     if (HasHalfComponents(fetch.xenos_format)) {
@@ -412,15 +451,9 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
         end = frame.bindings[draw.first_binding + it->second + 1].data_offset;
       }
       uint32_t words = (fetch.xenos_format == 26 || fetch.xenos_format == 32) ? 2 : 1;
-      for (size_t at = binding.data_offset + fetch.offset; at + words * 4 <= end;
-           at += binding.stride ? binding.stride : end) {
-        for (uint32_t w = 0; w < words; ++w) {
-          uint32_t value;
-          std::memcpy(&value, frame.data.data() + at + w * 4, 4);
-          value = std::rotl(value, 16);
-          std::memcpy(frame.data.data() + at + w * 4, &value, 4);
-        }
-      }
+      HalfSwap swap{binding.data_offset + fetch.offset, end, binding.stride, words};
+      SwapHalves(frame.data, swap.begin, swap.end, swap.stride, swap.words);
+      g_half_swaps.push_back(swap);
     }
   }
   draw.binding_count = uint32_t(frame.bindings.size()) - draw.first_binding;
@@ -583,7 +616,39 @@ void CaptureClear(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t
   frame.clears.push_back(clear);
 }
 
-void CaptureFrontBuffer(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame) {
+void FinishFrame(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame) {
+  // Copy the vertices again now that the game has written all of them.
+  static uint64_t frames = 0, changed_frames = 0, copies = 0, changed = 0;
+  bool frame_changed = false;
+  thread_local std::vector<uint8_t> fresh;
+  // Undo the half swaps (a 16-bit rotation is its own inverse) to compare.
+  for (const HalfSwap& swap : g_half_swaps) {
+    SwapHalves(frame.data, swap.begin, swap.end, swap.stride, swap.words);
+  }
+  for (const VertexCopy& copy : g_vertex_copies) {
+    fresh.clear();
+    AppendSwapped(fresh, Physical(base, copy.address), copy.size, copy.endian);
+    uint8_t* old = frame.data.data() + copy.data_offset;
+    if (std::memcmp(old, fresh.data(), copy.size)) {
+      std::memcpy(old, fresh.data(), copy.size);
+      changed++;
+      frame_changed = true;
+    }
+  }
+  for (const HalfSwap& swap : g_half_swaps) {
+    SwapHalves(frame.data, swap.begin, swap.end, swap.stride, swap.words);
+  }
+  copies += g_vertex_copies.size();
+  changed_frames += frame_changed;
+  if (++frames % 900 == 0) {
+    if (changed) {
+      REXLOG_INFO("[native view] vertices written after their draw: {} of {} ranges, in {} of "
+                  "900 frames", changed, copies, changed_frames);
+    }
+    copies = changed = changed_frames = 0;
+  }
+  g_vertex_copies.clear();
+  g_half_swaps.clear();
   if (!texture) {
     return;
   }

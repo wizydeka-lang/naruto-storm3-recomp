@@ -44,7 +44,9 @@ void CaptureResolve(const uint8_t* base, uint32_t device, uint32_t flags, uint32
 void CaptureClear(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t color,
                   float depth, uint32_t stencil, uint32_t pass, native_view::FrameInfo& frame);
 
-// Records the texture D3DDevice_Swap presents.
-void CaptureFrontBuffer(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame);
+// Finishes the frame at D3DDevice_Swap: copies its vertices again (the game
+// writes some after recording their draws) and records the texture it
+// presents.
+void FinishFrame(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame);
 
 }  // namespace frame_capture

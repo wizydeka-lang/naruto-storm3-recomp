@@ -265,7 +265,7 @@ REX_HOOK_RAW(sub_82746748) {
     {
       std::lock_guard<std::mutex> lock(g_mutex);
       if (native_view::Enabled()) {
-        frame_capture::CaptureFrontBuffer(base, ctx.r4.u32, g_frame);
+        frame_capture::FinishFrame(base, ctx.r4.u32, g_frame);
       }
       g_stats.frames++;
       if (g_logging) {
