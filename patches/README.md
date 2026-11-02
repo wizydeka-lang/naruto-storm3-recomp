@@ -137,3 +137,13 @@ The SDK names this platform `linux-arm64`, so its libraries land in
 - None of this has run on a device yet. The fiber switch, content URIs and the
   Android surface are untested at run time, and guest memory on 16 KB-page
   devices remains an open question.
+
+# Skipping Xenia's rendering
+
+`rexglue-vulkan-skip-rendering.patch` adds the `vulkan_skip_rendering` option.
+With it set, the Vulkan command processor still reads the command stream, so
+fences, interrupts and frame pacing keep working, but draws, resolves and
+presents do nothing. The native view (`src/native_view.cpp`) then does all the
+rendering; `bash tools/run-radeon.sh --native-only` turns both on. Resolved
+data never reaches guest memory in this mode, so anything the game reads back
+on the CPU from a resolve sees stale memory.
