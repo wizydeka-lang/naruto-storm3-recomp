@@ -270,6 +270,22 @@ void LogWindow() {
   g_window_start = now;
 }
 
+// NARUTO_UNLOCK_ALL=1 marks every playable character unlocked. The game
+// keeps one bit per player id at 0x82A0F508 (sub_821DB0E0, ccIsPlayerUnlock;
+// part of the save data at offset 0x1BEA0); ids 16-143 hold the unlockable
+// characters. Setting them each frame survives the save being loaded, and
+// the next save keeps them.
+void UnlockAllPlayers(uint8_t* base) {
+  static const bool enabled = [] {
+    const char* value = std::getenv("NARUTO_UNLOCK_ALL");
+    return value && *value && *value != '0';
+  }();
+  constexpr uint32_t kPlayerUnlockBits = 0x82A0F508;
+  if (enabled) {
+    std::memset(base + kPlayerUnlockBits + 2, 0xFF, 16);
+  }
+}
+
 template <typename Field>
 void Count(Field FrameStats::*field) {
   if (!g_enabled) {
@@ -323,6 +339,7 @@ REX_HOOK_RAW(sub_82749EF0) {
 
 // D3DDevice_Swap(device, front buffer texture, ...)
 REX_HOOK_RAW(sub_82746748) {
+  UnlockAllPlayers(base);
   if (g_enabled) {
     native_view::FrameInfo frame;
     {
