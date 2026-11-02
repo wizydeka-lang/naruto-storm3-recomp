@@ -39,6 +39,11 @@ void CaptureResolve(const uint8_t* base, uint32_t device, uint32_t flags, uint32
                     uint32_t texture, uint32_t point, uint32_t level, uint32_t slice,
                     uint32_t pass, native_view::FrameInfo& frame);
 
+// Records a D3DDevice_ClearF made during pass `pass`. color is a guest
+// pointer to four floats (0 for none).
+void CaptureClear(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t color,
+                  float depth, uint32_t stencil, uint32_t pass, native_view::FrameInfo& frame);
+
 // Records the texture D3DDevice_Swap presents.
 void CaptureFrontBuffer(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame);
 

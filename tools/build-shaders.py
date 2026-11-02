@@ -2,16 +2,19 @@
 """Build the native renderer's shader cache from the user's game files.
 
 The game's shaders are Xbox 360 shader containers in
-data/system/nuccMaterial_xbox360.nsh and nuccPostEffect_xbox360.nsh. This
-converts each one to HLSL with XenosRecomp (pinned below, with
-tools/shaders/xenosrecomp-naruto.patch) and compiles it to SPIR-V with DXC, then
-writes them all to one cache file. The cache holds code derived from the game,
-so it is built locally and never committed.
+data/system/nuccMaterial_xbox360.nsh and nuccPostEffect_xbox360.nsh, plus the
+ones the game captures from memory into out/shaders/runtime/ when it binds a
+shader neither file has (vs_<id>.bin, ps_<id>.bin). This converts each one to
+HLSL with XenosRecomp (pinned below, with tools/shaders/xenosrecomp-naruto.patch)
+and compiles it to SPIR-V with DXC, then writes them all to one cache file. The
+cache holds code derived from the game, so it is built locally and never
+committed; run this again after playing to convert newly captured shaders.
 
 Cache format (little-endian): b"NSHC", version, entry count; then per entry
-the library (0 nuccMaterial, 1 nuccPostEffect), stage (0 vertex, 1 pixel), two
-padding bytes, the container's offset in its library file, and the SPIR-V
-blob's offset in the cache and size; then the SPIR-V blobs.
+the library (0 nuccMaterial, 1 nuccPostEffect, 2 runtime), stage (0 vertex,
+1 pixel), two padding bytes, the container's offset in its library file (for
+runtime, its id), and the SPIR-V blob's offset in the cache and size; then the
+SPIR-V blobs.
 
 Usage: python3 tools/build-shaders.py [--game assets] [--out out/shaders/naruto_shaders.bin]
 Needs git, cmake, ninja and clang++ (or clang++-20) on PATH.
@@ -78,6 +81,7 @@ def main():
     parser.add_argument("--game", type=Path, default=ROOT / "assets",
                         help="folder holding default.xex and data/ (default: assets)")
     parser.add_argument("--out", type=Path, default=ROOT / "out" / "shaders" / "naruto_shaders.bin")
+    parser.add_argument("--runtime", type=Path, default=ROOT / "out" / "shaders" / "runtime")
     args = parser.parse_args()
 
     src, recomp = build_xenosrecomp(ROOT / "out" / "tools")
@@ -86,31 +90,41 @@ def main():
     env = dict(os.environ, LD_LIBRARY_PATH=str(dxc_dir / "lib" / "x64"))
     include = src / "XenosRecomp" / "shader_common.h"
 
+    sources = []  # (library index, name, offset or id, stage, container)
+    for library_index, library in enumerate(LIBRARIES):
+        path = args.game / "data" / "system" / f"{library}_xbox360.nsh"
+        if not path.exists():
+            sys.exit(f"{path} not found; point --game at the game files.")
+        for offset, stage, blob in containers(path.read_bytes()):
+            sources.append((library_index, f"{library}_{offset:08x}", offset, stage, blob))
+    for path in sorted(args.runtime.glob("[vp]s_????????.bin")):
+        for _, stage, blob in containers(path.read_bytes()):
+            sources.append((len(LIBRARIES), f"runtime_{path.stem}", int(path.stem[3:], 16), stage,
+                            blob))
+            break
+
     entries, blobs, failed = [], [], []
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
-        for library_index, library in enumerate(LIBRARIES):
-            path = args.game / "data" / "system" / f"{library}_xbox360.nsh"
-            if not path.exists():
-                sys.exit(f"{path} not found; point --game at the game files.")
-            for offset, stage, blob in containers(path.read_bytes()):
-                name = f"{library}_{offset:08x}"
-                container, hlsl, spirv = tmp / f"{name}.bin", tmp / f"{name}.hlsl", tmp / f"{name}.spv"
-                container.write_bytes(blob)
-                subprocess.run([str(recomp), str(container), str(hlsl), str(include)],
-                               check=True, capture_output=True)
-                command = [str(dxc), "-T", "vs_6_0" if stage == 0 else "ps_6_0", "-HV", "2021",
-                           "-all-resources-bound", "-spirv", "-fvk-use-dx-layout", "-Qstrip_debug",
-                           str(hlsl), "-Fo", str(spirv)]
-                if stage == 0:
-                    command.insert(-3, "-fvk-invert-y")
-                result = subprocess.run(command, env=env, capture_output=True, text=True)
-                if result.returncode != 0:
-                    errors = [l for l in result.stderr.splitlines() if "error" in l]
-                    failed.append((name, errors[:1]))
-                    continue
-                entries.append((library_index, stage, offset))
-                blobs.append(spirv.read_bytes())
+        for library_index, name, offset, stage, blob in sources:
+            container, hlsl, spirv = tmp / f"{name}.bin", tmp / f"{name}.hlsl", tmp / f"{name}.spv"
+            container.write_bytes(blob)
+            if subprocess.run([str(recomp), str(container), str(hlsl), str(include)],
+                              capture_output=True).returncode != 0:
+                failed.append((name, ["XenosRecomp failed"]))
+                continue
+            command = [str(dxc), "-T", "vs_6_0" if stage == 0 else "ps_6_0", "-HV", "2021",
+                       "-all-resources-bound", "-spirv", "-fvk-use-dx-layout", "-Qstrip_debug",
+                       str(hlsl), "-Fo", str(spirv)]
+            if stage == 0:
+                command.insert(-3, "-fvk-invert-y")
+            result = subprocess.run(command, env=env, capture_output=True, text=True)
+            if result.returncode != 0:
+                errors = [l for l in result.stderr.splitlines() if "error" in l]
+                failed.append((name, errors[:1]))
+                continue
+            entries.append((library_index, stage, offset))
+            blobs.append(spirv.read_bytes())
 
     header = struct.pack("<4sII", b"NSHC", CACHE_VERSION, len(entries))
     position = len(header) + 16 * len(entries)

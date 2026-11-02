@@ -17,10 +17,12 @@
 #include "native_view.h"
 #include "shader_library.h"
 
+#include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
@@ -37,53 +39,111 @@ uint32_t LoadGuest32(const uint8_t* base, uint32_t address) {
   return rex::memory::load_and_swap<uint32_t>(base + address);
 }
 
-// Microcode of a bound shader object (docs/d3d-functions.md). A vertex shader
-// holds variants patched for different vertex layouts; variant 0 is enough to
-// identify it. A pixel shader has one copy.
-std::vector<uint32_t> ShaderMicrocode(const uint8_t* base, uint32_t shader,
-                                      shader_library::Stage stage) {
-  uint32_t address, size;
+// Where a bound shader object keeps its microcode (docs/d3d-functions.md). A
+// vertex shader holds variants patched for different vertex layouts; variant
+// 0 is enough to identify it. A pixel shader has one copy. The object embeds
+// its container's virtual part (header, constant table, element table) at
+// `header`; the microcode is the container's physical part.
+struct ShaderLocation {
+  uint32_t header = 0;
+  uint32_t address = 0;
+  uint32_t size = 0;
+};
+
+ShaderLocation LocateShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage) {
+  ShaderLocation location;
   if (stage == shader_library::Stage::kVertex) {
+    location.header = shader + 872;
     uint32_t variant = shader + LoadGuest32(base, shader + 896);
-    address = LoadGuest32(base, shader + 32) + LoadGuest32(base, variant + 872);
-    size = LoadGuest32(base, variant + 876);
+    location.address = LoadGuest32(base, shader + 32) + LoadGuest32(base, variant + 872);
+    location.size = LoadGuest32(base, variant + 876);
   } else {
+    location.header = shader + 40;
     uint32_t info = shader + LoadGuest32(base, shader + 64);
-    address = LoadGuest32(base, shader + 24) + LoadGuest32(base, info + 40);
-    size = LoadGuest32(base, info + 44);
+    location.address = LoadGuest32(base, shader + 24) + LoadGuest32(base, info + 40);
+    location.size = LoadGuest32(base, info + 44);
   }
+  return location;
+}
+
+std::vector<uint32_t> ShaderMicrocode(const uint8_t* base, const ShaderLocation& location) {
   std::vector<uint32_t> words;
-  if (size && size % 4 == 0 && size <= 0x10000) {
-    for (uint32_t i = 0; i < size; i += 4) {
-      words.push_back(LoadGuest32(base, address + i));
+  if (location.size && location.size % 4 == 0 && location.size <= 0x10000) {
+    for (uint32_t i = 0; i < location.size; i += 4) {
+      words.push_back(LoadGuest32(base, location.address + i));
     }
   }
   return words;
 }
 
-// Bound shader object -> library index (-1: no match), matched once per object.
-std::unordered_map<uint32_t, int> g_shader_matches;
+// The shader's container rebuilt from the object: its virtual part followed
+// by the microcode at the offset the shader header gives.
+std::vector<uint8_t> ShaderContainer(const uint8_t* base, const ShaderLocation& location,
+                                     const std::vector<uint32_t>& words) {
+  uint32_t virtual_size = LoadGuest32(base, location.header + 4);
+  uint32_t shader_offset = LoadGuest32(base, location.header + 24);
+  if (virtual_size > 0x10000 || shader_offset + 8 > virtual_size) {
+    return {};
+  }
+  uint32_t code_offset = LoadGuest32(base, location.header + shader_offset);
+  std::vector<uint8_t> container(size_t(virtual_size) + code_offset + words.size() * 4);
+  for (uint32_t i = 0; i < virtual_size; ++i) {
+    container[i] = base[location.header + i];
+  }
+  for (size_t w = 0; w < words.size(); ++w) {
+    uint32_t value = std::byteswap(words[w]);
+    std::memcpy(container.data() + virtual_size + code_offset + w * 4, &value, 4);
+  }
+  // The physical size covers the microcode; Direct3D's own flag bits stay.
+  uint32_t physical_size = std::byteswap(uint32_t(code_offset + words.size() * 4));
+  std::memcpy(container.data() + 8, &physical_size, 4);
+  return container;
+}
+
+// Bound shader object -> library index (-1: no match). Objects are freed and
+// their addresses reused, so a match is kept with the microcode's address and
+// first words, and redone when those change.
+struct ShaderMatch {
+  int index = -1;
+  uint32_t address = 0;
+  uint32_t first_words[4] = {};
+};
+std::unordered_map<uint32_t, ShaderMatch> g_shader_matches;
 bool g_library_loaded = false;
 
 int MatchShader(const uint8_t* base, uint32_t shader, shader_library::Stage stage) {
   if (!shader) {
     return -1;
   }
-  auto [it, inserted] = g_shader_matches.try_emplace(shader, -1);
-  if (inserted) {
-    if (!g_library_loaded) {
-      g_library_loaded = true;
-      shader_library::Load(std::string(REXCVAR_GET(game_data_root)));
-    }
-    std::vector<uint32_t> words = ShaderMicrocode(base, shader, stage);
-    it->second = shader_library::Match(stage, words.data(), words.size());
-    if (it->second < 0) {
-      REXLOG_WARN("[render probe] {} shader object {:08X} ({} words) matches no library shader",
-                  stage == shader_library::Stage::kVertex ? "vertex" : "pixel", shader,
-                  words.size());
+  ShaderLocation location = LocateShader(base, shader, stage);
+  uint32_t first_words[4] = {};
+  for (uint32_t i = 0; i < 4 && i * 4 < location.size; ++i) {
+    first_words[i] = LoadGuest32(base, location.address + i * 4);
+  }
+  auto [it, inserted] = g_shader_matches.try_emplace(shader);
+  ShaderMatch& match = it->second;
+  if (!inserted && match.address == location.address &&
+      std::equal(std::begin(first_words), std::end(first_words), match.first_words)) {
+    return match.index;
+  }
+  if (!g_library_loaded) {
+    g_library_loaded = true;
+    shader_library::Load(std::string(REXCVAR_GET(game_data_root)));
+  }
+  match.address = location.address;
+  std::copy(std::begin(first_words), std::end(first_words), match.first_words);
+  std::vector<uint32_t> words = ShaderMicrocode(base, location);
+  match.index = shader_library::Match(stage, words.data(), words.size());
+  if (match.index < 0) {
+    REXLOG_WARN("[render probe] {} shader object {:08X} ({} words) matches no known shader",
+                stage == shader_library::Stage::kVertex ? "vertex" : "pixel", shader,
+                words.size());
+    std::vector<uint8_t> container = ShaderContainer(base, location, words);
+    if (!container.empty()) {
+      shader_library::SaveRuntimeContainer(stage, container, words.data(), words.size());
     }
   }
-  return it->second;
+  return match.index;
 }
 
 struct FrameStats {
@@ -151,8 +211,8 @@ void LogWindow() {
   double frames = s.frames ? double(s.frames) : 1.0;
   g_all_vertex_shaders.insert(s.vertex_shaders.begin(), s.vertex_shaders.end());
   size_t matched = 0;
-  for (auto [object, index] : g_shader_matches) {
-    matched += index >= 0;
+  for (const auto& [object, match] : g_shader_matches) {
+    matched += match.index >= 0;
   }
   g_all_pixel_shaders.insert(s.pixel_shaders.begin(), s.pixel_shaders.end());
   std::string primitives;
@@ -193,7 +253,7 @@ extern "C" {
 REX_FUNC(__imp__sub_82746748);
 REX_FUNC(__imp__sub_827518D8);
 REX_FUNC(__imp__sub_827514C0);
-REX_FUNC(__imp__sub_8275D010);
+REX_FUNC(__imp__sub_8275CED8);
 REX_FUNC(__imp__sub_8275BD48);
 REX_FUNC(__imp__sub_8274D2C8);
 }
@@ -241,10 +301,18 @@ REX_HOOK_RAW(sub_827514C0) {
   }
 }
 
-// D3DDevice_Clear
-REX_HOOK_RAW(sub_8275D010) {
-  Count(&FrameStats::clears);
-  __imp__sub_8275D010(ctx, base);
+// D3DDevice_ClearF(device, flags, rects, color (four floats), Z (f1), stencil
+// in r8); D3DDevice_Clear and the engine's clears both end up here.
+REX_HOOK_RAW(sub_8275CED8) {
+  if (g_enabled) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_stats.clears++;
+    if (native_view::Enabled()) {
+      frame_capture::CaptureClear(base, ctx.r3.u32, ctx.r4.u32, ctx.r6.u32, float(ctx.f1.f64),
+                                  ctx.r8.u32, g_pass, g_frame);
+    }
+  }
+  __imp__sub_8275CED8(ctx, base);
 }
 
 // D3DDevice_Resolve(device, flags, source rect, destination texture,

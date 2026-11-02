@@ -77,6 +77,21 @@ bound microcode describes the current vertex layout. A pixel shader's info
 block is at `shader + *(shader + 64)`; its microcode is at
 `*(shader + 24) + *(info + 40)`, `*(info + 44)` bytes long.
 
+A shader object embeds the virtual part of the container it was created from
+(header, constant table, vertex element table): at `+872` for a vertex
+shader, so a variant offset is the container's shader header offset, and at
+`+40` for a pixel shader. With the microcode as the physical part, the
+original container can be rebuilt from memory. That matters because not all
+shaders are in the two `.nsh` libraries: the 2D sprite shaders behind logos,
+dialog text and icons come from packed archives. The render probe saves any
+bound shader that matches neither library to `out/shaders/runtime/`, and
+`tools/build-shaders.py` converts those too.
+
+Matching a bound shader to a container compares three words at a time and
+allows only vertex fetch instructions to differ. A looser match (a number of
+differing words) paired the 42-word sprite vertex shader with a post-effect
+shader of the same size.
+
 ## Textures and boolean constants
 
 Pixel shader sampler register *n* uses texture fetch constant slot *n* (device
@@ -100,11 +115,18 @@ object's fetch constant is at `+0x1C` (after the `D3DResource` header and
 `MipFlush`), and the resolve reads the destination's size and format from it.
 
 The game resolves with flags `0x0`, `0x1` and `0x14` (render target 0, 1,
-and the depth buffer) and never clears: no resolve sets `0x100` or `0x200`,
-`Clear` is never called, and passes start drawing with depth testing on. Only
+and the depth buffer); no resolve sets `0x100` or `0x200`. Only
 `sub_8274B330`, D3D's per-tile resolve for predicated tiling, adds `0x200`,
-and the engine doesn't reach it in normal play. The native view clears each
-depth buffer to 1.0 the first time a frame uses it.
+and the engine doesn't reach it in normal play.
+
+The game clears through `D3DDevice_ClearF` (`sub_8275CED8`): the engine's
+clear command (`sub_827EE830`) calls it with the device, flags (bits 0–3
+render targets 0–3, `0x10` depth, `0x20` stencil), no rectangles, a pointer to
+four floats, Z in `f1` and stencil in `r8`, a few times a frame.
+`D3DDevice_Clear` (`sub_8275D010`, which converts a `D3DCOLOR`) also ends up
+there but is barely used. D3D draws the clear as rectangles in the bound
+targets' EDRAM, so the native view clears every render target at the bound
+EDRAM bases.
 
 `D3DDevice_Swap` (`sub_82746748`) takes the front buffer texture as its second
 argument and copies its fetch constant; the game resolves its final image

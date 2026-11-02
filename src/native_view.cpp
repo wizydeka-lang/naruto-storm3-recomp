@@ -132,6 +132,7 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCmdClearDepthStencilImage)     \
   X(vkCmdPipelineBarrier)            \
   X(vkCmdClearColorImage)            \
+  X(vkCmdClearAttachments)           \
   X(vkCmdCopyBufferToImage)          \
   X(vkCmdBindPipeline)               \
   X(vkCmdBindDescriptorSets)         \
@@ -921,6 +922,7 @@ class View {
     Image image;
     VkFormat format = VK_FORMAT_UNDEFINED;
     uint32_t width = 0, height = 0;
+    uint32_t base = 0;  // EDRAM tile
     bool depth = false;
   };
 
@@ -986,6 +988,7 @@ class View {
       retired_.push_back({target.image, 0, 0, frames_total_});
     }
     target.depth = key >> 63;
+    target.base = uint32_t(key & 0xFFF);
     target.format = target.depth ? kDepthFormat : ColorFormat(info);
     target.width = width;
     target.height = std::max(height, target.height);
@@ -1085,6 +1088,75 @@ class View {
                            VK_IMAGE_LAYOUT_GENERAL);
     InitializeImage(texture.entry.image.image, false);
     return &texture;
+  }
+
+  // Clears the clear's targets with vkCmdClearAttachments if all of them are
+  // attachments of the current pass; false if some aren't.
+  bool ClearAttachments(VkCommandBuffer cmd, const Clear& clear, const PassTargets& pt) {
+    std::array<VkClearAttachment, 5> attachments{};
+    uint32_t count = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (!(clear.flags & (1u << i))) {
+        continue;
+      }
+      uint32_t base = clear.color_info[i] & 0xFFF;
+      bool found = false;
+      for (uint32_t a = 0; a < pt.color_count && !found; ++a) {
+        if (pt.color[a] && pt.color[a]->base == base) {
+          VkClearAttachment& attachment = attachments[count++];
+          attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+          attachment.colorAttachment = a;
+          std::memcpy(attachment.clearValue.color.float32, clear.color, sizeof(clear.color));
+          found = true;
+        }
+      }
+      if (!found) {
+        return false;
+      }
+    }
+    if (clear.flags & 0x10) {
+      if (!pt.depth || pt.depth->base != (clear.depth_info & 0xFFF)) {
+        return false;
+      }
+      VkClearAttachment& attachment = attachments[count++];
+      attachment.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+      attachment.clearValue.depthStencil = {clear.depth, clear.stencil};
+    }
+    if (count) {
+      VkClearRect rect{{{0, 0}, pt.extent}, 0, 1};
+      vkCmdClearAttachments(cmd, count, attachments.data(), 1, &rect);
+    }
+    return true;
+  }
+
+  // Fills every render target at the EDRAM bases the clear names. Targets
+  // are keyed by base, format and pitch, so all views of a base are cleared.
+  void RecordClear(VkCommandBuffer cmd, const Clear& clear) {
+    for (auto& [key, target] : render_targets_) {
+      if (!target.image.image) {
+        continue;
+      }
+      uint32_t base = target.base;
+      if (target.depth) {
+        if ((clear.flags & 0x10) && base == (clear.depth_info & 0xFFF)) {
+          VkClearDepthStencilValue value{clear.depth, clear.stencil};
+          VkImageSubresourceRange range{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+          vkCmdClearDepthStencilImage(cmd, target.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1,
+                                      &range);
+        }
+        continue;
+      }
+      for (int i = 0; i < 4; ++i) {
+        if ((clear.flags & (1u << i)) && base == (clear.color_info[i] & 0xFFF)) {
+          VkClearColorValue value;
+          std::memcpy(value.float32, clear.color, sizeof(clear.color));
+          VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+          vkCmdClearColorImage(cmd, target.image.image, VK_IMAGE_LAYOUT_GENERAL, &value, 1,
+                               &range);
+          break;
+        }
+      }
+    }
   }
 
   // The pipeline for the draw's shaders, vertex layout, render state and the
@@ -1280,8 +1352,13 @@ class View {
     if (home) {
       pass_offset_ = 0;
     }
+    bool f12 = keys[SDL_SCANCODE_F12];
+    if (f12 && !key_f12_) {
+      snapshot_requested_ = true;
+    }
     key_left_ = left;
     key_right_ = right;
+    key_f12_ = f12;
   }
 
   void SetTitle(std::string title) {
@@ -1298,15 +1375,17 @@ class View {
   }
 
   // NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws of the n-th frame,
-  // for checking capture against what the game set.
-  void Dump(const FrameInfo& frame, uint32_t pass) {
+  // for checking capture against what the game set; pass UINT32_MAX logs
+  // every pass's draws.
+  void Dump(const FrameInfo& frame, uint32_t pass, bool forced) {
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
       return value ? std::atol(value) : -1;
     }();
-    if (long(frames_total_) != dump_frame) {
+    if (!forced && long(frames_total_) != dump_frame) {
       return;
     }
+    REXLOG_INFO("[native view] dump of frame {}", frames_total_);
     auto f32 = [&](uint32_t offset) {
       float v;
       std::memcpy(&v, frame.data.data() + offset, 4);
@@ -1342,21 +1421,23 @@ class View {
     }
     REXLOG_INFO("[native view] front buffer: {} {:08x} {:08x} {:08x}", frame.has_front_buffer,
                 frame.front_buffer[0], frame.front_buffer[1], frame.front_buffer[2]);
-    const PassInfo& info = frame.passes[pass];
-    REXLOG_INFO("[native view] pass {}: clear color {} ({} {} {} {}), clear depth {}", pass,
-                info.has_clear_color, info.clear_color[0], info.clear_color[1],
-                info.clear_color[2], info.clear_color[3], info.clear_depth);
+    if (pass != UINT32_MAX) {
+      const PassInfo& info = frame.passes[pass];
+      REXLOG_INFO("[native view] pass {}: clear color {} ({} {} {} {}), clear depth {}", pass,
+                  info.has_clear_color, info.clear_color[0], info.clear_color[1],
+                  info.clear_color[2], info.clear_color[3], info.clear_depth);
+    }
     uint32_t n = 0;
     for (const Draw& d : frame.captured) {
-      if (d.pass != pass || n++ >= 200) {
+      if ((pass != UINT32_MAX && d.pass != pass) || n++ >= 1000) {
         continue;
       }
       const auto& shaders = shader_library::Shaders();
       VkViewport vp = Viewport(d);
       REXLOG_INFO(
-          "[native view] draw: vs {}@{:#x} ps {} topology {} indices {} surface {:#x} vte {:#x} "
+          "[native view] draw in pass {}: vs {}@{:#x} ps {} topology {} indices {} surface {:#x} vte {:#x} "
           "depth {:#x} blend {:#x} mask {:#x} vport [{} {} {} {} {} {}] -> {} {} {} {} {} {}",
-          shaders[d.vertex_shader].library, shaders[d.vertex_shader].offset,
+          d.pass, shaders[d.vertex_shader].library, shaders[d.vertex_shader].offset,
           d.pixel_shader >= 0 ? shaders[d.pixel_shader].offset : 0, d.topology, d.index_count,
           d.surface_info, d.vte_control, d.depth_control, d.blend_control[0], d.color_mask,
           d.viewport[0], d.viewport[1], d.viewport[2], d.viewport[3], d.viewport[4],
@@ -1374,6 +1455,16 @@ class View {
         REXLOG_INFO("[native view]   input {} usage {}.{} binding {} stride {} offset {} format {}:{}",
                     a.location, element.usage, element.usage_index, a.binding, b.stride, a.offset,
                     a.format, values);
+      }
+      for (uint32_t b = 0; b < d.binding_count; ++b) {
+        const VertexBinding& binding = frame.bindings[d.first_binding + b];
+        for (uint32_t v = 0; v < 2; ++v) {
+          std::string words;
+          for (uint32_t w = 0; w < binding.stride / 4 && w < 16; ++w) {
+            words += fmt::format(" {}", f32(binding.data_offset + v * binding.stride + w * 4));
+          }
+          REXLOG_INFO("[native view]   binding {} vertex {}:{}", b, v, words);
+        }
       }
       for (uint32_t t = 0; t < d.texture_count; ++t) {
         const TextureBinding& b = frame.textures[d.first_texture + t];
@@ -1533,7 +1624,10 @@ class View {
   // NARUTO_NATIVE_VIEW_SNAPSHOTS=dir with NARUTO_NATIVE_VIEW_DUMP=n saves
   // each pass's first render target (after the pass and its resolves) and
   // the presented frame, downscaled, as PPM files in dir/<frame>/, for frame
-  // n and every 300th frame after it.
+  // n and every 300th frame after it (NARUTO_NATIVE_VIEW_SNAPSHOT_EVERY
+  // changes the interval). F12 in the view saves the current frame the same
+  // way, to dir or out/snapshots. Each snapshot also logs all of the frame's
+  // draws.
   static constexpr uint32_t kSnapshotWidth = 320, kSnapshotHeight = 180;
 
   bool PrepareSnapshots(uint32_t count) {
@@ -1617,7 +1711,11 @@ class View {
       return;
     }
     VkFence fence = frame_done_[frame_index_];
-    vkWaitForFences(device_, 1, &fence, VK_TRUE, UINT64_MAX);
+    VkResult waited = vkWaitForFences(device_, 1, &fence, VK_TRUE, 5'000'000'000ull);
+    if (waited != VK_SUCCESS) {
+      REXLOG_ERROR("[native view] waiting for frame {} failed: {}", frames_total_, int(waited));
+      return;
+    }
     frames_total_++;
     FreeRetired();
     HandleKeys();
@@ -1626,14 +1724,25 @@ class View {
     uint32_t shown_pass = pass_offset_ ? uint32_t(((pass_offset_ - 1) % int64_t(pass_count) +
                                                    pass_count) % pass_count)
                                        : UINT32_MAX;
-    Dump(frame, shown_pass == UINT32_MAX ? 0 : shown_pass);
+    bool requested = snapshot_requested_;
+    snapshot_requested_ = false;
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
       return value ? std::atol(value) : -1;
     }();
+    static const long snapshot_every = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_SNAPSHOT_EVERY");
+      long every = value ? std::atol(value) : 300;
+      return every > 0 ? every : 300;
+    }();
     const char* snapshot_dir = std::getenv("NARUTO_NATIVE_VIEW_SNAPSHOTS");
-    bool snapshots = snapshot_dir && dump_frame >= 0 && long(frames_total_) >= dump_frame &&
-                     (long(frames_total_) - dump_frame) % 300 == 0;
+    bool snapshots = (snapshot_dir && dump_frame >= 0 && long(frames_total_) >= dump_frame &&
+                      (long(frames_total_) - dump_frame) % snapshot_every == 0) ||
+                     requested;
+    if (!snapshot_dir) {
+      snapshot_dir = "out/snapshots";
+    }
+    Dump(frame, snapshots ? UINT32_MAX : shown_pass == UINT32_MAX ? 0 : shown_pass, snapshots);
 
     // Plan the frame on the CPU, in the game's order: resolves create their
     // destination images before later draws look textures up.
@@ -1768,16 +1877,16 @@ class View {
     uint32_t drawn = 0;
     size_t d = 0;
     next_resolve = 0;
-    // The game never clears depth itself (its resolves don't set the clear
-    // flags), so each depth buffer starts the frame cleared.
-    std::set<const RenderTarget*> depth_cleared;
+    size_t next_clear = 0;
     for (uint32_t pass = 0; pass < pass_count; ++pass) {
       size_t first = d;
       while (d < frame.captured.size() && frame.captured[d].pass <= pass) {
         ++d;
       }
       const PassTargets& pt = targets[pass];
-      if (d > first && (pt.color_count || pt.depth) && pt.extent.width != UINT32_MAX) {
+      bool renderable = d > first && (pt.color_count || pt.depth) && pt.extent.width != UINT32_MAX;
+      bool rendering = false;
+      auto begin_rendering = [&] {
         std::array<VkRenderingAttachmentInfo, 4> colors{};
         for (uint32_t i = 0; i < pt.color_count; ++i) {
           colors[i] = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
@@ -1790,58 +1899,95 @@ class View {
         if (pt.depth) {
           depth.imageView = pt.depth->image.view;
           depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-          depth.loadOp = depth_cleared.insert(pt.depth).second ? VK_ATTACHMENT_LOAD_OP_CLEAR
-                                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
-          depth.clearValue.depthStencil = {1.0f, 0};
+          depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
           depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
         }
-        VkRenderingInfo rendering{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        rendering.renderArea = {{0, 0}, pt.extent};
-        rendering.layerCount = 1;
-        rendering.colorAttachmentCount = pt.color_count;
-        rendering.pColorAttachments = colors.data();
-        rendering.pDepthAttachment = pt.depth ? &depth : nullptr;
-        vkCmdBeginRendering(cmd, &rendering);
+        VkRenderingInfo info{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        info.renderArea = {{0, 0}, pt.extent};
+        info.layerCount = 1;
+        info.colorAttachmentCount = pt.color_count;
+        info.pColorAttachments = colors.data();
+        info.pDepthAttachment = pt.depth ? &depth : nullptr;
+        vkCmdBeginRendering(cmd, &info);
         VkRect2D scissor{{0, 0}, pt.extent};
         vkCmdSetScissor(cmd, 0, 1, &scissor);
-        VkPipeline bound = VK_NULL_HANDLE;
-        for (size_t i = first; i < d; ++i) {
-          const Draw& draw = frame.captured[i];
-          VkViewport viewport = Viewport(draw);
-          if (!draw.index_count || viewport.width <= 0.0f || viewport.height == 0.0f) {
+        rendering = true;
+      };
+      // Clears go between draws and before the pass's resolves. Inside
+      // rendering, the pass's own attachments are cleared in place; ending
+      // rendering there can stall the NVIDIA driver.
+      auto clear_until = [&](uint32_t up_to_pass, size_t before_draw) {
+        bool cleared = false;
+        for (; next_clear < frame.clears.size() && frame.clears[next_clear].pass <= up_to_pass &&
+               frame.clears[next_clear].before_draw <= before_draw;
+             ++next_clear) {
+          const Clear& clear = frame.clears[next_clear];
+          if (rendering && ClearAttachments(cmd, clear, pt)) {
             continue;
           }
-          VkPipeline pipeline = Pipeline(frame, draw, pt);
-          if (!pipeline) {
-            continue;
+          if (rendering) {
+            vkCmdEndRendering(cmd);
+            rendering = false;
           }
-          if (pipeline != bound) {
-            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
-            bound = pipeline;
+          if (!cleared) {
+            Barrier(vkCmdPipelineBarrier, cmd);
           }
-          vkCmdSetViewport(cmd, 0, 1, &viewport);
-          std::array<VkBuffer, 16> buffers;
-          std::array<VkDeviceSize, 16> offsets;
-          for (uint32_t b = 0; b < draw.binding_count; ++b) {
-            buffers[b] = upload.buffer;
-            offsets[b] = frame.bindings[draw.first_binding + b].data_offset;
-          }
-          if (draw.binding_count) {
-            vkCmdBindVertexBuffers(cmd, 0, draw.binding_count, buffers.data(), offsets.data());
-          }
-          vkCmdBindIndexBuffer(cmd, upload.buffer, draw.index_offset, VK_INDEX_TYPE_UINT32);
-          PushConstants push{upload.address + draw.vertex_constants,
-                             upload.address + draw.pixel_constants,
-                             upload.address + shared_offset + i * kSharedConstantsSize};
-          vkCmdPushConstants(cmd, pipeline_layout_,
-                             VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                             sizeof(push), &push);
-          vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
-          drawn++;
+          RecordClear(cmd, clear);
+          cleared = true;
         }
+        if (cleared) {
+          Barrier(vkCmdPipelineBarrier, cmd);
+        }
+        return cleared;
+      };
+      VkPipeline bound = VK_NULL_HANDLE;
+      for (size_t i = first; renderable && i < d; ++i) {
+        if (clear_until(pass, i)) {
+          bound = VK_NULL_HANDLE;
+        }
+        const Draw& draw = frame.captured[i];
+        VkViewport viewport = Viewport(draw);
+        if (!draw.index_count || viewport.width <= 0.0f || viewport.height == 0.0f) {
+          continue;
+        }
+        VkPipeline pipeline = Pipeline(frame, draw, pt);
+        if (!pipeline) {
+          continue;
+        }
+        if (!rendering) {
+          begin_rendering();
+          bound = VK_NULL_HANDLE;
+        }
+        if (pipeline != bound) {
+          vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+          bound = pipeline;
+        }
+        vkCmdSetViewport(cmd, 0, 1, &viewport);
+        std::array<VkBuffer, 16> buffers;
+        std::array<VkDeviceSize, 16> offsets;
+        for (uint32_t b = 0; b < draw.binding_count; ++b) {
+          buffers[b] = upload.buffer;
+          offsets[b] = frame.bindings[draw.first_binding + b].data_offset;
+        }
+        if (draw.binding_count) {
+          vkCmdBindVertexBuffers(cmd, 0, draw.binding_count, buffers.data(), offsets.data());
+        }
+        vkCmdBindIndexBuffer(cmd, upload.buffer, draw.index_offset, VK_INDEX_TYPE_UINT32);
+        PushConstants push{upload.address + draw.vertex_constants,
+                           upload.address + draw.pixel_constants,
+                           upload.address + shared_offset + i * kSharedConstantsSize};
+        vkCmdPushConstants(cmd, pipeline_layout_,
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdDrawIndexed(cmd, draw.index_count, 1, 0, 0, 0);
+        drawn++;
+      }
+      if (rendering) {
         vkCmdEndRendering(cmd);
+        rendering = false;
         Barrier(vkCmdPipelineBarrier, cmd);
       }
+      clear_until(pass, SIZE_MAX);
       for (; next_resolve < frame.resolves.size() && frame.resolves[next_resolve].pass <= pass;
            ++next_resolve) {
         const Resolve& r = frame.resolves[next_resolve];
@@ -1941,7 +2087,10 @@ class View {
     submit.pCommandBuffers = &cmd;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = &render_done;
-    vkQueueSubmit(queue_, 1, &submit, fence);
+    VkResult submitted = vkQueueSubmit(queue_, 1, &submit, fence);
+    if (submitted != VK_SUCCESS) {
+      REXLOG_ERROR("[native view] submitting frame {} failed: {}", frames_total_, int(submitted));
+    }
     if (snapshots) {
       vkQueueWaitIdle(queue_);
       WriteSnapshots(snapshot_dir, pass_count + 1);
@@ -2008,6 +2157,8 @@ class View {
   int64_t pass_offset_ = 0;
   bool key_left_ = false;
   bool key_right_ = false;
+  bool key_f12_ = false;
+  bool snapshot_requested_ = false;
   uint64_t frames_presented_ = 0;
   uint64_t frames_total_ = 0;
   uint64_t draws_drawn_ = 0;

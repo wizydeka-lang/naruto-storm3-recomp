@@ -18,7 +18,8 @@ namespace {
 
 std::vector<Shader> g_shaders;
 
-const char* const kLibraries[] = {"nuccMaterial", "nuccPostEffect"};
+const char* const kLibraries[] = {"nuccMaterial", "nuccPostEffect", "runtime"};
+std::filesystem::path g_runtime_dir;
 
 uint32_t Load32(const std::vector<uint8_t>& data, size_t offset) {
   return rex::memory::load_and_swap<uint32_t>(data.data() + offset);
@@ -34,7 +35,20 @@ std::vector<uint8_t> ReadFile(const std::filesystem::path& path) {
 // vertex shader), virtual and physical sizes, then table offsets; the shader
 // header at shaderOffset gives the microcode's offset within the physical
 // part and its size in bytes.
-void ScanLibrary(const std::filesystem::path& path, const std::string& name) {
+// A runtime container's id: a hash of its microcode, which also names its
+// file.
+uint32_t RuntimeId(const uint32_t* words, size_t count) {
+  uint32_t hash = 2166136261u;
+  for (size_t w = 0; w < count; ++w) {
+    hash = (hash ^ words[w]) * 16777619u;
+  }
+  return hash;
+}
+
+// Scans a file of containers. For a runtime container the id from its file
+// name replaces the offset.
+void ScanLibrary(const std::filesystem::path& path, const std::string& name,
+                 uint32_t id = UINT32_MAX) {
   std::vector<uint8_t> data = ReadFile(path);
   size_t found = 0;
   for (size_t i = 0; i + 36 <= data.size(); i += 4) {
@@ -58,7 +72,7 @@ void ScanLibrary(const std::filesystem::path& path, const std::string& name) {
     Shader shader;
     shader.stage = (flags & 1) ? Stage::kVertex : Stage::kPixel;
     shader.library = name;
-    shader.offset = uint32_t(i);
+    shader.offset = id != UINT32_MAX ? id : uint32_t(i);
     for (size_t w = 0; w < code_size; w += 4) {
       shader.microcode.push_back(Load32(data, code_start + w));
     }
@@ -99,7 +113,9 @@ void ScanLibrary(const std::filesystem::path& path, const std::string& name) {
     }
     i += total - 4;
   }
-  REXLOG_INFO("[shader library] {}: {} shaders", name, found);
+  if (id == UINT32_MAX) {
+    REXLOG_INFO("[shader library] {}: {} shaders", name, found);
+  }
 }
 
 // Cache layout: see tools/build-shaders.py.
@@ -121,7 +137,7 @@ void LoadCache(const std::filesystem::path& path) {
     size_t entry = 12 + e * 16;
     uint8_t library = data[entry];
     uint32_t offset = read32(entry + 4), position = read32(entry + 8), size = read32(entry + 12);
-    if (library < 2 && size % 4 == 0 && position + size <= data.size()) {
+    if (library < std::size(kLibraries) && size % 4 == 0 && position + size <= data.size()) {
       blobs[{kLibraries[library], offset}] = {position, size};
     }
   }
@@ -142,9 +158,21 @@ void LoadCache(const std::filesystem::path& path) {
 
 bool Load(const std::filesystem::path& game_data_root) {
   g_shaders.clear();
-  for (const char* name : kLibraries) {
+  for (const char* name : {kLibraries[0], kLibraries[1]}) {
     ScanLibrary(game_data_root / "data" / "system" / (std::string(name) + "_xbox360.nsh"), name);
   }
+  g_runtime_dir = game_data_root.parent_path() / "out" / "shaders" / "runtime";
+  std::error_code error;
+  size_t runtime = 0;
+  for (const auto& entry : std::filesystem::directory_iterator(g_runtime_dir, error)) {
+    // vs_XXXXXXXX.bin or ps_XXXXXXXX.bin
+    std::string stem = entry.path().stem().string();
+    if (entry.path().extension() == ".bin" && stem.size() == 11) {
+      ScanLibrary(entry.path(), kLibraries[2], uint32_t(std::strtoul(stem.c_str() + 3, nullptr, 16)));
+      ++runtime;
+    }
+  }
+  REXLOG_INFO("[shader library] runtime: {} captured shaders", runtime);
   const char* cache = std::getenv("NARUTO_SHADER_CACHE");
   LoadCache(cache && *cache ? std::filesystem::path(cache)
                             : game_data_root.parent_path() / "out" / "shaders" /
@@ -157,21 +185,29 @@ const std::vector<Shader>& Shaders() {
 }
 
 int Match(Stage stage, const uint32_t* words, size_t count) {
-  // Patched vertex fetch instructions changed at most 37 words in the shaders
-  // measured; anything closer than a quarter of the shader is the same one.
-  size_t limit = std::max<size_t>(40, count / 4);
+  // Compared three words (one instruction, or two control flow
+  // instructions) at a time: only vertex fetches (opcode 0 with the
+  // must-be-one bit 19) may differ, since Direct3D patches them.
+  auto is_vertex_fetch = [](uint32_t w0) { return (w0 & 0x1F) == 0 && ((w0 >> 19) & 1); };
   int best = -1;
-  size_t best_diff = limit + 1;
+  size_t best_diff = SIZE_MAX;
   for (size_t i = 0; i < g_shaders.size(); ++i) {
     const Shader& s = g_shaders[i];
     if (s.stage != stage || s.microcode.size() != count) {
       continue;
     }
     size_t diff = 0;
-    for (size_t w = 0; w < count && diff < best_diff; ++w) {
-      diff += s.microcode[w] != words[w];
+    bool same = true;
+    for (size_t w = 0; w < count && same; w += 3) {
+      size_t n = std::min<size_t>(3, count - w);
+      if (std::equal(words + w, words + w + n, s.microcode.data() + w)) {
+        continue;
+      }
+      same = stage == Stage::kVertex && n == 3 && is_vertex_fetch(words[w]) &&
+             is_vertex_fetch(s.microcode[w]);
+      diff += n;
     }
-    if (diff < best_diff) {
+    if (same && diff < best_diff) {
       best = int(i);
       best_diff = diff;
       if (!diff) {
@@ -180,6 +216,24 @@ int Match(Stage stage, const uint32_t* words, size_t count) {
     }
   }
   return best;
+}
+
+void SaveRuntimeContainer(Stage stage, const std::vector<uint8_t>& container,
+                          const uint32_t* words, size_t count) {
+  if (g_runtime_dir.empty()) {
+    return;
+  }
+  std::error_code error;
+  std::filesystem::create_directories(g_runtime_dir, error);
+  std::filesystem::path path =
+      g_runtime_dir / fmt::format("{}_{:08x}.bin", stage == Stage::kVertex ? "vs" : "ps",
+                                  RuntimeId(words, count));
+  if (std::filesystem::exists(path, error)) {
+    return;
+  }
+  std::ofstream file(path, std::ios::binary);
+  file.write(reinterpret_cast<const char*>(container.data()), std::streamsize(container.size()));
+  REXLOG_INFO("[shader library] captured {} for tools/build-shaders.py", path.string());
 }
 
 }  // namespace shader_library

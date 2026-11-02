@@ -1,17 +1,23 @@
 // naruto - native renderer view
 //
-// A second window, presented with Vulkan by the native renderer while the
-// Xenia GPU backend keeps running the game in the main window. Enabled with
-// NARUTO_NATIVE_VIEW=1 in the environment.
+// A second window, presented with Vulkan by the native renderer. Enabled
+// with NARUTO_NATIVE_VIEW=1 in the environment; tools/run-radeon.sh
+// --native-only also stops the Xenia GPU backend drawing, leaving it only the
+// command stream.
 //
-// The game's draws are captured as they happen (frame_capture.h) and drawn
-// here with the precompiled shaders. The game renders a frame in passes, one
-// per render target, separated by resolves; the view draws one pass at a
-// time. By default it shows the pass with the most indices; with the view's
-// window focused, Left and Right pick another and Home returns to the default.
+// The game's draws, clears and resolves are captured as they happen
+// (frame_capture.h) and replayed here with the precompiled shaders, pass by
+// pass. The view shows the frame the game presents; with its window focused,
+// Left and Right show a pass's render target instead, Home returns to the
+// presented frame, and F12 saves a snapshot (below).
 //
 // Debugging: NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws in the
-// n-th frame; NARUTO_NATIVE_VIEW_DEBUG=1 turns depth testing off.
+// n-th frame; NARUTO_NATIVE_VIEW_DEBUG bits turn off depth testing (1) and
+// culling (2) and flip the winding (4); NARUTO_NATIVE_VIEW_SNAPSHOTS=dir saves
+// each pass and the presented frame as PPM files in dir/<frame>/ for frame
+// DUMP and every NARUTO_NATIVE_VIEW_SNAPSHOT_EVERY (300) frames after it. F12
+// does the same for the current frame (into out/snapshots without SNAPSHOTS)
+// and logs all its draws.
 
 #pragma once
 
@@ -86,6 +92,19 @@ struct Resolve {
   uint32_t fetch[6] = {};  // the destination texture's fetch constant
 };
 
+// A D3DDevice_ClearF: fills the render targets and depth buffer bound at the
+// time, which the view finds by EDRAM base, before captured draw before_draw.
+struct Clear {
+  uint32_t pass = 0;
+  uint32_t before_draw = 0;  // index into FrameInfo::captured
+  uint32_t flags = 0;        // bits 0-3: render targets 0-3, 0x10 depth, 0x20 stencil
+  uint32_t color_info[4] = {};  // RB_COLOR*_INFO
+  uint32_t depth_info = 0;      // RB_DEPTH_INFO
+  float color[4] = {};
+  float depth = 1.0f;
+  uint32_t stencil = 0;
+};
+
 // How a pass's render target starts: the Resolve that ended the previous
 // pass clears it.
 struct PassInfo {
@@ -102,6 +121,7 @@ struct FrameInfo {
   std::vector<VertexAttribute> attributes;
   std::vector<TextureBinding> textures;
   std::vector<Resolve> resolves;
+  std::vector<Clear> clears;
   // The texture D3DDevice_Swap presented.
   bool has_front_buffer = false;
   uint32_t front_buffer[6] = {};

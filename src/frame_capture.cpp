@@ -545,6 +545,28 @@ void CaptureResolve(const uint8_t* base, uint32_t device, uint32_t flags, uint32
   frame.resolves.push_back(resolve);
 }
 
+void CaptureClear(const uint8_t* base, uint32_t device, uint32_t flags, uint32_t color,
+                  float depth, uint32_t stencil, uint32_t pass, native_view::FrameInfo& frame) {
+  native_view::Clear clear;
+  clear.pass = pass;
+  clear.before_draw = uint32_t(frame.captured.size());
+  clear.flags = flags;
+  clear.color_info[0] = Load32(base, device + kRegColorInfo);
+  for (int i = 1; i < 4; ++i) {
+    clear.color_info[i] = Load32(base, device + kRegColor1Info + 4 * (i - 1));
+  }
+  clear.depth_info = Load32(base, device + kRegDepthInfo);
+  if (color) {
+    for (int i = 0; i < 4; ++i) {
+      uint32_t bits = Load32(base, color + 4 * i);
+      std::memcpy(&clear.color[i], &bits, 4);
+    }
+  }
+  clear.depth = depth;
+  clear.stencil = stencil;
+  frame.clears.push_back(clear);
+}
+
 void CaptureFrontBuffer(const uint8_t* base, uint32_t texture, native_view::FrameInfo& frame) {
   if (!texture) {
     return;
