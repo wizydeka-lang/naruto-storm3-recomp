@@ -9,7 +9,8 @@
 // (frame_capture.h) and replayed here with the precompiled shaders, pass by
 // pass. The view shows the frame the game presents; with its window focused,
 // Left and Right show a pass's render target instead, Home returns to the
-// presented frame, and F12 saves a snapshot (below).
+// presented frame, and F12 (or Back+R3 on a controller) saves a snapshot
+// (below).
 //
 // Debugging: NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws in the
 // n-th frame; NARUTO_NATIVE_VIEW_DEBUG bits turn off depth testing (1) and
@@ -159,6 +160,9 @@ bool Enabled();
 
 // Called from the game's D3DDevice_Swap; never blocks on the view.
 void SubmitFrame(FrameInfo&& frame);
+
+// Saves a snapshot of the next frame, as F12 in the view does.
+void RequestSnapshot();
 
 // An empty buffer for the next frame's data, reusing the memory of a frame
 // the view is done with so capture doesn't grow a new one each frame.

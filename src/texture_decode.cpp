@@ -10,6 +10,9 @@
 #include <cstdio>
 #include <cstring>
 
+#define XXH_INLINE_ALL
+#include <xxhash.h>
+
 namespace texture_decode {
 
 namespace {
@@ -283,17 +286,21 @@ uint64_t Fingerprint(const uint8_t* guest_base, const uint32_t fetch_words[6]) {
     return 0;
   }
   const uint8_t* data = Physical(guest_base, fetch.address);
-  uint64_t hash = 1469598103934665603ull;
-  constexpr uint32_t kSamples = 16, kSampleBytes = 32;
+  // Small textures are hashed whole: games swap small details, such as an
+  // eye's iris, by rewriting a few blocks of a texture in place. Larger
+  // ones are sampled evenly.
+  constexpr uint64_t kWholeBytes = 256 << 10;
+  if (span <= kWholeBytes) {
+    return XXH3_64bits(data, span);
+  }
+  constexpr uint32_t kSamples = 512, kSampleBytes = 64;
+  XXH3_state_t state;
+  XXH3_64bits_reset(&state);
   for (uint32_t s = 0; s < kSamples; ++s) {
     uint64_t at = std::min<uint64_t>(span * s / kSamples, span - kSampleBytes);
-    for (uint32_t b = 0; b < kSampleBytes; b += 8) {
-      uint64_t value;
-      std::memcpy(&value, data + at + b, 8);
-      hash = (hash ^ value) * 1099511628211ull;
-    }
+    XXH3_64bits_update(&state, data + at, kSampleBytes);
   }
-  return hash;
+  return XXH3_64bits_digest(&state);
 }
 
 }  // namespace texture_decode

@@ -235,6 +235,8 @@ class View {
     wake_.notify_one();
   }
 
+  void RequestSnapshot() { snapshot_requested_ = true; }
+
  private:
   void Run() {
     if (!Initialize()) {
@@ -1971,7 +1973,7 @@ class View {
   // changes the interval). F12 in the view (or creating out/snapshot-request)
   // saves the current frame the same way, to dir or out/snapshots. Each
   // snapshot also logs all of the frame's draws.
-  static constexpr uint32_t kSnapshotWidth = 320, kSnapshotHeight = 180;
+  static constexpr uint32_t kSnapshotWidth = 640, kSnapshotHeight = 360;
 
   bool PrepareSnapshots(uint32_t count) {
     VkDeviceSize size = VkDeviceSize(count) * kSnapshotWidth * kSnapshotHeight * 4;
@@ -2083,14 +2085,14 @@ class View {
     uint32_t shown_pass = pass_offset_ ? uint32_t(((pass_offset_ - 1) % int64_t(pass_count) +
                                                    pass_count) % pass_count)
                                        : UINT32_MAX;
-    // F12, or out/snapshot-request appearing (for scripts), asks for a
-    // snapshot.
+    // F12, Back+R3 on a controller (RequestSnapshot), or
+    // out/snapshot-request appearing (for scripts), asks for a snapshot.
     std::error_code error;
-    bool requested = snapshot_requested_ || std::filesystem::remove("out/snapshot-request", error);
+    bool requested = snapshot_requested_.exchange(false) ||
+                     std::filesystem::remove("out/snapshot-request", error);
     if (requested) {
       REXLOG_INFO("[native view] snapshot requested at frame {}", frames_total_);
     }
-    snapshot_requested_ = false;
     static const long dump_frame = [] {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DUMP");
       return value ? std::atol(value) : -1;
@@ -2711,7 +2713,7 @@ class View {
   bool key_left_ = false;
   bool key_right_ = false;
   bool key_f12_ = false;
-  bool snapshot_requested_ = false;
+  std::atomic<bool> snapshot_requested_ = false;
   uint64_t frames_presented_ = 0;
   uint64_t frames_total_ = 0;
   uint64_t draws_drawn_ = 0;
@@ -2819,6 +2821,12 @@ bool Enabled() {
 void SubmitFrame(FrameInfo&& frame) {
   if (Enabled()) {
     GetView().Submit(std::move(frame));
+  }
+}
+
+void RequestSnapshot() {
+  if (Enabled()) {
+    GetView().RequestSnapshot();
   }
 }
 

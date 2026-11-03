@@ -35,8 +35,9 @@ void Decode(const uint8_t* guest_base, const uint32_t fetch[6], Texture& texture
 // returns false for formats it doesn't handle.
 bool WritePreview(const Texture& texture, const char* path);
 
-// A cheap fingerprint of the texture's guest memory, to notice new contents
-// at the same address.
+// A fingerprint of the texture's guest memory, to notice new contents at the
+// same address: a hash of all of it for small textures, of 512 evenly spaced
+// samples for larger ones.
 uint64_t Fingerprint(const uint8_t* guest_base, const uint32_t fetch[6]);
 
 }  // namespace texture_decode

@@ -356,13 +356,19 @@ REX_HOOK_RAW(sub_828BAB38) {
   }();
   uint32_t user = ctx.r3.u32, state = ctx.r4.u32;
   __imp__sub_828BAB38(ctx, base);
-  if (log_input && ctx.r3.u32 == 0 && user < 4) {
+  if (ctx.r3.u32 == 0 && user < 4) {
     static uint16_t last[4] = {};
     uint16_t buttons = rex::memory::load_and_swap<uint16_t>(base + state + 4);
-    if (buttons != last[user]) {
-      REXLOG_INFO("[input] user {} buttons {:04X}", user, buttons);
-      last[user] = buttons;
+    // Back+R3 asks the native view for a snapshot.
+    constexpr uint16_t kSnapshotButtons = 0x0020 | 0x0080;
+    if ((buttons & kSnapshotButtons) == kSnapshotButtons &&
+        (last[user] & kSnapshotButtons) != kSnapshotButtons) {
+      native_view::RequestSnapshot();
     }
+    if (log_input && buttons != last[user]) {
+      REXLOG_INFO("[input] user {} buttons {:04X}", user, buttons);
+    }
+    last[user] = buttons;
   }
 }
 
