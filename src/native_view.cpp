@@ -43,6 +43,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <mutex>
 #include <set>
@@ -70,7 +72,11 @@ constexpr uint32_t kHeapSizes[3] = {8192, 256, 256};
 // magnification and minification.
 constexpr uint32_t kSamplerCount = 256;
 // Texture data uploaded per frame at most; the rest waits for later frames.
+// (Decoding time is limited too: kTextureDecodeSeconds.)
 constexpr size_t kTextureUploadBudget = 96u << 20;
+// CPU time per frame for decoding textures; the rest wait for later frames,
+// so a new scene's textures spread over a few frames instead of one hitch.
+constexpr double kTextureDecodeSeconds = 0.004;
 // Size of XenosRecomp's shared constants.
 constexpr uint32_t kSharedConstantsSize = 288;
 // Device-local memory for cached vertex data is allocated in chunks of at
@@ -124,6 +130,8 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkAllocateDescriptorSets)        \
   X(vkUpdateDescriptorSets)          \
   X(vkCreatePipelineLayout)          \
+  X(vkCreatePipelineCache)           \
+  X(vkGetPipelineCacheData)          \
   X(vkCreateShaderModule)            \
   X(vkCreateGraphicsPipelines)       \
   X(vkCreateCommandPool)             \
@@ -356,6 +364,8 @@ class View {
           physical_device_ = device;
           queue_family_ = family;
           device_name_ = properties.deviceName;
+          pipeline_cache_path_ = fmt::format("out/pipeline-cache/{:04x}-{:04x}.bin",
+                                             properties.vendorID, properties.deviceID);
           timestamp_period_ =
               families[family].timestampValidBits ? properties.limits.timestampPeriod : 0.0f;
           mirror_clamp_ = features12.samplerMirrorClampToEdge;
@@ -404,6 +414,7 @@ class View {
 #undef X
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties_);
+    LoadPipelineCache();
 
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -615,10 +626,15 @@ class View {
       return &textures_.emplace(key, entry).first->second;
     }
     entry.heap = uint32_t(decoded.dimension);
-    if (!budget || free_indices_[entry.heap].empty()) {
+    if (!budget || frame_work_.texture_seconds > kTextureDecodeSeconds ||
+        free_indices_[entry.heap].empty()) {
       return nullptr;
     }
+    auto began = std::chrono::steady_clock::now();
     texture_decode::Decode(frame.guest_base, fetch, decoded);
+    frame_work_.textures++;
+    frame_work_.texture_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     if (const char* dir = std::getenv("NARUTO_NATIVE_VIEW_TEXTURES")) {
       // A PPM where the format allows; otherwise the decoded data as is,
       // named with its size, layers and VkFormat.
@@ -923,6 +939,49 @@ class View {
     VkDeviceSize size = 0;
     VkDeviceAddress address = 0;
   };
+
+  // Pipelines compiled in earlier runs, kept on disk per GPU so they compile
+  // only once; the driver ignores data from another driver version.
+  void LoadPipelineCache() {
+    std::ifstream file(pipeline_cache_path_, std::ios::binary);
+    std::vector<char> data((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    info.initialDataSize = data.size();
+    info.pInitialData = data.empty() ? nullptr : data.data();
+    if (vkCreatePipelineCache(device_, &info, nullptr, &pipeline_cache_) != VK_SUCCESS) {
+      info.initialDataSize = 0;
+      info.pInitialData = nullptr;
+      vkCreatePipelineCache(device_, &info, nullptr, &pipeline_cache_);
+    }
+    REXLOG_INFO("[native view] pipeline cache {}: {} KB", pipeline_cache_path_, data.size() >> 10);
+  }
+
+  // Writes the pipeline cache if pipelines were added since the last save.
+  void SavePipelineCache() {
+    if (!pipeline_cache_ || pipelines_.size() == saved_pipelines_) {
+      return;
+    }
+    size_t size = 0;
+    vkGetPipelineCacheData(device_, pipeline_cache_, &size, nullptr);
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device_, pipeline_cache_, &size, data.data()) != VK_SUCCESS) {
+      return;
+    }
+    std::error_code error;
+    std::filesystem::path path(pipeline_cache_path_);
+    std::filesystem::create_directories(path.parent_path(), error);
+    std::filesystem::path temporary = path;
+    temporary += ".tmp";
+    {
+      std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+      file.write(data.data(), std::streamsize(size));
+      if (!file) {
+        return;
+      }
+    }
+    std::filesystem::rename(temporary, path, error);
+    saved_pipelines_ = pipelines_.size();
+  }
 
   // Cached vertex data on the GPU, in a chunk of device-local memory.
   struct ResidentVertices {
@@ -1473,8 +1532,12 @@ class View {
     info.pColorBlendState = &color_blend;
     info.pDynamicState = &dynamic;
     info.layout = pipeline_layout_;
+    auto began = std::chrono::steady_clock::now();
     VkResult result =
-        vkCreateGraphicsPipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &it->second);
+        vkCreateGraphicsPipelines(device_, pipeline_cache_, 1, &info, nullptr, &it->second);
+    frame_work_.pipelines++;
+    frame_work_.pipeline_seconds +=
+        std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     if (result != VK_SUCCESS) {
       it->second = VK_NULL_HANDLE;
       REXLOG_WARN("[native view] pipeline for shaders {} and {} failed: {}", draw.vertex_shader,
@@ -2011,6 +2074,7 @@ class View {
     auto cpu_start = std::chrono::steady_clock::now();
     wait_seconds_ += std::chrono::duration<double>(cpu_start - wait_start).count();
     ReadTimestamps();
+    frame_work_ = {};
     frames_total_++;
     FreeRetired();
     HandleKeys();
@@ -2135,6 +2199,7 @@ class View {
         it = vertex_data_.emplace(data.id, resident).first;
         vertex_sources[i] = {vertex_chunks_[resident.chunk].buffer, resident.offset};
         vertices_uploaded_bytes_ += data.bytes.size();
+        frame_work_.vertex_bytes += data.bytes.size();
       }
       staged_vertices.push_back(
           {i, offset, it != vertex_data_.end() ? &it->second : nullptr});
@@ -2522,7 +2587,18 @@ class View {
     if (submitted != VK_SUCCESS) {
       REXLOG_ERROR("[native view] submitting frame {} failed: {}", frames_total_, int(submitted));
     }
-    cpu_seconds_ += std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_start).count();
+    double cpu = std::chrono::duration<double>(std::chrono::steady_clock::now() - cpu_start).count();
+    cpu_seconds_ += cpu;
+    if (cpu > 0.015 || frame.capture_seconds > 0.015) {
+      REXLOG_INFO("[native view] slow frame {}: view CPU {:.1f} ms ({} new pipelines in {:.1f} "
+                  "ms, {} textures decoded in {:.1f} ms, {:.1f} MB of vertices uploaded), "
+                  "capture {:.1f} ms, GPU wait {:.1f} ms",
+                  frames_total_, cpu * 1000, frame_work_.pipelines,
+                  frame_work_.pipeline_seconds * 1000, frame_work_.textures,
+                  frame_work_.texture_seconds * 1000, frame_work_.vertex_bytes / 1048576.0,
+                  frame.capture_seconds * 1000,
+                  std::chrono::duration<double>(cpu_start - wait_start).count() * 1000);
+    }
     capture_seconds_ += frame.capture_seconds;
     if (snapshots) {
       vkQueueWaitIdle(queue_);
@@ -2568,6 +2644,7 @@ class View {
           textures_uploaded_bytes_ / 1048576.0, vertices_uploaded_bytes_ / 1048576.0,
           vertex_data_.size(), vertex_chunks_.size());
       vertices_uploaded_bytes_ = 0;
+      SavePipelineCache();
       uint64_t submitted = frames_submitted_.exchange(0);
       uint64_t presented = std::max<uint64_t>(frames_presented_, 1);
       REXLOG_INFO("[native view] timing: {:.1f} game frames/s, capture {:.2f} ms/frame (game "
@@ -2673,6 +2750,9 @@ class View {
   std::vector<Retired> retired_;
   uint64_t textures_failed_ = 0;
   uint64_t textures_uploaded_bytes_ = 0;
+  VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+  std::string pipeline_cache_path_;
+  size_t saved_pipelines_ = 0;  // pipelines_.size() at the last save
   std::unordered_map<uint64_t, ResidentVertices> vertex_data_;  // by VertexData::id
   std::vector<VertexChunk> vertex_chunks_;
   uint64_t vertices_uploaded_bytes_ = 0;
@@ -2680,6 +2760,12 @@ class View {
   double capture_seconds_ = 0;  // of the presented frames
   double cpu_seconds_ = 0;
   double wait_seconds_ = 0;  // for the frame's fence
+  // The current frame's costly one-off work, for the slow frame log.
+  struct FrameWork {
+    uint32_t pipelines = 0, textures = 0;
+    double pipeline_seconds = 0, texture_seconds = 0;
+    uint64_t vertex_bytes = 0;
+  } frame_work_;
   static constexpr uint32_t kTimestamps = 128;  // per frame in flight
   VkQueryPool timestamp_pool_ = VK_NULL_HANDLE;
   float timestamp_period_ = 0;  // ns per tick, 0 without timestamps
