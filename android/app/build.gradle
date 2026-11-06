@@ -46,6 +46,11 @@ android {
                 storePassword = System.getenv('NARUTO_KEYSTORE_PASSWORD')
                 keyAlias = providers.gradleProperty('releaseKeyAlias').getOrElse('naruto')
                 keyPassword = System.getenv('NARUTO_KEYSTORE_PASSWORD')
+                // Some phone installers (vivo, OPPO) reject APKs without the
+                // old v1 JAR signature as "missing the developer certificate".
+                enableV1Signing = true
+                enableV2Signing = true
+                enableV3Signing = true
             }
         }
     }
