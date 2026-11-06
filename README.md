@@ -13,7 +13,7 @@ An experimental native PC and Android port of the Xbox 360 game **Naruto Shippud
 | Windows | Installer and build scripts are written but **not yet tested** on a Windows PC. |
 | Online | **Experimental** peer-to-peer play, see [Online mode](#online-mode-experimental). |
 
-Story mode and other modes have not been checked. Please report problems with your log file attached.
+Story mode and other modes have not been checked. Please [report problems](#reporting-problems) with your log file attached.
 
 ## What you need
 
@@ -283,6 +283,34 @@ Settings are stored in `naruto.toml` next to the executable. The first build cre
 - **Low FPS:** run on the dedicated GPU, and use render scale 1 with the FSR upscaler.
 - **Updating:** on Windows, run `install-windows.bat` again. On Linux, run `tools/setup-sdk.sh` again if `patches/` changed; if `naruto_manifest.toml` changed, repeat all four build commands, otherwise only the last one.
 - **Online: the other player's match is not found:** check both IPs, the firewall ports above, and that both machines can ping each other.
+
+## Reporting problems
+
+Open an issue at [Issues, New issue](https://github.com/wizydeka-lang/naruto-storm3-recomp/issues/new/choose) and pick the form that fits:
+
+| Form | For |
+| --- | --- |
+| **Bug report** | Crashes, freezes, wrong graphics or sound in the game |
+| **Build or install problem** | The Windows installer, SDK setup or build fails |
+| **Online mode problem** | The experimental online mode does not connect or desyncs |
+| **Feature request** | Ideas and improvements |
+
+A good report has:
+
+1. **Your platform and hardware:** CPU, GPU and driver version; on Android, the phone model.
+2. **The project version:** `git log --oneline -1`, or the date you downloaded it.
+3. **What you did and what happened**, step by step, with a screenshot or short video if you can.
+4. **The log file**, attached:
+   - Windows and Linux: the newest file in the `logs` folder next to the executable (`out/build/win-amd64-release/logs` or `out/build/linux-amd64-release/logs`).
+   - Android: `Android/data/dev.narutorecomp/files/naruto.log`.
+   - Build problems: the last 50 lines of the build output, as text.
+5. For online problems, the logs from **both** players.
+
+Search the existing issues first; adding your details to a matching issue helps more than a duplicate. **Never attach game files, `default.xex`, `generated/` code, or built executables or APKs.** They contain the game and will be removed.
+
+## Why there are no ready-made downloads
+
+A built `naruto.exe` or Android APK contains the game's own code, recompiled from `default.xex`, plus shader data from the game. Sharing it would mean sharing the game, so this project only publishes source code, and everyone builds from their own copy. The Windows installer makes this mostly automatic.
 
 ## How the project is organised
 

@@ -1,0 +1,43 @@
+name: Online mode problem
+description: The experimental peer-to-peer online mode does not connect, desyncs or crashes.
+labels: [online]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Online mode is experimental. First check the README's "Online mode" section: both players set the other one's IP, firewall ports UDP 36000, TCP 44996 and UDP 37000-37001 are open, and both builds are the same version.
+  - type: input
+    id: host
+    attributes:
+      label: Host platform and version
+      placeholder: Android (Pixel 7), commit fb2e83a
+    validations: { required: true }
+  - type: input
+    id: client
+    attributes:
+      label: Joining platform and version
+      placeholder: Windows, commit fb2e83a
+    validations: { required: true }
+  - type: dropdown
+    id: network
+    attributes:
+      label: Network
+      options: [Same Wi-Fi / LAN, Tailscale, ZeroTier, Other VPN, Port forwarding]
+    validations: { required: true }
+  - type: dropdown
+    id: stage
+    attributes:
+      label: How far did it get?
+      options: [Match not found, Found but joining fails, Character select, Loading the fight, During the fight, After the fight]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+    validations: { required: true }
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs from both players
+      description: Attach both log files. The `[netplay]` lines matter most. Hide your public IP address if you do not want it shown.
+    validations: { required: true }

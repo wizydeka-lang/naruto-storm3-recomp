@@ -1,0 +1,37 @@
+name: Build or install problem
+description: The Windows installer, the SDK setup or the build fails.
+labels: [build]
+body:
+  - type: markdown
+    attributes:
+      value: Do not attach game files or generated code.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Windows installer, Windows (by hand), Linux, Android build]
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Project version
+      description: Commit hash or download date.
+    validations: { required: true }
+  - type: dropdown
+    id: step
+    attributes:
+      label: Which step failed?
+      options: [Installing tools, Game files check, SDK setup (clone/patch/build), Codegen (translating default.xex), Compiling the game, Shortcuts or launching]
+    validations: { required: true }
+  - type: input
+    id: paths
+    attributes:
+      label: Repository and SDK paths
+      placeholder: C:\dev\naruto-recomp and C:\dev\rexglue-sdk
+  - type: textarea
+    id: output
+    attributes:
+      label: Error output
+      description: The last 50 or so lines of output, including the first line that says "error". Paste as text, not a screenshot.
+      render: text
+    validations: { required: true }

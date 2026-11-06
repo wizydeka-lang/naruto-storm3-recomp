@@ -1,0 +1,61 @@
+name: Bug report
+description: The game crashes, freezes, looks wrong or sounds wrong.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing. **Never attach game files**, `default.xex`, `generated/` code or built executables/APKs: they contain the game and will be deleted.
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Windows, Linux, Android]
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes:
+      label: Project version
+      description: Commit hash (`git log --oneline -1`) or the date you downloaded the source.
+    validations: { required: true }
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware
+      description: "CPU, GPU and driver version, RAM. Android: phone model and Android version."
+      placeholder: Ryzen 5 7535HS, RTX 2050 (driver 580.x), 16 GB
+    validations: { required: true }
+  - type: dropdown
+    id: game-check
+    attributes:
+      label: Does `tools/check-game.py` print "Game files OK."?
+      options: ["Yes", "No", "Android (not applicable)"]
+    validations: { required: true }
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead. Screenshots or a short video help a lot.
+    validations: { required: true }
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Free Battle
+        2. Pick Naruto vs Sasuke, Valley of the End
+        3. Use an Ultimate Jutsu -> crash
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and settings
+      description: Command-line options, launcher settings, or changes to `naruto.toml`.
+  - type: textarea
+    id: log
+    attributes:
+      label: Log file
+      description: |
+        Drag the log file here (do not paste thousands of lines).
+        - Windows / Linux: the newest file in the `logs` folder next to `naruto.exe` / `naruto` (`out/build/...-release/logs`).
+        - Android: `Android/data/dev.narutorecomp/files/naruto.log` (copy it with a file manager or `adb pull`).
+    validations: { required: true }

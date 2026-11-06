@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Setup guide
+    url: https://github.com/wizydeka-lang/naruto-storm3-recomp#readme
+    about: Read the README and its Troubleshooting section before opening an issue.
