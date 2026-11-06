@@ -15,7 +15,7 @@ An experimental native PC and Android port of the Xbox 360 game **Naruto Shippud
 
 Story mode and other modes have not been checked. Please [report problems](#reporting-problems) with your log file attached.
 
-> **Made with AI.** Most of this project's code was written by an AI assistant (Claude) under human direction and testing. See [AI usage disclaimer](#ai-usage-disclaimer).
+> **Made with AI assistance.** The CPU-side recompilation was done by hand; the GPU renderer, Android port, online mode and tooling were mostly written by an AI assistant (Claude) under human direction and testing. See [AI usage disclaimer](#ai-usage-disclaimer).
 
 ## What you need
 
@@ -335,16 +335,17 @@ Generated code (`generated/default/`) and build output (`out/`) are created on y
 
 ## AI usage disclaimer
 
-This project is openly made with AI assistance, and I'm fine with that. To be transparent about how much:
+This project is openly made with AI assistance, and I'm fine with that. To be transparent about who did what:
 
-- **Most of the code in this repository was written by AI.** [Claude](https://www.anthropic.com/claude) (Anthropic), through Claude Code, wrote nearly all of it: 43 of the first 44 commits are marked `Co-Authored-By: Claude`. That includes the native Vulkan renderer, the Android port and launcher, the online mode patch, the SDK patches, the build scripts, the Windows installer and most of this README.
-- **The person behind the project** chose what to build, ran and played the game on PC and phone, tested online matches between devices, reported what was broken, and made the decisions (including what to publish).
-- **The AI also did the debugging**: reading logs, attaching debuggers to find crashes, and reverse engineering the game's functions. Its findings were checked by running the game, not by a human code review of every line.
-- **Not AI-made here:** [ReXGlue](https://github.com/rexglue/rexglue-sdk), Xenia, XenonRecomp and the other projects in [Credits](#credits). This project only patches and uses them.
+- **CPU side: done by me, before AI was involved.** Getting the game's PowerPC code recompiled with ReXGlue was my own work: setting up the codegen, finding the function boundaries in `naruto_manifest.toml`, and getting the game to boot and run on the CPU side. The git history starts with an "Initial source release" commit, so this work is older than the history shows.
+- **GPU side and later work: mostly written by AI.** From there, [Claude](https://www.anthropic.com/claude) (Anthropic), through Claude Code, wrote most of the new code: the native Vulkan renderer and the mapping of the game's Direct3D functions, the Android port and launcher, the online mode patch, the other SDK patches, the build scripts, the Windows installer and most of this README. Commits it helped write are marked `Co-Authored-By: Claude`.
+- **My part in the AI-assisted work:** choosing what to build, running and playing the game on PC and phone, testing online matches between devices, reporting what was broken, and making the decisions, including what to publish.
+- **Debugging** of the AI-written parts (reading logs, attaching debuggers, reverse engineering the game's rendering) was mostly done by the AI. Its fixes were checked by running the game, not by a human review of every line.
+- **Not made here:** [ReXGlue](https://github.com/rexglue/rexglue-sdk), Xenia, XenonRecomp and the other projects in [Credits](#credits). This project only uses and patches them.
 
 What this means for you:
 
-- Expect bugs and rough edges. Code was accepted when the game worked, so parts of it may be odd, over-complicated or wrong in cases nobody tested.
+- Expect bugs and rough edges, especially in the AI-written parts: code was accepted when the game worked, so parts of it may be odd or wrong in cases nobody tested.
 - Review before reusing code from here in your own project.
 - Bug reports and pull requests, AI-assisted or not, are welcome.
 
