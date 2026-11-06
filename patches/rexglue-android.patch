@@ -1,0 +1,706 @@
+diff --git a/include/rex/chrono/chrono.h b/include/rex/chrono/chrono.h
+index d876846..a5ba4c3 100644
+--- a/include/rex/chrono/chrono.h
++++ b/include/rex/chrono/chrono.h
+@@ -116,8 +116,9 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
+ 
+ namespace std::chrono {
+ 
+-#ifdef __APPLE__
+-// Apple libc++ does not expose clock_time_conversion or clock_cast.
++#if defined(__APPLE__) || defined(__ANDROID__)
++// Apple's and the Android NDK's libc++ do not expose clock_time_conversion or
++// clock_cast.
+ template <class, class>
+ struct clock_time_conversion {};
+ 
+diff --git a/include/rex/main_android.h b/include/rex/main_android.h
+new file mode 100644
+index 0000000..c2de091
+--- /dev/null
++++ b/include/rex/main_android.h
+@@ -0,0 +1,24 @@
++/**
++ * @file        rex/main_android.h
++ * @brief       Android platform queries
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
++ *              All rights reserved.
++ *
++ * @license     BSD 3-Clause License
++ *              See LICENSE file in the project root for full license text.
++ */
++
++#pragma once
++
++#include <android/api-level.h>
++
++namespace rex {
++
++// API level of the device the app runs on, which may be newer than the one it
++// was built for.
++inline int GetAndroidApiLevel() {
++  return android_get_device_api_level();
++}
++
++}  // namespace rex
+diff --git a/include/rex/thread/fiber.h b/include/rex/thread/fiber.h
+index 352af67..26703ff 100644
+--- a/include/rex/thread/fiber.h
++++ b/include/rex/thread/fiber.h
+@@ -14,7 +14,10 @@
+ #include <rex/platform.h>
+ #include <cstddef>
+ 
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++#include <cstdint>
++#include <vector>
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ #if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+ // Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+ // before including <ucontext.h>.
+@@ -56,6 +59,16 @@ struct Fiber {
+ #if REX_PLATFORM_WIN32
+   void* handle_ = nullptr;
+   bool is_thread_fiber_ = false;
++#elif REX_PLATFORM_ANDROID
++  // Bionic has no ucontext functions; the saved stack pointer is the whole
++  // context, with callee-saved registers stored on the fiber's own stack.
++  void* sp_ = nullptr;
++  std::vector<uint8_t> stack_;
++  void (*entry_)(void*) = nullptr;
++  void* arg_ = nullptr;
++  bool is_thread_fiber_ = false;
++
++  static void Trampoline();
+ #elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+   ucontext_t context_{};
+   std::vector<uint8_t> stack_;
+diff --git a/include/rex/ui/surface_android.h b/include/rex/ui/surface_android.h
+new file mode 100644
+index 0000000..f137bb7
+--- /dev/null
++++ b/include/rex/ui/surface_android.h
+@@ -0,0 +1,35 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2021 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ */
++
++#pragma once
++
++#include <rex/ui/surface.h>
++
++#include <android/native_window.h>
++
++namespace rex {
++namespace ui {
++
++class AndroidNativeWindowSurface final : public Surface {
++ public:
++  explicit AndroidNativeWindowSurface(ANativeWindow* window) : window_(window) {}
++  TypeIndex GetType() const override { return kTypeIndex_AndroidNativeWindow; }
++  ANativeWindow* window() const { return window_; }
++
++ protected:
++  bool GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const override;
++
++ private:
++  ANativeWindow* window_;
++};
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/include/rex/ui/windowed_app.h b/include/rex/ui/windowed_app.h
+index 50638d6..b4ead81 100644
+--- a/include/rex/ui/windowed_app.h
++++ b/include/rex/ui/windowed_app.h
+@@ -24,11 +24,6 @@
+ #include <rex/platform.h>
+ #include <rex/ui/windowed_app_context.h>
+ 
+-#if REX_PLATFORM_ANDROID
+-// Multiple apps in a single library instead of separate executables.
+-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
+-#endif
+-
+ namespace rex {
+ namespace ui {
+ 
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1ddafd0..65bb2b2 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -100,6 +100,11 @@ target_include_directories(rexcore PRIVATE
+ 
+ if(APPLE)
+     target_link_libraries(rexcore PRIVATE pthread)
++elseif(ANDROID)
++    # Bionic's libc includes pthread and rt; there are no separate libraries.
++    target_link_libraries(rexcore PRIVATE dl)
++    # filesystem_posix.cpp reaches the Java side through SDL's JNI handles.
++    target_link_libraries(rexcore PRIVATE SDL3::SDL3)
+ elseif(UNIX)
+     target_link_libraries(rexcore PRIVATE pthread rt dl)
+ endif()
+diff --git a/src/core/fiber_posix.cpp b/src/core/fiber_posix.cpp
+index 4fe1ca6..d0a87d5 100644
+--- a/src/core/fiber_posix.cpp
++++ b/src/core/fiber_posix.cpp
+@@ -17,7 +17,135 @@
+ #endif
+ 
+ #include <rex/platform.h>
+-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#if REX_PLATFORM_ANDROID
++
++#include <rex/thread/fiber.h>
++
++#include <cassert>
++#include <cstring>
++
++#if !defined(__aarch64__)
++#error Android fibers are only implemented for arm64.
++#endif
++
++// rex_fiber_switch(void** from_sp, void* to_sp): pushes the AAPCS64
++// callee-saved registers (x19-x30, d8-d15) onto the current stack, stores the
++// stack pointer to *from_sp, then loads to_sp and pops the same frame from it.
++// The final ret jumps to the restored x30.
++//
++// rex_fiber_start is the x30 of a new fiber's first frame; x19 of that frame
++// holds the function to run, which must not return.
++asm(R"(
++    .text
++    .p2align 2
++    .globl rex_fiber_switch
++    .hidden rex_fiber_switch
++    .type rex_fiber_switch, %function
++rex_fiber_switch:
++    sub sp, sp, #160
++    stp x19, x20, [sp, #0]
++    stp x21, x22, [sp, #16]
++    stp x23, x24, [sp, #32]
++    stp x25, x26, [sp, #48]
++    stp x27, x28, [sp, #64]
++    stp x29, x30, [sp, #80]
++    stp d8, d9, [sp, #96]
++    stp d10, d11, [sp, #112]
++    stp d12, d13, [sp, #128]
++    stp d14, d15, [sp, #144]
++    mov x9, sp
++    str x9, [x0]
++    mov sp, x1
++    ldp x19, x20, [sp, #0]
++    ldp x21, x22, [sp, #16]
++    ldp x23, x24, [sp, #32]
++    ldp x25, x26, [sp, #48]
++    ldp x27, x28, [sp, #64]
++    ldp x29, x30, [sp, #80]
++    ldp d8, d9, [sp, #96]
++    ldp d10, d11, [sp, #112]
++    ldp d12, d13, [sp, #128]
++    ldp d14, d15, [sp, #144]
++    add sp, sp, #160
++    ret
++    .size rex_fiber_switch, . - rex_fiber_switch
++
++    .p2align 2
++    .globl rex_fiber_start
++    .hidden rex_fiber_start
++    .type rex_fiber_start, %function
++rex_fiber_start:
++    mov x29, xzr
++    blr x19
++    brk #0x3e8
++    .size rex_fiber_start, . - rex_fiber_start
++)");
++
++extern "C" void rex_fiber_switch(void** from_sp, void* to_sp);
++extern "C" void rex_fiber_start();
++
++namespace rex::thread {
++
++namespace {
++constexpr size_t kSwitchFrameSize = 160;
++constexpr size_t kSwitchFrameX19 = 0;
++constexpr size_t kSwitchFrameX30 = 88;
++}  // namespace
++
++thread_local Fiber* Fiber::tls_current_ = nullptr;
++
++Fiber* Fiber::ConvertCurrentThread() {
++  // The thread's stack pointer is saved by the first SwitchTo away from it.
++  auto* f = new Fiber();
++  f->is_thread_fiber_ = true;
++  tls_current_ = f;
++  return f;
++}
++
++Fiber* Fiber::Create(size_t stack_size, void (*entry)(void*), void* arg) {
++  auto* f = new Fiber();
++  f->entry_ = entry;
++  f->arg_ = arg;
++  f->stack_.resize(stack_size);
++
++  // A first switch frame at the 16-byte aligned top of the stack: zeroed
++  // registers, except x19 = Trampoline and x30 = rex_fiber_start.
++  auto top = reinterpret_cast<uintptr_t>(f->stack_.data() + f->stack_.size()) & ~uintptr_t(15);
++  auto* frame = reinterpret_cast<uint8_t*>(top - kSwitchFrameSize);
++  std::memset(frame, 0, kSwitchFrameSize);
++  auto trampoline = reinterpret_cast<uintptr_t>(&Fiber::Trampoline);
++  auto start = reinterpret_cast<uintptr_t>(&rex_fiber_start);
++  std::memcpy(frame + kSwitchFrameX19, &trampoline, sizeof(trampoline));
++  std::memcpy(frame + kSwitchFrameX30, &start, sizeof(start));
++  f->sp_ = frame;
++  return f;
++}
++
++/*static*/ void Fiber::Trampoline() {
++  // tls_current_ was updated by SwitchTo before rex_fiber_switch entered here.
++  Fiber* f = tls_current_;
++  f->entry_(f->arg_);
++}
++
++void Fiber::SwitchTo(Fiber* target) {
++  Fiber* from = tls_current_;
++  tls_current_ = target;
++  rex_fiber_switch(&from->sp_, target->sp_);
++}
++
++void Fiber::Destroy() {
++  // Thread fibers are destroyed from the owning thread itself.
++  if (is_thread_fiber_) {
++    tls_current_ = nullptr;
++  } else {
++    assert(this != tls_current_ && "Destroy called on the currently running fiber");
++  }
++  delete this;
++}
++
++}  // namespace rex::thread
++
++#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ 
+ #include <rex/thread/fiber.h>
+ 
+diff --git a/src/core/filesystem_posix.cpp b/src/core/filesystem_posix.cpp
+index ef5bdf4..122e18c 100644
+--- a/src/core/filesystem_posix.cpp
++++ b/src/core/filesystem_posix.cpp
+@@ -30,6 +30,12 @@
+ #include <rex/platform/env.h>
+ #include <rex/string.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <jni.h>
++
++#include <SDL3/SDL_system.h>
++#endif
++
+ #include <dirent.h>
+ #include <ftw.h>
+ #include <libgen.h>
+@@ -302,5 +308,57 @@ std::vector<FileInfo> ListFiles(const std::filesystem::path& path) {
+   return result;
+ }
+ 
++#if REX_PLATFORM_ANDROID
++bool IsAndroidContentUri(const std::string_view source) {
++  return source.starts_with("content://");
++}
++
++int OpenAndroidContentFileDescriptor(const std::string_view uri, const char* mode) {
++  // ContentResolver.openFileDescriptor(Uri.parse(uri), mode).detachFd(), with
++  // the activity from SDL. Java exceptions (missing permission, no such file)
++  // become -1.
++  auto* env = static_cast<JNIEnv*>(SDL_GetAndroidJNIEnv());
++  if (!env || env->PushLocalFrame(16) != JNI_OK) {
++    return -1;
++  }
++  int file_descriptor = -1;
++  auto activity = static_cast<jobject>(SDL_GetAndroidActivity());
++  if (activity) {
++    jclass context_class = env->FindClass("android/content/Context");
++    jclass resolver_class = env->FindClass("android/content/ContentResolver");
++    jclass uri_class = env->FindClass("android/net/Uri");
++    jclass pfd_class = env->FindClass("android/os/ParcelFileDescriptor");
++    if (context_class && resolver_class && uri_class && pfd_class) {
++      jmethodID get_content_resolver = env->GetMethodID(
++          context_class, "getContentResolver", "()Landroid/content/ContentResolver;");
++      jmethodID parse =
++          env->GetStaticMethodID(uri_class, "parse", "(Ljava/lang/String;)Landroid/net/Uri;");
++      jmethodID open_file_descriptor =
++          env->GetMethodID(resolver_class, "openFileDescriptor",
++                           "(Landroid/net/Uri;Ljava/lang/String;)Landroid/os/ParcelFileDescriptor;");
++      jmethodID detach_fd = env->GetMethodID(pfd_class, "detachFd", "()I");
++      jobject resolver = env->CallObjectMethod(activity, get_content_resolver);
++      jstring uri_string = env->NewStringUTF(std::string(uri).c_str());
++      jobject parsed_uri =
++          resolver && uri_string ? env->CallStaticObjectMethod(uri_class, parse, uri_string)
++                                 : nullptr;
++      jstring mode_string = parsed_uri ? env->NewStringUTF(mode) : nullptr;
++      jobject pfd = mode_string ? env->CallObjectMethod(resolver, open_file_descriptor,
++                                                        parsed_uri, mode_string)
++                                : nullptr;
++      if (pfd && !env->ExceptionCheck()) {
++        file_descriptor = env->CallIntMethod(pfd, detach_fd);
++      }
++    }
++  }
++  if (env->ExceptionCheck()) {
++    env->ExceptionClear();
++    file_descriptor = -1;
++  }
++  env->PopLocalFrame(nullptr);
++  return file_descriptor;
++}
++#endif  // REX_PLATFORM_ANDROID
++
+ }  // namespace filesystem
+ }  // namespace rex
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index b52bf39..ffbd0eb 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -48,13 +48,14 @@
+ #if REX_PLATFORM_ANDROID
+ #include <string.h>
+ 
++#include <android/sharedmem.h>
++
+ #include <dlfcn.h>
+ #include <sys/ioctl.h>
+ 
+ #include <linux/ashmem.h>
+ 
+-// TODO(tomc): Android or maybe na. idk
+-// #include "xenia/base/main_android.h"
++#include <rex/main_android.h>
+ #endif
+ 
+ namespace rex {
+@@ -432,28 +433,11 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
+ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, size_t length,
+                                           PageAccess access, bool commit) {
+ #if REX_PLATFORM_ANDROID
+-  // TODO(Triang3l): Check if memfd can be used instead on API 30+.
+-  if (android_ASharedMemory_create_) {
+-    int sharedmem_fd = android_ASharedMemory_create_(path.c_str(), length);
+-    return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
+-                             : kFileMappingHandleInvalid;
+-  }
+-
+-  // Use /dev/ashmem on API versions below 26, which added ASharedMemory.
+-  // /dev/ashmem was disabled on API 29 for apps targeting it.
+-  // https://chromium.googlesource.com/chromium/src/+/master/third_party/ashmem/ashmem-dev.c
+-  int ashmem_fd = open("/" ASHMEM_NAME_DEF, O_RDWR);
+-  if (ashmem_fd < 0) {
+-    return kFileMappingHandleInvalid;
+-  }
+-  char ashmem_name[ASHMEM_NAME_LEN];
+-  strlcpy(ashmem_name, path.c_str(), rex::countof(ashmem_name));
+-  if (ioctl(ashmem_fd, ASHMEM_SET_NAME, ashmem_name) < 0 ||
+-      ioctl(ashmem_fd, ASHMEM_SET_SIZE, length) < 0) {
+-    close(ashmem_fd);
+-    return kFileMappingHandleInvalid;
+-  }
+-  return static_cast<FileMappingHandle>(ashmem_fd);
++  // API 26+, the minimum for these builds. /dev/ashmem is closed to apps
++  // targeting API 29+, so it is no fallback.
++  int sharedmem_fd = ASharedMemory_create(path.c_str(), length);
++  return sharedmem_fd >= 0 ? static_cast<FileMappingHandle>(sharedmem_fd)
++                           : kFileMappingHandleInvalid;
+ #else
+   int oflag;
+   switch (access) {
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 9ac8d15..231726e 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -270,8 +270,9 @@ static sem_t* RexCreateAnonymousSemaphore() {
+ class PosixConditionBase {
+  public:
+   PosixConditionBase() {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+     // Use robust mutexes so waits can recover if owner thread terminates.
++    // Bionic has no robust mutexes, so Android uses plain ones like macOS.
+     pthread_mutexattr_t attr;
+     if (pthread_mutexattr_init(&attr) == 0) {
+       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
+@@ -290,7 +291,7 @@ class PosixConditionBase {
+   WaitResult Wait(std::chrono::milliseconds timeout) {
+     bool executed;
+     auto predicate = [this] { return this->signaled(); };
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
+     int lock_result = pthread_mutex_lock(native_mutex);
+     if (lock_result == EOWNERDEAD) {
+@@ -344,7 +345,7 @@ class PosixConditionBase {
+       locks.reserve(handles.size());
+ 
+       for (size_t i = 0; i < handles.size(); ++i) {
+-#if REX_PLATFORM_LINUX
++#if REX_PLATFORM_GNU_LINUX
+         auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+         int result = pthread_mutex_trylock(native_mutex);
+         if (result == 0 || result == EOWNERDEAD) {
+@@ -868,19 +869,17 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return;
+     }
+ 
+-#if defined(__APPLE__)
+-    // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+-    // without the sigval payload.
++#if defined(__APPLE__) || REX_PLATFORM_ANDROID
++    // macOS has no sigqueue/pthread_sigqueue, and Bionic only has
++    // pthread_sigqueue from API 29 (sigqueue takes a process, not a thread:
++    // it fails for any but the main one, and the thread never wakes).
++    // pthread_kill delivers the signal without the sigval payload, which the
++    // handler doesn't use.
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+ #else
+     sigval value{};
+     value.sival_ptr = this;
+-#if REX_PLATFORM_ANDROID
+-    int result = sigqueue(pthread_gettid_np(thread_),
+-                          GetSystemSignal(SignalType::kThreadUserCallback), value);
+-#else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+-#endif
+ #endif
+     if (result != 0) {
+       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 001f36b..0cab718 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -930,10 +930,16 @@ bool VulkanCommandProcessor::SetupContext() {
+     return false;
+   }
+   if (!device_properties.vertexPipelineStoresAndAtomics) {
+-    REXGPU_ERROR(
+-        "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation and "
+-        "D3D12 parity, but unsupported by the selected device");
+-    return false;
++    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics)) {
++      REXGPU_ERROR(
++          "Vulkan vertexPipelineStoresAndAtomics is required for GPU emulation "
++          "(vulkan_require_vertex_pipeline_stores_and_atomics=true), but unsupported by the "
++          "selected device");
++      return false;
++    }
++    REXGPU_WARN(
++        "Vulkan vertexPipelineStoresAndAtomics is not supported by the device; vertex "
++        "shader memory export will be dropped");
+   }
+   if (!device_properties.geometryShader) {
+     if (REXCVAR_GET(vulkan_require_geometry_shader)) {
+@@ -3630,13 +3636,19 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
+   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
+-  if (memexport_used_vertex) {
+-    if (!device_properties.vertexPipelineStoresAndAtomics) {
+-      REXGPU_ERROR(
+-          "Vertex shader memexport draw encountered without "
+-          "vertexPipelineStoresAndAtomics support");
+-      return false;
++  if (memexport_used_vertex && !device_properties.vertexPipelineStoresAndAtomics) {
++    // The translator leaves memory export out of vertex shaders without the
++    // feature, so the draw itself still renders.
++    static bool warned = false;
++    if (!warned) {
++      REXGPU_WARN(
++          "Vertex shader memexport draw without vertexPipelineStoresAndAtomics "
++          "support; drawing without the export");
++      warned = true;
+     }
++    memexport_used_vertex = false;
++  }
++  if (memexport_used_vertex) {
+     draw_util::AddMemExportRanges(regs, *vertex_shader, memexport_ranges_);
+   }
+ 
+diff --git a/src/system/gpu_plugin_loader.cpp b/src/system/gpu_plugin_loader.cpp
+index 754fa13..d879ac5 100644
+--- a/src/system/gpu_plugin_loader.cpp
++++ b/src/system/gpu_plugin_loader.cpp
+@@ -22,6 +22,10 @@
+ #include <rex/platform.h>
+ #include <rex/platform/dynlib.h>
+ 
++#if REX_PLATFORM_ANDROID
++#include <dlfcn.h>
++#endif
++
+ namespace rex::system {
+ 
+ namespace {
+@@ -52,10 +56,23 @@ std::vector<platform::DynamicLibrary>& LoadedPlugins() {
+   return plugins;
+ }
+ 
++// Where plugins are installed. An Android app's executable is the system's
++// app_process; its native libraries, plugins included, sit together in the
++// app's library folder, which is the one holding this library.
++std::filesystem::path PluginFolder() {
++#if REX_PLATFORM_ANDROID
++  Dl_info info{};
++  if (dladdr(reinterpret_cast<void*>(&PluginFileName), &info) && info.dli_fname) {
++    return std::filesystem::path(info.dli_fname).parent_path();
++  }
++#endif
++  return rex::filesystem::GetExecutableFolder();
++}
++
+ }  // namespace
+ 
+ std::unique_ptr<IGraphicsSystem> LoadGpuPlugin(std::string_view name, std::string_view backend) {
+-  auto path = rex::filesystem::GetExecutableFolder() / PluginFileName(name);
++  auto path = PluginFolder() / PluginFileName(name);
+   if (!std::filesystem::exists(path)) {
+     REXSYS_ERROR(
+         "GPU plugin '{}' not found at {}. Stage it next to the executable "
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 5bd3dc5..3733ea5 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -72,6 +72,10 @@ elseif(APPLE)
+     set(REXUI_PLATFORM_SOURCES
+         surface_mac.cpp
+     )
++elseif(ANDROID)
++    set(REXUI_PLATFORM_SOURCES
++        surface_android.cpp
++    )
+ else()
+     set(REXUI_PLATFORM_SOURCES
+         surface_gnulinux.cpp
+@@ -146,7 +150,9 @@ if(REXGLUE_USE_VULKAN)
+ endif()
+ 
+ # Platform-specific dependencies
+-if(UNIX AND NOT APPLE)
++if(ANDROID)
++    target_link_libraries(rexui PUBLIC android)
++elseif(UNIX AND NOT APPLE)
+     find_package(PkgConfig REQUIRED)
+     pkg_check_modules(X11_XCB REQUIRED x11-xcb)
+     # Required, not optional: vulkan/api.h pulls in <wayland-client.h> on every
+diff --git a/src/ui/surface_android.cpp b/src/ui/surface_android.cpp
+new file mode 100644
+index 0000000..7f51334
+--- /dev/null
++++ b/src/ui/surface_android.cpp
+@@ -0,0 +1,29 @@
++/**
++ ******************************************************************************
++ * Xenia : Xbox 360 Emulator Research Project                                 *
++ ******************************************************************************
++ * Copyright 2021 Ben Vanik. All rights reserved.                             *
++ * Released under the BSD license - see LICENSE in the root for more details. *
++ ******************************************************************************
++ *
++ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
++ */
++
++#include <rex/ui/surface_android.h>
++
++namespace rex {
++namespace ui {
++
++bool AndroidNativeWindowSurface::GetSizeImpl(uint32_t& width_out, uint32_t& height_out) const {
++  int32_t width = ANativeWindow_getWidth(window_);
++  int32_t height = ANativeWindow_getHeight(window_);
++  if (width <= 0 || height <= 0) {
++    return false;
++  }
++  width_out = uint32_t(width);
++  height_out = uint32_t(height);
++  return true;
++}
++
++}  // namespace ui
++}  // namespace rex
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 8197bb4..881a14c 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -26,17 +26,22 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan
+                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
+                     "required for Vulkan GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI/Vulkan",
+-                    "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
+-                    "required for Vulkan GPU emulation")
++// Mali GPUs on Android do not expose vertexPipelineStoresAndAtomics; without
++// it, vertex shader memory export is dropped and those draws render without it.
++REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, !REX_PLATFORM_ANDROID,
++                    "UI/Vulkan",
++                    "Require vertexPipelineStoresAndAtomics support for Vulkan GPU emulation "
++                    "(disable to allow devices without it, dropping vertex shader memory export)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-// Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
+-// default both to false on macOS so the device can still be selected.
++// Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid,
++// and Mali GPUs on Android lack fillModeNonSolid; default those to false there
++// so the device can still be selected.
+ REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulkan",
+                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
+                     "fallback primitive emulation paths)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+-REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/Vulkan",
++REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC && !REX_PLATFORM_ANDROID,
++                    "UI/Vulkan",
+                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
+                     "allow fallback to solid fill for line/point polygon modes)")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -116,7 +121,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+           properties.deviceName);
+       return nullptr;
+     }
+-    if (!supported_features.vertexPipelineStoresAndAtomics) {
++    if (REXCVAR_GET(vulkan_require_vertex_pipeline_stores_and_atomics) &&
++        !supported_features.vertexPipelineStoresAndAtomics) {
+       REXLOG_WARN(
+           "Vulkan device '{}' doesn't support vertexPipelineStoresAndAtomics, which "
+           "is required for Vulkan GPU emulation parity",
+diff --git a/src/ui/window_sdl.cpp b/src/ui/window_sdl.cpp
+index 2251429..c842eb6 100644
+--- a/src/ui/window_sdl.cpp
++++ b/src/ui/window_sdl.cpp
+@@ -35,6 +35,8 @@
+ #include <SDL3/SDL_metal.h>
+ 
+ #include <rex/ui/surface_mac.h>
++#elif REX_PLATFORM_ANDROID
++#include <rex/ui/surface_android.h>
+ #else
+ #include <X11/Xlib-xcb.h>
+ #include <rex/ui/surface_gnulinux.h>
+@@ -398,6 +400,15 @@ std::unique_ptr<Surface> WindowSDL::CreateSurfaceImpl(Surface::TypeFlags allowed
+       SDL_Metal_DestroyView(metal_view);
+     }
+   }
++#elif REX_PLATFORM_ANDROID
++  SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
++  if (allowed_types & Surface::kTypeFlag_AndroidNativeWindow) {
++    auto* native_window = static_cast<ANativeWindow*>(
++        SDL_GetPointerProperty(props, SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr));
++    if (native_window) {
++      return std::make_unique<AndroidNativeWindowSurface>(native_window);
++    }
++  }
+ #else
+   SDL_PropertiesID props = SDL_GetWindowProperties(sdl_window_);
+   if (allowed_types & Surface::kTypeFlag_WaylandSurface) {

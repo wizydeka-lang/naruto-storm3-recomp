@@ -1,0 +1,127 @@
+plugins {
+    id 'com.android.application'
+}
+
+def home = System.getenv('HOME')
+def rexglueSdk = file(providers.gradleProperty('rexglueSdk').getOrElse("${home}/rexglue-sdk"))
+def androidNdk = file(providers.gradleProperty('androidNdk')
+        .orElse(providers.environmentVariable('ANDROID_NDK_HOME'))
+        .getOrElse("${home}/Android/android-ndk-r30"))
+def sdlJava = new File(rexglueSdk, 'thirdparty/sdl3/android-project/app/src/main/java')
+def sdkLibs = new File(rexglueSdk, 'out/install/android-arm64/lib')
+def gameBuild = rootProject.file('../out/build/android-arm64-release')
+def stagedLibs = layout.buildDirectory.dir('staged/jniLibs')
+def stagedAssets = layout.buildDirectory.dir('staged/assets')
+def stagedRes = layout.buildDirectory.dir('staged/res')
+
+android {
+    namespace = 'dev.narutorecomp'
+    compileSdk = 35
+    ndkPath = androidNdk.path
+    ndkVersion = '30.0.16248370'
+
+    defaultConfig {
+        applicationId = 'dev.narutorecomp'
+        minSdk = 26
+        targetSdk = 35
+        versionCode = 1
+        versionName = '0.1'
+        ndk {
+            abiFilters 'arm64-v8a'
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled = false
+            // Sideloaded test builds: sign with the local debug key.
+            signingConfig = signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    sourceSets {
+        main {
+            java.srcDirs += sdlJava
+            jniLibs.srcDirs = [stagedLibs]
+            assets.srcDirs = [stagedAssets]
+            // src/main/res, with the icon made from the game's art over the
+            // default one.
+            res.srcDirs = [stagedRes]
+        }
+    }
+
+    packaging {
+        jniLibs {
+            // Extract the libraries to nativeLibraryDir: the runtime loads the
+            // GPU plugin from there by path.
+            useLegacyPackaging = true
+        }
+    }
+
+    lint {
+        abortOnError = false
+    }
+}
+
+// The native libraries come from the CMake builds (see README.md), not from
+// Gradle: the game, the SDK runtime and GPU plugin, and the NDK's C++ library.
+def stageNativeLibs = tasks.register('stageNativeLibs', Copy) {
+    from(new File(gameBuild, 'libmain.so'))
+    from(new File(sdkLibs, 'librexruntime.so'))
+    from(new File(sdkLibs, 'librexgpu-xenos.so'))
+    from(new File(androidNdk,
+            'toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so'))
+    into(stagedLibs.map { it.dir('arm64-v8a') })
+    doFirst {
+        ['libmain.so': gameBuild, 'librexruntime.so': sdkLibs].each { name, dir ->
+            if (!new File(dir, name).exists()) {
+                throw new GradleException("${new File(dir, name)} is missing; build it first (see README.md).")
+            }
+        }
+    }
+}
+
+// The settings, and the shader cache built on the PC when there is one
+// (tools/build-shaders.py): the phone then compiles no shaders as it plays.
+// Both come from the local build, never from the repository.
+def stageAssets = tasks.register('stageAssets', Copy) {
+    from(rootProject.file('../config/naruto-performance.toml')) {
+        rename { 'naruto.toml' }
+    }
+    from(rootProject.file('../out/shaders/naruto_shaders.bin'))
+    into(stagedAssets)
+}
+
+// The resources, with the app icon made from the game's own box art
+// (assets/nxeart) when it and the desktop launcher's Python and Qt are there;
+// otherwise the default icon stays.
+def stageIcons = tasks.register('stageIcons') {
+    def script = rootProject.file('../tools/launcher/naruto_launcher.py')
+    def art = rootProject.file('../assets/nxeart')
+    def res = file('src/main/res')
+    inputs.dir(res)
+    inputs.files(script, art).optional()
+    outputs.dir(stagedRes)
+    doLast {
+        def staged = stagedRes.get().asFile
+        project.delete(staged)
+        project.copy { from res; into staged }
+        if (!art.exists()) {
+            return
+        }
+        def result = providers.exec {
+            commandLine 'python3', script.path, '--android-icons', staged.path
+            ignoreExitValue = true
+        }
+        logger.lifecycle(result.standardOutput.asText.get().trim())
+    }
+}
+
+tasks.named('preBuild') {
+    dependsOn stageNativeLibs, stageAssets, stageIcons
+}

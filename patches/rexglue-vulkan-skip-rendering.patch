@@ -1,0 +1,47 @@
+--- a/src/graphics/vulkan/command_processor.cpp	2026-11-02 17:45:00.835060035 +0800
++++ b/src/graphics/vulkan/command_processor.cpp	2026-11-02 17:45:00.817688331 +0800
+@@ -55,6 +55,10 @@
+                     "Read data written by memory export in shaders on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_skip_rendering, false, "GPU/Vulkan",
++                    "Process the command stream but draw, resolve and present nothing, for "
++                    "when another renderer draws the game");
++
+ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
+                     "When async shader compilation is enabled, skip presenting frames that "
+                     "used placeholder pipelines to avoid visible flashing")
+@@ -2295,6 +2299,11 @@
+     return;
+   }
+ 
++  if (REXCVAR_GET(vulkan_skip_rendering)) {
++    EndSubmission(true);
++    return;
++  }
++
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
+@@ -3600,6 +3609,10 @@
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(vulkan_skip_rendering)) {
++    return true;
++  }
++
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
+   auto draw_fail = [&](const char* stage) {
+@@ -4398,6 +4411,10 @@
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  if (REXCVAR_GET(vulkan_skip_rendering)) {
++    return true;
++  }
++
+   if (!BeginSubmission(true)) {
+     return false;
+   }

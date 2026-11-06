@@ -1,8 +1,13 @@
 # Clone ReXGlue at the revision this project was built against, apply the
-# project's SDK patches, then build and install it (Release and Debug) with
-# the Direct3D 12 backend. Run from an "x64 Native Tools" PowerShell session.
-# Usage: powershell -ExecutionPolicy Bypass -File tools\setup-sdk.ps1 [-SdkDir C:\dev\rexglue-sdk]
-param([string]$SdkDir = "C:\dev\rexglue-sdk")
+# project's SDK patches, then build and install it with the Vulkan backend,
+# which the game's native renderer needs. Run from an "x64 Native Tools"
+# PowerShell session (install-windows.bat does this for you).
+# Usage: powershell -ExecutionPolicy Bypass -File tools\setup-sdk.ps1 [-SdkDir C:\dev\rexglue-sdk] [-WithDebug]
+param(
+    [string]$SdkDir = "C:\dev\rexglue-sdk",
+    # Also build the Debug runtime (only needed for debugging the game).
+    [switch]$WithDebug
+)
 $ErrorActionPreference = "Stop"
 
 $SdkRevision = "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518"
@@ -58,9 +63,11 @@ if (-not (Test-Path "$FfxDir\sdk\include")) {
     Invoke-Checked git -C $FfxDir checkout -q FETCH_HEAD
 }
 
-Invoke-Checked cmake --preset win-amd64 -DREXGLUE_USE_D3D12=ON -DREXGLUE_USE_VULKAN=OFF `
+Invoke-Checked cmake --preset win-amd64 -DREXGLUE_USE_VULKAN=ON -DREXGLUE_USE_D3D12=OFF `
     -DREXGLUE_ENABLE_FIDELITYFX=OFF "-DREXGLUE_FIDELITYFX_SOURCE_DIR=$FfxDir"
-foreach ($config in "Release", "Debug") {
+$configs = @("Release")
+if ($WithDebug) { $configs += "Debug" }
+foreach ($config in $configs) {
     # Four jobs keeps compiler memory use reasonable on most machines.
     Invoke-Checked cmake --build out/build/win-amd64 --config $config --target install --parallel 4
 }
