@@ -15,6 +15,8 @@ An experimental native PC and Android port of the Xbox 360 game **Naruto Shippud
 
 Story mode and other modes have not been checked. Please [report problems](#reporting-problems) with your log file attached.
 
+> **Made with AI.** Most of this project's code was written by an AI assistant (Claude) under human direction and testing. See [AI usage disclaimer](#ai-usage-disclaimer).
+
 ## What you need
 
 - Your own Xbox 360 copy of the game, extracted to a folder.
@@ -330,6 +332,21 @@ The Android APK is published in [Releases](https://github.com/wizydeka-lang/naru
 | `docs/` | Development notes |
 
 Generated code (`generated/default/`) and build output (`out/`) are created on your machine and are not part of the repository.
+
+## AI usage disclaimer
+
+This project is openly made with AI assistance, and I'm fine with that. To be transparent about how much:
+
+- **Most of the code in this repository was written by AI.** [Claude](https://www.anthropic.com/claude) (Anthropic), through Claude Code, wrote nearly all of it: 43 of the first 44 commits are marked `Co-Authored-By: Claude`. That includes the native Vulkan renderer, the Android port and launcher, the online mode patch, the SDK patches, the build scripts, the Windows installer and most of this README.
+- **The person behind the project** chose what to build, ran and played the game on PC and phone, tested online matches between devices, reported what was broken, and made the decisions (including what to publish).
+- **The AI also did the debugging**: reading logs, attaching debuggers to find crashes, and reverse engineering the game's functions. Its findings were checked by running the game, not by a human code review of every line.
+- **Not AI-made here:** [ReXGlue](https://github.com/rexglue/rexglue-sdk), Xenia, XenonRecomp and the other projects in [Credits](#credits). This project only patches and uses them.
+
+What this means for you:
+
+- Expect bugs and rough edges. Code was accepted when the game worked, so parts of it may be odd, over-complicated or wrong in cases nobody tested.
+- Review before reusing code from here in your own project.
+- Bug reports and pull requests, AI-assisted or not, are welcome.
 
 ## Credits
 
