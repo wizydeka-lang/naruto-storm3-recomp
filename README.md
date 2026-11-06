@@ -331,6 +331,33 @@ The Android APK is published in [Releases](https://github.com/wizydeka-lang/naru
 
 Generated code (`generated/default/`) and build output (`out/`) are created on your machine and are not part of the repository.
 
+## Credits
+
+This port stands on the work of many people. Thank you all.
+
+### Recompilation
+
+- **[ReXGlue SDK](https://github.com/rexglue/rexglue-sdk)**: the static recompiler and runtime this whole project is built on. Founded by [Tom (crack)](https://github.com/tomcl7), with [Loreaxe](https://github.com/Loreaxe), [mystixor](https://github.com/Mystixor), [Graine25](https://github.com/Graine25), [Carlos Estrague (mrcmunir)](https://github.com/mrcmunir), [sanjay900](https://github.com/sanjay900), [Toby](https://github.com/TbyDtch), [Roxxsen](https://github.com/Roxxsen) and the whole ReXGlue community.
+- **[XenonRecomp](https://github.com/hedge-dev/XenonRecomp)** by the [hedge-dev](https://github.com/hedge-dev) team: pioneered modern Xbox 360 static recompilation. ReXGlue's code analysis and instruction translation are based on it.
+- **[XenosRecomp](https://github.com/hedge-dev/XenosRecomp)** by hedge-dev: the Xbox 360 shader recompiler used to build this project's shader cache (`tools/build-shaders.py`).
+- **[Unleashed Recompiled](https://github.com/hedge-dev/UnleashedRecomp)** by hedge-dev: proved that a full Xbox 360 game can become a polished native port, and showed how to release one responsibly.
+- **[Xenia](https://github.com/xenia-project/xenia)** by Ben Vanik and the Xenia team: the Xbox 360 emulator whose kernel, GPU and system research ReXGlue is built on. Neither ReXGlue nor this port would exist without it.
+- **[rexdex's recompiler](https://github.com/rexdex/recompiler)**: the original Xbox 360 static recompiler.
+- **[N64Recomp](https://github.com/N64Recomp/N64Recomp)** and **[Zelda 64: Recompiled](https://github.com/Zelda64Recomp/Zelda64Recomp)** by Wiseguy and contributors: inspiration for the recompilation scene as a whole.
+
+### Libraries and tools
+
+- [SDL3](https://www.libsdl.org/): windows, input and the Android app shell.
+- [Vulkan](https://www.vulkan.org/) headers and loader (Khronos), [Vulkan Memory Allocator](https://github.com/GPUOpen-LibrariesAndSDKs/VulkanMemoryAllocator) (AMD), [glslang](https://github.com/KhronosGroup/glslang) and [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools).
+- [AMD FidelityFX](https://gpuopen.com/fidelityfx-superresolution/) FSR 1 and CAS upscaling, and NVIDIA's FXAA 3.11 by Timothy Lottes (licenses in `third_party/`).
+- [FFmpeg](https://ffmpeg.org/), [Dear ImGui](https://github.com/ocornut/imgui), [fmt](https://github.com/fmtlib/fmt), [spdlog](https://github.com/gabime/spdlog), [toml++](https://github.com/marzer/tomlplusplus), [xxHash](https://github.com/Cyan4973/xxHash), [stb](https://github.com/nothings/stb) and the other libraries bundled with ReXGlue.
+- [extract-xiso](https://github.com/XboxDev/extract-xiso) for extracting the game disc.
+- The Xbox 360 homebrew, modding and preservation communities, whose research makes projects like this possible.
+
+### The game
+
+*Naruto Shippuden: Ultimate Ninja Storm 3 Full Burst* was developed by [CyberConnect2](https://www.cc2.co.jp/) and published by [Bandai Namco Entertainment](https://www.bandainamcoent.com/). *Naruto* was created by Masashi Kishimoto. This is an unofficial fan project, not affiliated with or endorsed by them. Please support the official releases.
+
 ## Legal
 
 This project includes no game code or assets. You must own the game and supply your own files. Do not share `assets/`, `generated/default/` or built executables, since they contain or are derived from the original game.
