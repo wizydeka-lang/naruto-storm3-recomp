@@ -168,7 +168,7 @@ cd android
 JAVA_HOME=~/Android/jdk-17 ANDROID_HOME=~/Android/sdk ./gradlew assembleRelease
 ```
 
-The APK is `android/app/build/outputs/apk/release/app-release.apk`. Add `-PpublicRelease=true` for an APK without the shader cache and box-art icon, as published in Releases. If you built the shader cache on the PC (`out/shaders/naruto_shaders.bin`), it goes into the APK, so the phone doesn't compile shaders while you play. The app icon is made from your game's box art.
+The APK is `android/app/build/outputs/apk/release/app-release.apk`. Add `-PpublicRelease=true` for an APK without the box-art icon, as published in Releases. Build the shader cache first (`python3 tools/build-shaders.py`): the phone cannot compile shaders, so an APK without `out/shaders/naruto_shaders.bin` plays sound over a black screen. If you built the shader cache on the PC (`out/shaders/naruto_shaders.bin`), it goes into the APK, so the phone doesn't compile shaders while you play. The app icon is made from your game's box art.
 
 ### Play
 
@@ -316,7 +316,7 @@ Search the existing issues first; adding your details to a matching issue helps 
 
 ## Downloads
 
-The Android APK is published in [Releases](https://github.com/wizydeka-lang/naruto-storm3-recomp/releases). Like other recompilation projects, it contains the recompiled program but **no game assets**: no textures, models, sounds, videos or shader data. The game files always come from your own copy, and only the one supported version is accepted. On Windows and Linux, the game is built on your machine (the Windows installer does it for you).
+The Android APK is published in [Releases](https://github.com/wizydeka-lang/naruto-storm3-recomp/releases). Like other recompilation projects, it contains the recompiled program and the game's recompiled shaders, but **no game assets**: no textures, models, sounds or videos. The game files always come from your own copy, and only the one supported version is accepted. On Windows and Linux, the game is built on your machine (the Windows installer does it for you).
 
 ## How the project is organised
 

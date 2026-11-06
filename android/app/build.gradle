@@ -13,9 +13,9 @@ def gameBuild = rootProject.file('../out/build/android-arm64-release')
 def stagedLibs = layout.buildDirectory.dir('staged/jniLibs')
 def stagedAssets = layout.buildDirectory.dir('staged/assets')
 def stagedRes = layout.buildDirectory.dir('staged/res')
-// -PpublicRelease=true: an APK for publishing. It leaves out everything made
-// from the game's data (the PC shader cache and the box-art icon); the game's
-// files still come from the user's own copy on the phone.
+// -PpublicRelease=true: an APK for publishing. It leaves out the icon made from
+// the game's box art. It keeps the shader cache: the native renderer cannot
+// compile shaders on the phone, so without it nothing is drawn.
 def publicRelease = providers.gradleProperty('publicRelease').getOrElse('false').toBoolean()
 // Release signing key, kept outside the repository:
 // -PreleaseKeystore=... -PreleaseKeyAlias=... and the passwords in
@@ -112,11 +112,15 @@ def stageAssets = tasks.register('stageAssets', Copy) {
     from(rootProject.file('../config/naruto-performance.toml')) {
         rename { 'naruto.toml' }
     }
-    if (!publicRelease) {
-        from(rootProject.file('../out/shaders/naruto_shaders.bin'))
-    }
+    from(rootProject.file('../out/shaders/naruto_shaders.bin'))
     into(stagedAssets)
-    doFirst { project.delete(stagedAssets) }
+    doFirst {
+        project.delete(stagedAssets)
+        if (publicRelease && !rootProject.file('../out/shaders/naruto_shaders.bin').exists()) {
+            throw new GradleException('out/shaders/naruto_shaders.bin is missing; run tools/build-shaders.py. '
+                    + 'Without it the published APK draws nothing.')
+        }
+    }
 }
 
 // The resources, with the app icon made from the game's own box art
