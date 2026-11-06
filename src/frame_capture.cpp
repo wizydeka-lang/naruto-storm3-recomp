@@ -3,6 +3,7 @@
 #include "frame_capture.h"
 
 #include "shader_library.h"
+#include "texture_decode.h"
 
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
@@ -447,6 +448,22 @@ native_view::VertexBinding BindVertices(const uint8_t* base, const VertexRange& 
 
 }  // namespace
 
+// The fingerprint of a texture's memory, once per frame for each texture.
+uint64_t TextureFingerprint(const uint8_t* base, const uint32_t fetch[6],
+                            native_view::FrameInfo& frame) {
+  static std::unordered_map<uint64_t, uint64_t> fingerprints;  // by fetch constant
+  static uint64_t frame_number = UINT64_MAX;
+  if (frame.number != frame_number) {
+    frame_number = frame.number;
+    fingerprints.clear();
+  }
+  auto [it, added] = fingerprints.try_emplace(XXH3_64bits(fetch, 6 * sizeof(uint32_t)));
+  if (added) {
+    it->second = texture_decode::Fingerprint(base, fetch);
+  }
+  return it->second;
+}
+
 bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& frame) {
   const auto& shaders = shader_library::Shaders();
   if (call.vertex_shader_index < 0 || (call.pixel_shader && call.pixel_shader_index < 0)) {
@@ -746,6 +763,7 @@ bool Capture(const uint8_t* base, const DrawCall& call, native_view::FrameInfo& 
         binding.fetch[w] = Load32(base, call.device + kDeviceFetchConstants + sampler * 24 + 4 * w);
       }
       if ((binding.fetch[0] & 3) == 2) {
+        binding.fingerprint = TextureFingerprint(base, binding.fetch, frame);
         frame.textures.push_back(binding);
       } else {
         static std::set<std::pair<int, uint8_t>> warned;

@@ -161,7 +161,11 @@ bool Load(const std::filesystem::path& game_data_root) {
   for (const char* name : {kLibraries[0], kLibraries[1]}) {
     ScanLibrary(game_data_root / "data" / "system" / (std::string(name) + "_xbox360.nsh"), name);
   }
-  g_runtime_dir = game_data_root.parent_path() / "out" / "shaders" / "runtime";
+  // NARUTO_OUT_DIR, as the native view's: by default out/ beside the game.
+  const char* out = std::getenv("NARUTO_OUT_DIR");
+  std::filesystem::path out_dir =
+      out && *out ? std::filesystem::path(out) : game_data_root.parent_path() / "out";
+  g_runtime_dir = out_dir / "shaders" / "runtime";
   std::error_code error;
   size_t runtime = 0;
   for (const auto& entry : std::filesystem::directory_iterator(g_runtime_dir, error)) {
@@ -175,8 +179,7 @@ bool Load(const std::filesystem::path& game_data_root) {
   REXLOG_INFO("[shader library] runtime: {} captured shaders", runtime);
   const char* cache = std::getenv("NARUTO_SHADER_CACHE");
   LoadCache(cache && *cache ? std::filesystem::path(cache)
-                            : game_data_root.parent_path() / "out" / "shaders" /
-                                  "naruto_shaders.bin");
+                            : out_dir / "shaders" / "naruto_shaders.bin");
   return !g_shaders.empty();
 }
 

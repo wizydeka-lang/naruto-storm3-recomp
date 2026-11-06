@@ -1,0 +1,6 @@
+# Patches must reach git apply byte for byte, even with core.autocrlf=true.
+*.patch -text
+*.sh text eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+gradlew text eol=lf

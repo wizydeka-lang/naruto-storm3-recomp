@@ -3,14 +3,24 @@
 // A second window, presented with Vulkan by the native renderer. Enabled
 // with NARUTO_NATIVE_VIEW=1 in the environment; tools/run-radeon.sh
 // --native-only also stops the Xenia GPU backend drawing, leaving it only the
-// command stream.
+// command stream, and hides the game's own window (NARUTO_NATIVE_VIEW_ONLY=1).
 //
 // The game's draws, clears and resolves are captured as they happen
 // (frame_capture.h) and replayed here with the precompiled shaders, pass by
 // pass. The view shows the frame the game presents; with its window focused,
-// Left and Right show a pass's render target instead, Home returns to the
-// presented frame, and F12 (or Back+R3 on a controller) saves a snapshot
-// (below).
+// Ctrl+Left and Ctrl+Right show a pass's render target instead, Ctrl+Home
+// returns to the presented frame, F11 switches fullscreen and F12 (or Back+R3
+// on a controller) saves a snapshot (below). It renders at 1.5 times the
+// game's resolution (1080p from 720p); NARUTO_NATIVE_VIEW_SCALE sets another
+// factor, 1 for the game's own. The window opens that size where the screen
+// has room (NARUTO_NATIVE_VIEW_FULLSCREEN=1 opens it fullscreen). The frame
+// is shown at 16:9, as the 360 stretches it to a TV; NARUTO_NATIVE_VIEW_ASPECT
+// sets another shape ("21:9") or "fill" for the window's. Where it is
+// larger than the frame, AMD FSR 1 scales the frame up to it;
+// NARUTO_NATIVE_VIEW_UPSCALER=cas uses AMD CAS instead and linear a plain
+// stretch, and NARUTO_NATIVE_VIEW_SHARPNESS (0 to 1, default 0.9) sets how
+// much they sharpen. NARUTO_NATIVE_VIEW_FXAA=1 smooths edges with FXAA first.
+// tools/launcher sets these.
 //
 // Debugging: NARUTO_NATIVE_VIEW_DUMP=n logs the shown pass's draws in the
 // n-th frame; NARUTO_NATIVE_VIEW_DEBUG bits turn off depth testing (1) and
@@ -20,7 +30,9 @@
 // does the same for the current frame (into out/snapshots without SNAPSHOTS)
 // and logs all its draws. NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS=p also saves pass
 // p after each of its draws (pass<p>_draw<k>_rt<0|1>.ppm, its first two color
-// targets, k in the logged order).
+// targets, k in the logged order). NARUTO_NATIVE_VIEW_DECOMPRESS=1
+// decompresses DXT textures on the CPU, as on phone GPUs, which can't sample
+// them.
 
 #pragma once
 
@@ -60,6 +72,9 @@ struct VertexAttribute {
 struct TextureBinding {
   uint32_t sampler;
   uint32_t fetch[6];
+  // texture_decode::Fingerprint of its memory when the game drew with it;
+  // the view decodes the texture only while its memory still matches.
+  uint64_t fingerprint = 0;
 };
 
 struct Draw {

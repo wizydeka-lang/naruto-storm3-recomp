@@ -1,0 +1,2140 @@
+diff --git a/include/rex/kernel/xam/netplay.h b/include/rex/kernel/xam/netplay.h
+new file mode 100644
+index 0000000..5b85075
+--- /dev/null
++++ b/include/rex/kernel/xam/netplay.h
+@@ -0,0 +1,126 @@
++/**
++ * @file        rex/kernel/xam/netplay.h
++ * @brief       Online play without Xbox Live
++ *
++ * With the netplay cvar on, player 1 is reported as signed in to Xbox Live,
++ * so a game's online modes open, and Live's matchmaking is replaced by a
++ * small peer-to-peer lobby:
++ *
++ * - Each copy has a unique online XUID and title address (XNADDR) holding
++ *   its real IPv4 address, so the game's XNADDR to IN_ADDR lookups give real
++ *   addresses and its own traffic goes straight between the two.
++ * - A copy hosting a session answers lobby queries (UDP, netplay_port) with
++ *   the session, the host's contexts and properties and its QoS data. A
++ *   session search asks netplay_peer and broadcasts on the local network.
++ * - The game's socket ports are moved up by netplay_port_offset (Xbox games
++ *   use ports below 1024, which need root elsewhere).
++ *
++ * Calls into networking, sessions and Live are logged with a [netplay]
++ * prefix.
++ */
++
++#pragma once
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include <fmt/format.h>
++
++#include <rex/hook.h>
++#include <rex/logging.h>
++#include <rex/system/flags.h>
++
++#define REX_NETPLAY_LOG(...)                                  \
++  do {                                                        \
++    if (REXCVAR_GET(netplay)) {                               \
++      REXKRNL_INFO("[netplay] {}", fmt::format(__VA_ARGS__)); \
++    }                                                         \
++  } while (0)
++
++// An unimplemented export that, with netplay on, logs its first six
++// arguments and caller instead of the usual stub warning. Like REX_STUB it
++// leaves r3 as it was.
++#define REX_EXPORT_NETPLAY_TRACE(name)                                                         \
++  extern "C" REX_FUNC(name) {                                                                  \
++    (void)base;                                                                                \
++    if (REXCVAR_GET(netplay)) {                                                                \
++      REXKRNL_INFO("[netplay] {}({:08X}, {:08X}, {:08X}, {:08X}, {:08X}, {:08X}) from {:08X}", \
++                   #name, ctx.r3.u32, ctx.r4.u32, ctx.r5.u32, ctx.r6.u32, ctx.r7.u32,           \
++                   ctx.r8.u32, uint32_t(ctx.lr));                                              \
++    } else {                                                                                   \
++      REXKRNL_WARN("{} STUB", #name);                                                          \
++    }                                                                                          \
++  }                                                                                            \
++  static rex::ppc::detail::PPCFuncRegistrar _ppc_reg_##name(#name, &name);
++
++namespace rex::kernel::xam::netplay {
++
++// Guest structure sizes: XNADDR, XNKID, XNKEY and XSESSION_INFO (an XNKID,
++// the host's XNADDR and an XNKEY).
++constexpr size_t kXnAddrSize = 36;
++constexpr size_t kXnKidSize = 8;
++constexpr size_t kXnKeySize = 16;
++constexpr size_t kSessionInfoSize = kXnKidSize + kXnAddrSize + kXnKeySize;
++
++inline bool Enabled() {
++  return REXCVAR_GET(netplay);
++}
++
++// This copy's IPv4 address (host order), as the peer reaches it.
++uint32_t LocalIp();
++// This copy's XNADDR, as the guest lays it out.
++void FillXnAddr(uint8_t* xnaddr);
++// The IPv4 address (host order) in a guest XNADDR.
++uint32_t XnAddrIp(const uint8_t* xnaddr);
++// This copy's online XUID: unique per run, for sessions and the game's own
++// traffic (saves stay under the profile's own XUID).
++uint64_t OnlineXuid();
++// A 64-bit value no other copy will pick, for session ids, keys and nonces.
++uint64_t Random64();
++
++// The host socket port for a guest one, and back.
++uint16_t HostPort(uint16_t guest_port);
++uint16_t GuestPort(uint16_t host_port);
++
++// Player 1's contexts and properties (XUserSetContext / XUserSetProperty),
++// which a hosted session advertises. Property values are as the guest
++// stores them (big-endian).
++void SetContext(uint32_t id, uint32_t value);
++void SetProperty(uint32_t id, const uint8_t* value, uint32_t size);
++// Data the host attached with XNetQosListen.
++void SetQosData(const uint8_t* data, uint32_t size);
++
++struct Property {
++  uint32_t id = 0;
++  std::vector<uint8_t> value;  // big-endian, as the guest stores it
++};
++
++// A session, as hosted here or as found by a search.
++struct Session {
++  uint8_t info[kSessionInfoSize] = {};  // XSESSION_INFO, guest layout
++  uint32_t flags = 0;
++  uint32_t max_public = 0, max_private = 0;
++  uint32_t filled_public = 0, filled_private = 0;
++  std::vector<std::pair<uint32_t, uint32_t>> contexts;
++  std::vector<Property> properties;
++  std::vector<uint8_t> qos;
++};
++
++// Starts advertising a session (replacing any other), updates how many
++// slots it has filled, or stops.
++void Host(const Session& session);
++void SetFilledSlots(uint32_t filled_public, uint32_t filled_private);
++void StopHosting();
++
++// Sessions hosted by netplay_peer or on the local network, waiting up to
++// about a second for answers.
++std::vector<Session> Search();
++// The QoS data of a session found by the last search, by its host address.
++bool FoundQosData(uint32_t host_ip, std::vector<uint8_t>* data);
++
++// XNADDRs seen (searches, lookups), to map IN_ADDRs back to them.
++void RememberXnAddr(const uint8_t* xnaddr);
++bool XnAddrForIp(uint32_t ip, uint8_t* xnaddr);
++
++}  // namespace rex::kernel::xam::netplay
+diff --git a/include/rex/system/flags.h b/include/rex/system/flags.h
+index 902bffd..eec980f 100644
+--- a/include/rex/system/flags.h
++++ b/include/rex/system/flags.h
+@@ -14,6 +14,7 @@
+ #include <rex/cvar.h>
+ 
+ REXCVAR_DECLARE(bool, headless);
++REXCVAR_DECLARE(bool, netplay);
+ REXCVAR_DECLARE(bool, log_high_frequency_kernel_calls);
+ REXCVAR_DECLARE(uint32_t, license_mask);
+ REXCVAR_DECLARE(uint32_t, user_country);
+diff --git a/include/rex/system/xam/user_profile.h b/include/rex/system/xam/user_profile.h
+index ec37017..7023f91 100644
+--- a/include/rex/system/xam/user_profile.h
++++ b/include/rex/system/xam/user_profile.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <rex/system/flags.h>
+ #include <memory>
+ #include <string>
+ #include <unordered_map>
+@@ -218,7 +219,8 @@ class UserProfile {
+ 
+   uint64_t xuid() const { return xuid_; }
+   std::string name() const { return name_; }
+-  uint32_t signin_state() const { return 1; }
++  // 1: signed in locally; 2: signed in to Xbox Live (with netplay on).
++  uint32_t signin_state() const { return REXCVAR_GET(netplay) ? 2 : 1; }
+   uint32_t type() const { return 1 | 2; /* local | online profile? */ }
+ 
+   void set_kernel_state(KernelState* ks) { kernel_state_ = ks; }
+diff --git a/src/kernel/CMakeLists.txt b/src/kernel/CMakeLists.txt
+index 984b97d..4c8dd75 100644
+--- a/src/kernel/CMakeLists.txt
++++ b/src/kernel/CMakeLists.txt
+@@ -14,6 +14,7 @@ set(REXKERNEL_SOURCES
+     xam/xam_locale.cpp
+     xam/xam_msg.cpp
+     xam/xam_net.cpp
++    xam/netplay.cpp
+     xam/xam_notify.cpp
+     xam/xam_nui.cpp
+     xam/xam_party.cpp
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index 2b222da..f762073 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -10,6 +10,13 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xgi_app.h>
++
++#include <algorithm>
++#include <map>
++#include <mutex>
++#include <vector>
++
++#include <rex/kernel/xam/netplay.h>
+ #include <rex/logging.h>
+ #include <rex/thread.h>
+ 
+@@ -23,6 +30,141 @@ using namespace rex::system;
+ 
+ XgiApp::XgiApp(KernelState* kernel_state) : App(kernel_state, 0xFB) {}
+ 
++namespace {
++
++namespace np = rex::kernel::xam::netplay;
++
++// With netplay on: the sessions this copy has created or joined, by the
++// object XamSessionRefObjByHandle gave for each.
++struct LocalSession {
++  np::Session session;
++  bool host = false;
++  uint64_t nonce = 0;
++  uint32_t state = 0;  // XSESSION_STATE: lobby, registration, in game, reporting
++  uint32_t members = 0;
++  std::vector<uint64_t> remote_xuids;
++};
++std::mutex sessions_mutex;
++std::map<uint32_t, LocalSession> sessions;
++std::vector<np::Session> found_sessions;
++std::map<uint32_t, uint32_t> user_contexts;
++
++constexpr uint32_t kSearchResultSize = 92;  // XSESSION_SEARCHRESULT
++constexpr uint32_t kPropertySize = 24;      // XUSER_PROPERTY
++constexpr uint32_t kContextSize = 8;        // XUSER_CONTEXT
++constexpr uint32_t kLocalDetailsSize = 128;  // XSESSION_LOCAL_DETAILS
++constexpr uint32_t kMemberSize = 16;         // XSESSION_MEMBER
++
++// Advertises the hosted session searches should find: the latest one using
++// matchmaking (XSESSION_CREATE_USES_MATCHMAKING), else the latest hosted.
++// sessions_mutex is held.
++void Advertise() {
++  const LocalSession* best = nullptr;
++  for (const auto& [object, local] : sessions) {
++    if (local.host && (!best || (local.session.flags & 8) >= (best->session.flags & 8))) {
++      best = &local;
++    }
++  }
++  if (!best) {
++    np::StopHosting();
++    return;
++  }
++  np::Session advertised = best->session;
++  advertised.filled_public = std::min(best->members, advertised.max_public);
++  np::Host(advertised);
++}
++
++// The numeric properties a search result can carry (strings and binary
++// data would need more room).
++bool NumericProperty(const np::Property& property) {
++  uint32_t type = property.id >> 28;
++  return (type == 1 || type == 2 || type == 3 || type == 5 || type == 7) &&
++         property.value.size() <= 8;
++}
++
++uint32_t ResultExtraSize(const np::Session& session) {
++  uint32_t properties = uint32_t(std::count_if(session.properties.begin(),
++                                               session.properties.end(), NumericProperty));
++  return properties * kPropertySize + uint32_t(session.contexts.size()) * kContextSize;
++}
++
++// XSessionSearch: asks the lobby, then writes an XSESSION_SEARCHRESULT_HEADER
++// and the sessions with open slots at results_ptr. Without room, stores the
++// size needed in the message (its results size field) instead.
++X_HRESULT SearchSessions(memory::Memory* memory, uint8_t* size_field, uint32_t max_results,
++                         uint32_t results_size, uint32_t results_ptr) {
++  std::vector<np::Session> found;
++  for (np::Session& session : np::Search()) {
++    if (session.filled_public < session.max_public && found.size() < max_results) {
++      found.push_back(std::move(session));
++    }
++  }
++  {
++    std::lock_guard<std::mutex> lock(sessions_mutex);
++    found_sessions = found;
++  }
++  uint32_t needed = 8;
++  for (const np::Session& session : found) {
++    needed += kSearchResultSize + ResultExtraSize(session);
++  }
++  if (!results_ptr || results_size < 8) {
++    memory::store_and_swap<uint32_t>(size_field, std::max<uint32_t>(needed, 8 + kSearchResultSize));
++    REX_NETPLAY_LOG("XSessionSearch: {} found, needs {} bytes", found.size(), needed);
++    return X_ERROR_INSUFFICIENT_BUFFER;
++  }
++  // As many results as fit.
++  uint32_t count = 0, used = 8;
++  while (count < found.size() &&
++         used + kSearchResultSize + ResultExtraSize(found[count]) <= results_size) {
++    used += kSearchResultSize + ResultExtraSize(found[count]);
++    ++count;
++  }
++  uint8_t* header = memory->TranslateVirtual<uint8_t*>(results_ptr);
++  std::memset(header, 0, used);
++  uint32_t results = results_ptr + 8;
++  uint32_t extra = results + count * kSearchResultSize;
++  memory::store_and_swap<uint32_t>(header + 0, count);
++  memory::store_and_swap<uint32_t>(header + 4, count ? results : 0);
++  for (uint32_t i = 0; i < count; ++i) {
++    const np::Session& session = found[i];
++    uint8_t* result = memory->TranslateVirtual<uint8_t*>(results + i * kSearchResultSize);
++    std::memcpy(result, session.info, np::kSessionInfoSize);
++    memory::store_and_swap<uint32_t>(result + 60, session.max_public - session.filled_public);
++    memory::store_and_swap<uint32_t>(
++        result + 64, session.max_private - std::min(session.filled_private, session.max_private));
++    memory::store_and_swap<uint32_t>(result + 68, session.filled_public);
++    memory::store_and_swap<uint32_t>(result + 72, session.filled_private);
++    uint32_t properties_ptr = extra, property_count = 0;
++    for (const np::Property& property : session.properties) {
++      if (!NumericProperty(property)) {
++        continue;
++      }
++      uint8_t* out = memory->TranslateVirtual<uint8_t*>(extra);
++      memory::store_and_swap<uint32_t>(out + 0, property.id);
++      out[8] = uint8_t(property.id >> 28);  // XUSER_DATA type
++      std::memcpy(out + 16, property.value.data(), property.value.size());
++      extra += kPropertySize;
++      ++property_count;
++    }
++    uint32_t contexts_ptr = extra;
++    for (const auto& [id, value] : session.contexts) {
++      uint8_t* out = memory->TranslateVirtual<uint8_t*>(extra);
++      memory::store_and_swap<uint32_t>(out + 0, id);
++      memory::store_and_swap<uint32_t>(out + 4, value);
++      extra += kContextSize;
++    }
++    memory::store_and_swap<uint32_t>(result + 76, property_count);
++    memory::store_and_swap<uint32_t>(result + 80, uint32_t(session.contexts.size()));
++    memory::store_and_swap<uint32_t>(result + 84, property_count ? properties_ptr : 0);
++    memory::store_and_swap<uint32_t>(result + 88, session.contexts.empty() ? 0 : contexts_ptr);
++  }
++  REX_NETPLAY_LOG("XSessionSearch: returned {} of {} sessions ({} bytes of {})", count,
++                  found.size(), used, results_size);
++  return X_E_SUCCESS;
++}
++
++}  // namespace
++
+ // http://mb.mirage.org/bugzilla/xliveless/main.c
+ 
+ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+@@ -42,6 +184,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint32_t context_value = memory::load_and_swap<uint32_t>(buffer + 20);
+       REXKRNL_DEBUG("XGIUserSetContextEx({:08X}, {:08X}, {:08X})", user_index, context_id,
+                     context_value);
++      if (np::Enabled() && user_index == 0) {
++        np::SetContext(context_id, context_value);
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        user_contexts[context_id] = context_value;
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0007: {
+@@ -51,6 +198,9 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint32_t value_ptr = memory::load_and_swap<uint32_t>(buffer + 24);
+       REXKRNL_DEBUG("XGIUserSetPropertyEx({:08X}, {:08X}, {}, {:08X})", user_index, property_id,
+                     value_size, value_ptr);
++      if (np::Enabled() && user_index == 0 && value_ptr) {
++        np::SetProperty(property_id, memory_->TranslateVirtual<uint8_t*>(value_ptr), value_size);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0008: {
+@@ -113,6 +263,50 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+           "{:08X})",
+           session_ptr, flags, num_slots_public, num_slots_private, user_xuid, session_info_ptr,
+           nonce_ptr);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        LocalSession& local = sessions[session_ptr];
++        local = {};
++        local.host = flags & 1;  // XSESSION_CREATE_HOST
++        local.session.flags = flags;
++        local.session.max_public = num_slots_public;
++        local.session.max_private = num_slots_private;
++        local.nonce = np::Random64();
++        uint8_t* info =
++            session_info_ptr ? memory_->TranslateVirtual<uint8_t*>(session_info_ptr) : nullptr;
++        if (local.host) {
++          // A new XNKID (an online peer's), this copy's XNADDR and an XNKEY.
++          uint8_t* out = local.session.info;
++          uint64_t id = np::Random64();
++          std::memcpy(out, &id, np::kXnKidSize);
++          out[0] = uint8_t((out[0] & 0x0F) | 0x80);
++          np::FillXnAddr(out + np::kXnKidSize);
++          uint64_t key[2] = {np::Random64(), np::Random64()};
++          std::memcpy(out + np::kXnKidSize + np::kXnAddrSize, key, np::kXnKeySize);
++          if (info) {
++            std::memcpy(info, out, np::kSessionInfoSize);
++          }
++        } else if (info) {
++          // Joining: the session a search found. Games create their copy with
++          // only their own players' slots, but Live reports the host's session,
++          // and games size their player tables from its slot counts.
++          std::memcpy(local.session.info, info, np::kSessionInfoSize);
++          for (const np::Session& found : found_sessions) {
++            if (std::memcmp(found.info, info, np::kXnKidSize) == 0) {
++              local.session.filled_public = found.filled_public;
++              local.session.max_public = std::max(num_slots_public, found.max_public);
++              local.session.max_private = std::max(num_slots_private, found.max_private);
++            }
++          }
++        }
++        if (nonce_ptr) {
++          memory::store_and_swap<uint64_t>(memory_->TranslateVirtual(nonce_ptr), local.nonce);
++        }
++        Advertise();
++        REX_NETPLAY_LOG("XSessionCreate({:08X}, flags {:08X}, {} public / {} private slots) as {}",
++                        session_ptr, flags, num_slots_public, num_slots_private,
++                        local.host ? "host" : "client");
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0011: {
+@@ -123,6 +317,12 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
+ 
+       REXKRNL_DEBUG("XGISessionDelete({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        sessions.erase(obj_ptr);
++        Advertise();
++        REX_NETPLAY_LOG("XSessionDelete({:08X})", obj_ptr);
++      }
+ 
+       return X_E_SUCCESS;
+     }
+@@ -138,6 +338,66 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("{}({:08X}, {}, {}, {:08X}, {:08X})",
+                     is_local ? "XGISessionJoinLocal" : "XGISessionJoinRemote", session_ptr,
+                     user_count, xuid_array_ptr, user_index_array, private_slots_array);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        LocalSession& local = sessions[session_ptr];
++        local.members += user_count;
++        for (uint32_t i = 0; !is_local && i < std::min<uint32_t>(user_count, 16); ++i) {
++          local.remote_xuids.push_back(memory::load_and_swap<uint64_t>(
++              memory_->TranslateVirtual(xuid_array_ptr + 8 * i)));
++        }
++        Advertise();
++        REX_NETPLAY_LOG("XSessionJoin{}({:08X}, {} users) -> {} members",
++                        is_local ? "Local" : "Remote", session_ptr, user_count, local.members);
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x000B0013: {
++      // XSessionLeaveLocal / XSessionLeaveRemote, laid out as a join.
++      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
++      uint32_t user_count = memory::load_and_swap<uint32_t>(buffer + 4);
++      uint32_t xuid_array_ptr = memory::load_and_swap<uint32_t>(buffer + 8);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        LocalSession& local = sessions[session_ptr];
++        local.members -= std::min(local.members, user_count);
++        for (uint32_t i = 0; xuid_array_ptr && i < std::min<uint32_t>(user_count, 16); ++i) {
++          uint64_t xuid =
++              memory::load_and_swap<uint64_t>(memory_->TranslateVirtual(xuid_array_ptr + 8 * i));
++          auto& xuids = local.remote_xuids;
++          xuids.erase(std::remove(xuids.begin(), xuids.end(), xuid), xuids.end());
++        }
++        Advertise();
++        REX_NETPLAY_LOG("XSessionLeave({:08X}, {} users) -> {} members", session_ptr, user_count,
++                        local.members);
++      }
++      return X_E_SUCCESS;
++    }
++    case 0x000B0018: {
++      // XSessionModify(session, flags, public slots, private slots). A joining
++      // copy keeps at least the host's slot counts (see XSessionCreate).
++      uint32_t session_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
++      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
++      uint32_t max_public = memory::load_and_swap<uint32_t>(buffer + 8);
++      uint32_t max_private = memory::load_and_swap<uint32_t>(buffer + 12);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        auto it = sessions.find(session_ptr);
++        if (it != sessions.end()) {
++          np::Session& session = it->second.session;
++          if (it->second.host) {
++            session.max_public = max_public;
++            session.max_private = max_private;
++          } else {
++            session.max_public = std::max(session.max_public, max_public);
++            session.max_private = std::max(session.max_private, max_private);
++          }
++          Advertise();
++          REX_NETPLAY_LOG("XSessionModify({:08X}, flags {:08X}, {} public / {} private) -> {}/{}",
++                          session_ptr, flags, max_public, max_private, session.max_public,
++                          session.max_private);
++        }
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B0014: {
+@@ -148,6 +408,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
+ 
+       REXKRNL_DEBUG("XSessionStart({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        sessions[obj_ptr].state = 2;  // XSESSION_STATE_INGAME
++        REX_NETPLAY_LOG("XSessionStart({:08X})", obj_ptr);
++      }
+ 
+       return X_STATUS_SUCCESS;
+     }
+@@ -160,6 +425,11 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       uint64_t session_nonce = memory::load_and_swap<uint64_t>(buffer + 8);
+ 
+       REXKRNL_DEBUG("XSessionEnd({:08X}, {:08X}, {:016X})", obj_ptr, flags, session_nonce);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        sessions[obj_ptr].state = 0;  // back in the lobby
++        REX_NETPLAY_LOG("XSessionEnd({:08X})", obj_ptr);
++      }
+ 
+       return X_E_SUCCESS;
+     }
+@@ -179,19 +449,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XSessionSearch({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X})", proc_index,
+                     user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                     results_buffer_size, search_results_ptr);
+-      return X_E_SUCCESS;
+-    }
+-    case 0x000B0018: {
+-      assert_true(!buffer_length || buffer_length == 16);
+-
+-      uint32_t obj_ptr = memory::load_and_swap<uint32_t>(buffer + 0);
+-      uint32_t flags = memory::load_and_swap<uint32_t>(buffer + 4);
+-      uint32_t maxPublicSlots = memory::load_and_swap<uint32_t>(buffer + 8);
+-      uint16_t maxPrivateSlots = memory::load_and_swap<uint16_t>(buffer + 12);
+-
+-      REXKRNL_DEBUG("XSessionModify({:08X}, {:08X}, {:08X}, {:08X})", obj_ptr, flags,
+-                    maxPublicSlots, maxPrivateSlots);
+-
++      if (np::Enabled()) {
++        return SearchSessions(memory_, buffer + 24, num_results, results_buffer_size,
++                              search_results_ptr);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B001C: {
+@@ -213,7 +474,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XSessionSearchEx({}, {}, {}, {}, {}, {:08X}, {:08X}, {}, {:08X}, {})",
+                     proc_index, user_index, num_results, num_props, num_ctx, props_ptr, ctx_ptr,
+                     results_buffer_size, search_results_ptr, num_users);
+-
++      if (np::Enabled()) {
++        return SearchSessions(memory_, buffer + 24, num_results, results_buffer_size,
++                              search_results_ptr);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x000B001D: {
+@@ -228,6 +492,53 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       REXKRNL_DEBUG("XSessionGetDetails({:08X}, {}, {:08X}, {}, {}, {})", obj_ptr,
+                     details_buffer_size, session_details_ptr, reserved1, reserved2, reserved3);
++      if (np::Enabled()) {
++        std::lock_guard<std::mutex> lock(sessions_mutex);
++        auto it = sessions.find(obj_ptr);
++        if (it == sessions.end()) {
++          REX_NETPLAY_LOG("XSessionGetDetails({:08X}): no such session", obj_ptr);
++          return X_E_FAIL;
++        }
++        const LocalSession& local = it->second;
++        std::vector<uint64_t> members = {np::OnlineXuid()};
++        members.insert(members.end(), local.remote_xuids.begin(), local.remote_xuids.end());
++        uint32_t needed = kLocalDetailsSize + uint32_t(members.size()) * kMemberSize;
++        if (!session_details_ptr || details_buffer_size < needed) {
++          memory::store_and_swap<uint32_t>(buffer + 4, needed);
++          REX_NETPLAY_LOG("XSessionGetDetails({:08X}): needs {} bytes, has {}", obj_ptr, needed,
++                          details_buffer_size);
++          return X_ERROR_INSUFFICIENT_BUFFER;
++        }
++        uint8_t* out = memory_->TranslateVirtual<uint8_t*>(session_details_ptr);
++        std::memset(out, 0, needed);
++        auto context = [&](uint32_t id) {
++          auto found = user_contexts.find(id);
++          return found == user_contexts.end() ? 0u : found->second;
++        };
++        const np::Session& session = local.session;
++        uint32_t filled = std::max<uint32_t>(local.members, uint32_t(members.size()));
++        memory::store_and_swap<uint32_t>(out + 0, local.host ? 0 : 0xFE);  // XUSER_INDEX_NONE
++        memory::store_and_swap<uint32_t>(out + 4, context(0x800A));  // X_CONTEXT_GAME_TYPE
++        memory::store_and_swap<uint32_t>(out + 8, context(0x800B));  // X_CONTEXT_GAME_MODE
++        memory::store_and_swap<uint32_t>(out + 12, session.flags);
++        memory::store_and_swap<uint32_t>(out + 16, session.max_public);
++        memory::store_and_swap<uint32_t>(out + 20, session.max_private);
++        memory::store_and_swap<uint32_t>(out + 24,
++                                         session.max_public - std::min(filled, session.max_public));
++        memory::store_and_swap<uint32_t>(out + 28, session.max_private);
++        memory::store_and_swap<uint32_t>(out + 32, filled);
++        memory::store_and_swap<uint32_t>(out + 36, uint32_t(members.size()));
++        memory::store_and_swap<uint32_t>(out + 40, local.state);
++        memory::store_and_swap<uint64_t>(out + 48, local.nonce);
++        std::memcpy(out + 56, session.info, np::kSessionInfoSize);
++        memory::store_and_swap<uint32_t>(out + 124, session_details_ptr + kLocalDetailsSize);
++        for (size_t i = 0; i < members.size(); ++i) {
++          uint8_t* member = out + kLocalDetailsSize + i * kMemberSize;
++          memory::store_and_swap<uint64_t>(member + 0, members[i]);
++          memory::store_and_swap<uint32_t>(member + 8, i == 0 ? 0 : 0xFE);
++        }
++        REX_NETPLAY_LOG("XSessionGetDetails({:08X}) -> {} members", obj_ptr, members.size());
++      }
+ 
+       return X_E_SUCCESS;
+     }
+diff --git a/src/kernel/xam/apps/xlivebase_app.cpp b/src/kernel/xam/apps/xlivebase_app.cpp
+index 3593403..8c2d679 100644
+--- a/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -77,6 +77,12 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       REXKRNL_DEBUG("XPresenceInitialize({:08X}, {:08X})", buffer_ptr, buffer_length);
+       return X_E_SUCCESS;
+     }
++    case 0x0005800E: {
++      // XUserMuteListQuery: is a remote player on this user's mute list?
++      // Nobody is. Games ask this about every player in an online session.
++      REXKRNL_DEBUG("XUserMuteListQuery({:08X}, {:08X})", buffer_ptr, buffer_length);
++      return X_E_SUCCESS;
++    }
+   }
+   REXKRNL_ERROR(
+       "Unimplemented XLIVEBASE message app={:08X}, msg={:08X}, arg1={:08X}, "
+diff --git a/src/kernel/xam/netplay.cpp b/src/kernel/xam/netplay.cpp
+new file mode 100644
+index 0000000..0da28f8
+--- /dev/null
++++ b/src/kernel/xam/netplay.cpp
+@@ -0,0 +1,464 @@
++/**
++ * @file        kernel/xam/netplay.cpp
++ * @brief       Online play without Xbox Live (see rex/kernel/xam/netplay.h)
++ */
++
++#include <rex/kernel/xam/netplay.h>
++
++#include <algorithm>
++#include <atomic>
++#include <chrono>
++#include <cstring>
++#include <mutex>
++#include <random>
++#include <thread>
++#include <unordered_map>
++
++#include <rex/cvar.h>
++#include <rex/platform.h>
++
++#if REX_PLATFORM_WIN32
++#include <winsock2.h>  // NOLINT(build/include_order)
++#include <ws2tcpip.h>  // NOLINT(build/include_order)
++using socket_t = SOCKET;
++#define NETPLAY_CLOSE closesocket
++#else
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <sys/time.h>
++#include <unistd.h>
++using socket_t = int;
++#define NETPLAY_CLOSE close
++#endif
++
++REXCVAR_DEFINE_BOOL(netplay, false, "Netplay",
++                    "Online play without Xbox Live: player 1 is signed in to Live and sessions "
++                    "are found through netplay_peer or the local network");
++REXCVAR_DEFINE_STRING(netplay_peer, "", "Netplay",
++                      "IPv4 address of the other player's machine, asked first when searching "
++                      "for sessions (sessions on the local network are found without it)");
++REXCVAR_DEFINE_UINT32(netplay_port, 36000, "Netplay",
++                      "UDP port where hosted sessions answer searches");
++REXCVAR_DEFINE_UINT32(netplay_port_offset, 36000, "Netplay",
++                      "Added to the game's own socket ports (Xbox games use ports below 1024)");
++
++namespace rex::kernel::xam::netplay {
++
++namespace {
++
++constexpr uint8_t kQuery[4] = {'N', 'R', 'Q', '1'};
++constexpr uint8_t kAnswer[4] = {'N', 'R', 'S', '1'};
++
++std::string IpText(uint32_t ip) {
++  return fmt::format("{}.{}.{}.{}", ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
++}
++
++uint32_t ParseIp(const std::string& text) {
++  in_addr address{};
++  if (text.empty() || inet_pton(AF_INET, text.c_str(), &address) != 1) {
++    return 0;
++  }
++  return ntohl(address.s_addr);
++}
++
++sockaddr_in SocketAddress(uint32_t ip, uint16_t port) {
++  sockaddr_in address{};
++  address.sin_family = AF_INET;
++  address.sin_addr.s_addr = htonl(ip);
++  address.sin_port = htons(port);
++  return address;
++}
++
++// Winsock must be started before the lobby's own sockets are opened, which can
++// happen before the guest calls WSAStartup. Extra calls are reference counted.
++socket_t OpenUdpSocket() {
++#if REX_PLATFORM_WIN32
++  static const bool started = [] {
++    WSADATA data{};
++    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
++  }();
++  (void)started;
++#endif
++  return socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++}
++
++void SetReceiveTimeout(socket_t s, int milliseconds) {
++#if REX_PLATFORM_WIN32
++  DWORD timeout = milliseconds;
++#else
++  timeval timeout{milliseconds / 1000, (milliseconds % 1000) * 1000};
++#endif
++  setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout),
++             sizeof(timeout));
++}
++
++// Big-endian writers and readers for the lobby messages.
++void Put16(std::vector<uint8_t>& out, uint16_t value) {
++  out.push_back(uint8_t(value >> 8));
++  out.push_back(uint8_t(value));
++}
++void Put32(std::vector<uint8_t>& out, uint32_t value) {
++  Put16(out, uint16_t(value >> 16));
++  Put16(out, uint16_t(value));
++}
++struct Reader {
++  const uint8_t* data;
++  size_t size, at = 0;
++  bool ok = true;
++  bool Take(void* out, size_t count) {
++    if (!ok || size - at < count) {
++      ok = false;
++      return false;
++    }
++    std::memcpy(out, data + at, count);
++    at += count;
++    return true;
++  }
++  uint16_t Get16() {
++    uint8_t b[2] = {};
++    Take(b, 2);
++    return uint16_t((b[0] << 8) | b[1]);
++  }
++  uint32_t Get32() {
++    uint32_t high = Get16();
++    return (high << 16) | Get16();
++  }
++};
++
++std::vector<uint8_t> Encode(const Session& session) {
++  std::vector<uint8_t> out(kAnswer, kAnswer + 4);
++  out.insert(out.end(), session.info, session.info + kSessionInfoSize);
++  Put32(out, session.flags);
++  Put32(out, session.max_public);
++  Put32(out, session.max_private);
++  Put32(out, session.filled_public);
++  Put32(out, session.filled_private);
++  Put16(out, uint16_t(session.contexts.size()));
++  for (const auto& [id, value] : session.contexts) {
++    Put32(out, id);
++    Put32(out, value);
++  }
++  Put16(out, uint16_t(session.properties.size()));
++  for (const Property& property : session.properties) {
++    Put32(out, property.id);
++    Put16(out, uint16_t(property.value.size()));
++    out.insert(out.end(), property.value.begin(), property.value.end());
++  }
++  Put16(out, uint16_t(session.qos.size()));
++  out.insert(out.end(), session.qos.begin(), session.qos.end());
++  return out;
++}
++
++bool Decode(const uint8_t* data, size_t size, Session* session) {
++  Reader in{data, size};
++  uint8_t magic[4];
++  if (!in.Take(magic, 4) || std::memcmp(magic, kAnswer, 4) != 0) {
++    return false;
++  }
++  in.Take(session->info, kSessionInfoSize);
++  session->flags = in.Get32();
++  session->max_public = in.Get32();
++  session->max_private = in.Get32();
++  session->filled_public = in.Get32();
++  session->filled_private = in.Get32();
++  for (uint16_t i = 0, n = in.Get16(); in.ok && i < n; ++i) {
++    uint32_t id = in.Get32();
++    session->contexts.emplace_back(id, in.Get32());
++  }
++  for (uint16_t i = 0, n = in.Get16(); in.ok && i < n; ++i) {
++    Property property;
++    property.id = in.Get32();
++    property.value.resize(in.Get16());
++    in.Take(property.value.data(), property.value.size());
++    session->properties.push_back(std::move(property));
++  }
++  session->qos.resize(in.Get16());
++  in.Take(session->qos.data(), session->qos.size());
++  return in.ok;
++}
++
++struct State {
++  std::mutex mutex;
++  bool hosting = false;
++  Session hosted;
++  std::vector<std::pair<uint32_t, uint32_t>> contexts;
++  std::vector<Property> properties;
++  std::vector<uint8_t> qos;
++  std::unordered_map<uint32_t, std::vector<uint8_t>> found_qos;      // by host IP
++  std::unordered_map<uint32_t, std::vector<uint8_t>> known_xnaddrs;  // by IP
++  std::atomic<bool> lobby_started{false};
++};
++
++State& state() {
++  static State* instance = new State;
++  return *instance;
++}
++
++// Answers lobby queries while netplay is on: with the hosted session, if any.
++void LobbyThread() {
++  socket_t s = OpenUdpSocket();
++  int yes = 1;
++  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, reinterpret_cast<const char*>(&yes), sizeof(yes));
++  setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&yes), sizeof(yes));
++  sockaddr_in address = SocketAddress(INADDR_ANY, uint16_t(REXCVAR_GET(netplay_port)));
++  if (bind(s, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
++    REXKRNL_ERROR("[netplay] lobby: can't use UDP port {}; others won't find sessions hosted here",
++                  REXCVAR_GET(netplay_port));
++    NETPLAY_CLOSE(s);
++    return;
++  }
++  REXKRNL_INFO("[netplay] lobby listening on UDP port {}, this machine is {}",
++               REXCVAR_GET(netplay_port), IpText(LocalIp()));
++  uint8_t buffer[2048];
++  for (;;) {
++    sockaddr_in from{};
++    socklen_t from_size = sizeof(from);
++    int received = int(recvfrom(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
++                                reinterpret_cast<sockaddr*>(&from), &from_size));
++    if (received < 4 || std::memcmp(buffer, kQuery, 4) != 0) {
++      continue;
++    }
++    std::vector<uint8_t> answer;
++    {
++      std::lock_guard<std::mutex> lock(state().mutex);
++      if (!state().hosting) {
++        continue;
++      }
++      Session session = state().hosted;
++      session.contexts = state().contexts;
++      session.properties = state().properties;
++      session.qos = state().qos;
++      answer = Encode(session);
++    }
++    sendto(s, reinterpret_cast<const char*>(answer.data()), int(answer.size()), 0,
++           reinterpret_cast<sockaddr*>(&from), from_size);
++    REXKRNL_INFO("[netplay] lobby: told {} about the session hosted here",
++                 IpText(ntohl(from.sin_addr.s_addr)));
++  }
++}
++
++void StartLobby() {
++  if (!state().lobby_started.exchange(true)) {
++    std::thread(LobbyThread).detach();
++  }
++}
++
++}  // namespace
++
++uint32_t LocalIp() {
++  static const uint32_t ip = [] {
++    // The address the system would send from towards the peer (or the
++    // internet): the interface the other player reaches, not a VPN's.
++    uint32_t target = ParseIp(REXCVAR_GET(netplay_peer));
++    if (!target) {
++      target = 0x08080808;
++    }
++    socket_t s = OpenUdpSocket();
++    sockaddr_in address = SocketAddress(target, 53);
++    uint32_t local = INADDR_LOOPBACK;
++    if (connect(s, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0) {
++      sockaddr_in name{};
++      socklen_t size = sizeof(name);
++      if (getsockname(s, reinterpret_cast<sockaddr*>(&name), &size) == 0) {
++        local = ntohl(name.sin_addr.s_addr);
++      }
++    }
++    NETPLAY_CLOSE(s);
++    return local;
++  }();
++  return ip;
++}
++
++uint64_t Random64() {
++  static std::mutex mutex;
++  static std::mt19937_64 generator{[] {
++    std::random_device device;
++    return (uint64_t(device()) << 32) ^ device() ^
++           uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
++  }()};
++  std::lock_guard<std::mutex> lock(mutex);
++  return generator();
++}
++
++uint64_t OnlineXuid() {
++  // Online XUIDs start 0009; bits 54-55 must stay clear.
++  static const uint64_t xuid = 0x0009000000000000ull | (Random64() & 0x0000FFFFFFFFFFFFull);
++  return xuid;
++}
++
++void FillXnAddr(uint8_t* xnaddr) {
++  StartLobby();
++  static const uint64_t machine = Random64();
++  uint32_t ip = htonl(LocalIp());
++  std::memset(xnaddr, 0, kXnAddrSize);
++  std::memcpy(xnaddr + 0, &ip, 4);  // ina
++  std::memcpy(xnaddr + 4, &ip, 4);  // inaOnline
++  uint16_t port = htons(uint16_t(REXCVAR_GET(netplay_port)));
++  std::memcpy(xnaddr + 8, &port, 2);  // wPortOnline
++  // abEnet: a locally administered MAC; abOnline: this copy's id.
++  xnaddr[10] = 0x02;
++  for (int i = 1; i < 6; ++i) {
++    xnaddr[10 + i] = uint8_t(machine >> (8 * i));
++  }
++  for (int i = 0; i < 8; ++i) {
++    xnaddr[16 + i] = uint8_t(machine >> (8 * i));
++  }
++  std::memcpy(xnaddr + 24, &ip, 4);
++}
++
++uint32_t XnAddrIp(const uint8_t* xnaddr) {
++  uint32_t ip;
++  std::memcpy(&ip, xnaddr, 4);
++  return ntohl(ip);
++}
++
++uint16_t HostPort(uint16_t guest_port) {
++  return guest_port ? uint16_t(guest_port + REXCVAR_GET(netplay_port_offset)) : 0;
++}
++
++uint16_t GuestPort(uint16_t host_port) {
++  uint32_t offset = REXCVAR_GET(netplay_port_offset);
++  return host_port > offset ? uint16_t(host_port - offset) : host_port;
++}
++
++void SetContext(uint32_t id, uint32_t value) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  auto& contexts = state().contexts;
++  auto it = std::find_if(contexts.begin(), contexts.end(),
++                         [id](const auto& context) { return context.first == id; });
++  if (it != contexts.end()) {
++    it->second = value;
++  } else {
++    contexts.emplace_back(id, value);
++  }
++}
++
++void SetProperty(uint32_t id, const uint8_t* value, uint32_t size) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  auto& properties = state().properties;
++  auto it = std::find_if(properties.begin(), properties.end(),
++                         [id](const Property& property) { return property.id == id; });
++  if (it == properties.end()) {
++    properties.push_back({id, {}});
++    it = properties.end() - 1;
++  }
++  it->value.assign(value, value + std::min<uint32_t>(size, 256));
++}
++
++void SetQosData(const uint8_t* data, uint32_t size) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  state().qos.assign(data, data + std::min<uint32_t>(size, 1024));
++}
++
++void Host(const Session& session) {
++  StartLobby();
++  std::lock_guard<std::mutex> lock(state().mutex);
++  state().hosted = session;
++  state().hosting = true;
++}
++
++void SetFilledSlots(uint32_t filled_public, uint32_t filled_private) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  state().hosted.filled_public = filled_public;
++  state().hosted.filled_private = filled_private;
++}
++
++void StopHosting() {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  state().hosting = false;
++}
++
++std::vector<Session> Search() {
++  StartLobby();
++  std::vector<Session> found;
++  socket_t s = OpenUdpSocket();
++  int yes = 1;
++  setsockopt(s, SOL_SOCKET, SO_BROADCAST, reinterpret_cast<const char*>(&yes), sizeof(yes));
++  SetReceiveTimeout(s, 200);
++  uint16_t port = uint16_t(REXCVAR_GET(netplay_port));
++  uint32_t peer = ParseIp(REXCVAR_GET(netplay_peer));
++  uint32_t self = LocalIp();
++  auto ask = [&] {
++    if (peer) {
++      sockaddr_in to = SocketAddress(peer, port);
++      sendto(s, reinterpret_cast<const char*>(kQuery), 4, 0, reinterpret_cast<sockaddr*>(&to),
++             sizeof(to));
++    }
++    sockaddr_in everyone = SocketAddress(INADDR_BROADCAST, port);
++    sendto(s, reinterpret_cast<const char*>(kQuery), 4, 0,
++           reinterpret_cast<sockaddr*>(&everyone), sizeof(everyone));
++  };
++  auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
++  auto next_ask = std::chrono::steady_clock::now();
++  uint8_t buffer[2048];
++  while (std::chrono::steady_clock::now() < deadline) {
++    if (std::chrono::steady_clock::now() >= next_ask) {
++      ask();  // a few times, in case a packet is lost
++      next_ask += std::chrono::milliseconds(300);
++    }
++    sockaddr_in from{};
++    socklen_t from_size = sizeof(from);
++    int received = int(recvfrom(s, reinterpret_cast<char*>(buffer), sizeof(buffer), 0,
++                                reinterpret_cast<sockaddr*>(&from), &from_size));
++    Session session;
++    if (received <= 0 || !Decode(buffer, size_t(received), &session)) {
++      continue;
++    }
++    uint32_t from_ip = ntohl(from.sin_addr.s_addr);
++    if (from_ip == self) {
++      continue;  // our own session, through the broadcast
++    }
++    // The host as we reach it: its answer's source address.
++    uint32_t ip = htonl(from_ip);
++    std::memcpy(session.info + kXnKidSize + 0, &ip, 4);
++    std::memcpy(session.info + kXnKidSize + 4, &ip, 4);
++    bool duplicate = std::any_of(found.begin(), found.end(), [&](const Session& other) {
++      return std::memcmp(other.info, session.info, kXnKidSize) == 0;
++    });
++    if (duplicate) {
++      continue;
++    }
++    RememberXnAddr(session.info + kXnKidSize);
++    {
++      std::lock_guard<std::mutex> lock(state().mutex);
++      state().found_qos[from_ip] = session.qos;
++    }
++    REXKRNL_INFO("[netplay] found a session hosted by {} ({}/{} public slots filled)",
++                 IpText(from_ip), session.filled_public, session.max_public);
++    found.push_back(std::move(session));
++  }
++  NETPLAY_CLOSE(s);
++  return found;
++}
++
++bool FoundQosData(uint32_t host_ip, std::vector<uint8_t>* data) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  auto it = state().found_qos.find(host_ip);
++  if (it == state().found_qos.end()) {
++    return false;
++  }
++  *data = it->second;
++  return true;
++}
++
++void RememberXnAddr(const uint8_t* xnaddr) {
++  std::lock_guard<std::mutex> lock(state().mutex);
++  state().known_xnaddrs[XnAddrIp(xnaddr)].assign(xnaddr, xnaddr + kXnAddrSize);
++}
++
++bool XnAddrForIp(uint32_t ip, uint8_t* xnaddr) {
++  if (ip == LocalIp()) {
++    FillXnAddr(xnaddr);
++    return true;
++  }
++  std::lock_guard<std::mutex> lock(state().mutex);
++  auto it = state().known_xnaddrs.find(ip);
++  if (it == state().known_xnaddrs.end()) {
++    return false;
++  }
++  std::memcpy(xnaddr, it->second.data(), kXnAddrSize);
++  return true;
++}
++
++}  // namespace rex::kernel::xam::netplay
+diff --git a/src/kernel/xam/xam_info.cpp b/src/kernel/xam/xam_info.cpp
+index 1fda053..f84da69 100644
+--- a/src/kernel/xam/xam_info.cpp
++++ b/src/kernel/xam/xam_info.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/system/flags.h>
+ #include <rex/kernel/xam/module.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+@@ -157,6 +158,11 @@ u32 XamGetSystemVersion_entry() {
+   // we pretend to be old we have less to worry with implementing.
+   // 0x200A3200
+   // 0x20096B00
++  // Online play needs a late dashboard: games skip XSessionGetDetails (and
++  // other later Live calls) on older ones. 2.0.17559.0.
++  if (REXCVAR_GET(netplay)) {
++    return 0x20449700;
++  }
+   return 0;
+ }
+ 
+diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
+index ff6cb56..565e610 100644
+--- a/src/kernel/xam/xam_misc.cpp
++++ b/src/kernel/xam/xam_misc.cpp
+@@ -8,6 +8,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <rex/kernel/xam/netplay.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/hook.h>
+@@ -243,7 +244,7 @@ REX_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
+ REX_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetState);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
+-REX_EXPORT_STUB(__imp__XNetLogonGetTitleID);
++REX_EXPORT_NETPLAY_TRACE(__imp__XNetLogonGetTitleID);
+ REX_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
+ REX_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+ REX_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
+diff --git a/src/kernel/xam/xam_net.cpp b/src/kernel/xam/xam_net.cpp
+index 58e36a4..42cb4b3 100644
+--- a/src/kernel/xam/xam_net.cpp
++++ b/src/kernel/xam/xam_net.cpp
+@@ -12,7 +12,11 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <algorithm>
++#include <atomic>
++#include <cerrno>
+ #include <cstring>
++#include <string>
+ 
+ #if REX_PLATFORM_MAC
+ #include <sys/select.h>
+@@ -20,6 +24,8 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/kernel/xam/module.h>
++#include <rex/kernel/xam/netplay.h>
++#include <rex/memory.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/kernel/xboxkrnl/error.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+@@ -44,6 +50,84 @@
+ #include <sys/socket.h>
+ #endif
+ 
++
++
++namespace {
++
++// Sockets are kernel objects here, with handles like 0xF80001FC, but on the
++// console a SOCKET is a small positive number and games check for that (a
++// negative one is taken as INVALID_SOCKET). The guest sees the handle without
++// its high bits.
++constexpr uint32_t kSocketHandleBits = 0xF8000000;
++
++uint32_t GuestSocket(uint32_t handle) {
++  return (handle & kSocketHandleBits) == kSocketHandleBits ? handle & ~kSocketHandleBits : handle;
++}
++
++rex::system::object_ref<rex::system::XSocket> LookupSocket(uint32_t socket) {
++  if (socket == 0xFFFFFFFF) {
++    return nullptr;
++  }
++  if ((socket & kSocketHandleBits) == 0) {
++    socket |= kSocketHandleBits;
++  }
++  return REX_KERNEL_OBJECTS()->LookupObject<rex::system::XSocket>(socket);
++}
++
++// Sets the guest's last error (a Winsock code) from the host's socket error,
++// so a non-blocking socket's "would block" and the like read as on Windows.
++void SetSocketError() {
++#if REX_PLATFORM_WIN32
++  rex::system::XThread::SetLastError(uint32_t(WSAGetLastError()));
++#else
++  uint32_t code;
++  switch (errno) {
++    case EWOULDBLOCK:
++#if EAGAIN != EWOULDBLOCK
++    case EAGAIN:
++#endif
++    case EINPROGRESS:  // a non-blocking connect is WSAEWOULDBLOCK in Winsock
++      code = 10035;
++      break;
++    case EALREADY: code = 10037; break;
++    case ENOTSOCK: code = 10038; break;
++    case EMSGSIZE: code = 10040; break;
++    case EADDRINUSE: code = 10048; break;
++    case EADDRNOTAVAIL: code = 10049; break;
++    case ENETDOWN: code = 10050; break;
++    case ENETUNREACH: code = 10051; break;
++    case ECONNABORTED: code = 10053; break;
++    case ECONNRESET: code = 10054; break;
++    case ENOBUFS: code = 10055; break;
++    case EISCONN: code = 10056; break;
++    case ENOTCONN: code = 10057; break;
++    case ESHUTDOWN: code = 10058; break;
++    case ETIMEDOUT: code = 10060; break;
++    case ECONNREFUSED: code = 10061; break;
++    case EHOSTUNREACH: code = 10065; break;
++    case EINTR: code = 10004; break;
++    case EFAULT: code = 10014; break;
++    default: code = 10022; break;  // WSAEINVAL
++  }
++  rex::system::XThread::SetLastError(code);
++#endif
++}
++
++}  // namespace
++
++namespace {
++// A host-order IPv4 address as text, for logs.
++std::string NetplayIp(uint32_t address) {
++  return fmt::format("{}.{}.{}.{}", address >> 24, (address >> 16) & 0xFF, (address >> 8) & 0xFF,
++                     address & 0xFF);
++}
++// Logs only the first calls of a busy function, so sends and receives
++// during a match don't flood the log.
++bool NetplayLogBusy(std::atomic<uint32_t>& count) {
++  return REXCVAR_GET(netplay) && count.fetch_add(1, std::memory_order_relaxed) < 40;
++}
++}  // namespace
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -187,6 +271,9 @@ u32 NetDll_XNetStartup_entry(u32 caller, ppc_ptr_t<XNetStartupParams> params) {
+     assert_true(params->cfgSizeOfStruct == sizeof(XNetStartupParams));
+     std::memcpy(&xnet_startup_params, params, sizeof(XNetStartupParams));
+   }
++  REX_NETPLAY_LOG("XNetStartup(caller {}, flags {:02X}, {} dgram / {} stream sockets)", caller,
++                  xnet_startup_params.cfgFlags, xnet_startup_params.cfgSockMaxDgramSockets,
++                  xnet_startup_params.cfgSockMaxStreamSockets);
+ 
+   auto xam = REX_KERNEL_STATE()->GetKernelModule<XamModule>("xam.xex");
+ 
+@@ -323,7 +410,7 @@ u32 NetDll_WSASendTo_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XWSABUF> buf
+   assert(!overlapped);
+   assert(!completion_routine);
+ 
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -436,6 +523,15 @@ struct XnAddrStatus {
+ };
+ 
+ u32 NetDll_XNetGetTitleXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
++  if (netplay::Enabled()) {
++    netplay::FillXnAddr(reinterpret_cast<uint8_t*>(&*addr_ptr));
++    static std::atomic<uint32_t> calls;
++    if (NetplayLogBusy(calls)) {
++      REX_NETPLAY_LOG("XNetGetTitleXnAddr -> {}", NetplayIp(netplay::LocalIp()));
++    }
++    return XnAddrStatus::XNET_GET_XNADDR_STATIC | XnAddrStatus::XNET_GET_XNADDR_GATEWAY |
++           XnAddrStatus::XNET_GET_XNADDR_DNS | XnAddrStatus::XNET_GET_XNADDR_ONLINE;
++  }
+   // Just return a loopback address atm.
+   addr_ptr->ina.s_addr = htonl(INADDR_LOOPBACK);
+   addr_ptr->inaOnline.s_addr = 0;
+@@ -467,6 +563,14 @@ u32 NetDll_XNetGetDebugXnAddr_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr) {
+ }
+ 
+ u32 NetDll_XNetXnAddrToMachineId_entry(u32 caller, ppc_ptr_t<XNADDR> addr_ptr, mapped_u32 id_ptr) {
++  if (netplay::Enabled() && addr_ptr && id_ptr) {
++    // abOnline's first eight bytes hold the copy's id.
++    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&*addr_ptr);
++    uint32_t id = 0;
++    std::memcpy(&id, bytes + 16, 4);
++    *id_ptr = id;
++    return 0;
++  }
+   // Tell the caller we're not signed in to live (non-zero ret)
+   return 1;
+ }
+@@ -480,6 +584,14 @@ void NetDll_XNetInAddrToString_entry(u32 caller, u32 in_addr, mapped_string stri
+ // subsequent socket calls (like a handle to a XNet address)
+ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mapped_void xid,
+                                     mapped_void in_addr) {
++  if (netplay::Enabled() && xn_addr && in_addr) {
++    // The real address: the game's traffic then goes straight to the peer.
++    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&*xn_addr);
++    netplay::RememberXnAddr(bytes);
++    std::memcpy(in_addr, bytes, 4);
++    REX_NETPLAY_LOG("XNetXnAddrToInAddr -> {}", NetplayIp(netplay::XnAddrIp(bytes)));
++    return 0;
++  }
+   return 1;
+ }
+ 
+@@ -487,6 +599,14 @@ u32 NetDll_XNetXnAddrToInAddr_entry(u32 caller, ppc_ptr_t<XNADDR> xn_addr, mappe
+ // FIXME: Arguments may not be correct.
+ u32 NetDll_XNetInAddrToXnAddr_entry(u32 caller, mapped_void in_addr, ppc_ptr_t<XNADDR> xn_addr,
+                                     mapped_void xid) {
++  if (netplay::Enabled() && in_addr && xn_addr) {
++    uint32_t ip;
++    std::memcpy(&ip, in_addr, 4);
++    ip = ntohl(ip);
++    bool known = netplay::XnAddrForIp(ip, reinterpret_cast<uint8_t*>(&*xn_addr));
++    REX_NETPLAY_LOG("XNetInAddrToXnAddr({}) -> {}", NetplayIp(ip), known ? "found" : "unknown");
++    return known ? 0 : 1;
++  }
+   return 1;
+ }
+ 
+@@ -506,6 +626,10 @@ struct XEthernetStatus {
+ };
+ 
+ u32 NetDll_XNetGetEthernetLinkStatus_entry(u32 caller) {
++  if (REXCVAR_GET(netplay)) {
++    return XEthernetStatus::XNET_ETHERNET_LINK_ACTIVE | XEthernetStatus::XNET_ETHERNET_LINK_100MBPS |
++           XEthernetStatus::XNET_ETHERNET_LINK_FULL_DUPLEX;
++  }
+   return 0;
+ }
+ 
+@@ -534,6 +658,7 @@ u32 NetDll_XNetDnsRelease_entry(u32 caller, ppc_ptr_t<XNDNS> dns) {
+ }
+ 
+ u32 NetDll_XNetQosServiceLookup_entry(u32 caller, u32 flags, u32 event_handle, mapped_u32 pqos) {
++  REX_NETPLAY_LOG("XNetQosServiceLookup(flags {:08X}) -> no results", flags);
+   // Set pqos as some games will try accessing it despite non-successful result
+   if (pqos) {
+     auto qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(sizeof(XNQOS));
+@@ -559,9 +684,81 @@ u32 NetDll_XNetQosRelease_entry(u32 caller, ppc_ptr_t<XNQOS> qos) {
+ 
+ u32 NetDll_XNetQosListen_entry(u32 caller, mapped_void id, mapped_void data, u32 data_size, u32 r7,
+                                u32 flags) {
++  if (netplay::Enabled()) {
++    // XNET_QOS_LISTEN_SET_DATA: the data a lookup of this host returns.
++    if ((flags & 2) && data) {
++      netplay::SetQosData(static_cast<const uint8_t*>(&*data), data_size);
++    }
++    REX_NETPLAY_LOG("XNetQosListen(data size {}, flags {:X})", data_size, flags);
++    return 0;
++  }
+   return X_ERROR_FUNCTION_FAILED;
+ }
+ 
++// XNetQosLookup(cxna, apxna, apxnkid, apxnkey, cina, aina, adwServiceId,
++// cProbes, dwBitsPerSec, dwFlags, hEvent, ppxnqos). With netplay on, each
++// host found by a search answers at once, with the data it set through
++// XNetQosListen.
++u32 NetDll_XNetQosLookup_entry(u32 caller, u32 count, u32 xnaddrs, u32 xnkids, u32 xnkeys,
++                               u32 ina_count, u32 inas, u32 service_ids, u32 probes, u32 bits_per_second, u32 flags,
++                               u32 event_handle, mapped_u32 pqos) {
++  if (!netplay::Enabled()) {
++    REXKRNL_WARN("__imp__NetDll_XNetQosLookup STUB");
++    return X_ERROR_FUNCTION_FAILED;
++  }
++  count = std::min<uint32_t>(count, 64);
++  std::vector<std::vector<uint8_t>> data(count);
++  uint32_t data_total = 0;
++  std::vector<bool> contacted(count);
++  for (uint32_t i = 0; i < count; ++i) {
++    uint32_t xnaddr_ptr =
++        xnaddrs ? memory::load_and_swap<uint32_t>(
++                      REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(xnaddrs + 4 * i))
++                : 0;
++    auto* xnaddr = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(xnaddr_ptr);
++    contacted[i] = xnaddr_ptr && netplay::FoundQosData(netplay::XnAddrIp(xnaddr), &data[i]);
++    data_total += uint32_t(data[i].size());
++  }
++  uint32_t header = 8 + 24 * std::max<uint32_t>(count, 1);
++  uint32_t qos_guest = REX_KERNEL_MEMORY()->SystemHeapAlloc(header + data_total);
++  auto* qos = REX_KERNEL_MEMORY()->TranslateVirtual<uint8_t*>(qos_guest);
++  std::memset(qos, 0, header + data_total);
++  auto* table = reinterpret_cast<XNQOS*>(qos);
++  table->count = count;
++  table->count_pending = 0;
++  auto* infos = reinterpret_cast<XNQOSINFO*>(qos + 8);
++  uint32_t data_at = header;
++  for (uint32_t i = 0; i < count; ++i) {
++    XNQOSINFO& info = infos[i];
++    // XNET_XNQOSINFO_COMPLETE, TARGET_CONTACTED and DATA_RECEIVED.
++    info.flags = uint8_t(contacted[i] ? (0x01 | 0x02 | (data[i].empty() ? 0 : 0x08)) : 0x01);
++    info.probes_xmit = uint16_t(probes);
++    info.probes_recv = uint16_t(contacted[i] ? probes : 0);
++    if (!data[i].empty()) {
++      std::memcpy(qos + data_at, data[i].data(), data[i].size());
++      info.data_ptr = qos_guest + data_at;
++      info.data_len = uint16_t(data[i].size());
++      data_at += uint32_t(data[i].size());
++    }
++    info.rtt_min_in_msecs = 20;
++    info.rtt_med_in_msecs = 25;
++    info.up_bits_per_sec = 10000000;
++    info.down_bits_per_sec = 10000000;
++  }
++  if (pqos) {
++    *pqos = qos_guest;
++  }
++  if (event_handle) {
++    auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(event_handle);
++    if (ev) {
++      ev->Set(0, false);
++    }
++  }
++  REX_NETPLAY_LOG("XNetQosLookup({} hosts, {} addresses) -> {} bytes of host data", count,
++                  ina_count, data_total);
++  return 0;
++}
++
+ u32 NetDll_inet_addr_entry(mapped_string addr_ptr) {
+   if (!addr_ptr) {
+     return -1;
+@@ -589,14 +786,17 @@ u32 NetDll_socket_entry(u32 caller, u32 af, u32 type, u32 protocol) {
+ 
+     uint32_t error = xboxkrnl::xeRtlNtStatusToDosError(result);
+     XThread::SetLastError(error);
++    REX_NETPLAY_LOG("socket(af {}, type {}, protocol {}) -> failed", af, type, protocol);
+     return -1;
+   }
+ 
+-  return socket->handle();
++  REX_NETPLAY_LOG("socket(af {}, type {}, protocol {}) -> {:08X}", af, type, protocol,
++                  GuestSocket(socket->handle()));
++  return GuestSocket(socket->handle());
+ }
+ 
+ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -611,7 +811,7 @@ u32 NetDll_closesocket_entry(u32 caller, u32 socket_handle) {
+ }
+ 
+ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -632,7 +832,7 @@ i32 NetDll_shutdown_entry(u32 caller, u32 socket_handle, i32 how) {
+ 
+ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optname,
+                             mapped_void optval_ptr, u32 optlen) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -640,11 +840,13 @@ u32 NetDll_setsockopt_entry(u32 caller, u32 socket_handle, u32 level, u32 optnam
+   }
+ 
+   X_STATUS status = socket->SetOption(level, optname, optval_ptr, optlen);
++  REX_NETPLAY_LOG("setsockopt({:08X}, level {:X}, option {:X}, length {}) -> {:08X}", socket_handle,
++                  level, optname, optlen, status);
+   return XSUCCEEDED(status) ? 0 : -1;
+ }
+ 
+ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void arg_ptr) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -653,7 +855,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+ 
+   X_STATUS status = socket->IOControl(cmd, arg_ptr);
+   if (XFAILED(status)) {
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    SetSocketError();
+     return -1;
+   }
+ 
+@@ -662,7 +864,7 @@ u32 NetDll_ioctlsocket_entry(u32 caller, u32 socket_handle, u32 cmd, mapped_void
+ }
+ 
+ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> name, u32 namelen) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -670,9 +872,16 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+   }
+ 
+   N_XSOCKADDR_IN native_name(name);
++  if (netplay::Enabled()) {
++    native_name.sin_port = netplay::HostPort(native_name.sin_port);
++  }
+   X_STATUS status = socket->Bind(&native_name, namelen);
+   if (XFAILED(status)) {
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    SetSocketError();
++  }
++  REX_NETPLAY_LOG("bind({:08X}, {}:{}) -> {:08X}", socket_handle,
++                  NetplayIp(uint32_t(name->sin_addr)), uint16_t(name->sin_port), status);
++  if (XFAILED(status)) {
+     return -1;
+   }
+ 
+@@ -680,7 +889,7 @@ u32 NetDll_bind_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR_IN> nam
+ }
+ 
+ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> name, u32 namelen) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -688,9 +897,23 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+   }
+ 
+   N_XSOCKADDR native_name(name);
++  if (netplay::Enabled() && native_name.address_family == AF_INET) {
++    // sa_data starts with the port, big-endian.
++    uint16_t port = uint16_t((uint8_t(native_name.sa_data[0]) << 8) | uint8_t(native_name.sa_data[1]));
++    port = netplay::HostPort(port);
++    native_name.sa_data[0] = char(port >> 8);
++    native_name.sa_data[1] = char(port);
++  }
+   X_STATUS status = socket->Connect(&native_name, namelen);
+   if (XFAILED(status)) {
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    SetSocketError();
++  }
++  REX_NETPLAY_LOG("connect({:08X}, {}.{}.{}.{}:{}) -> {:08X} (error {})", socket_handle,
++                  uint8_t(native_name.sa_data[2]), uint8_t(native_name.sa_data[3]),
++                  uint8_t(native_name.sa_data[4]), uint8_t(native_name.sa_data[5]),
++                  (uint8_t(native_name.sa_data[0]) << 8) | uint8_t(native_name.sa_data[1]), status,
++                  XFAILED(status) ? XThread::GetLastError() : 0);
++  if (XFAILED(status)) {
+     return -1;
+   }
+ 
+@@ -698,7 +921,7 @@ u32 NetDll_connect_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> nam
+ }
+ 
+ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -707,7 +930,10 @@ u32 NetDll_listen_entry(u32 caller, u32 socket_handle, i32 backlog) {
+ 
+   X_STATUS status = socket->Listen(backlog);
+   if (XFAILED(status)) {
+-    XThread::SetLastError(xboxkrnl::xeRtlNtStatusToDosError(status));
++    SetSocketError();
++  }
++  REX_NETPLAY_LOG("listen({:08X}, {}) -> {:08X}", socket_handle, int32_t(backlog), status);
++  if (XFAILED(status)) {
+     return -1;
+   }
+ 
+@@ -722,7 +948,7 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+     return -1;
+   }
+ 
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -732,12 +958,26 @@ u32 NetDll_accept_entry(u32 caller, u32 socket_handle, ppc_ptr_t<XSOCKADDR> addr
+   N_XSOCKADDR native_addr(addr_ptr);
+   int native_len = *addrlen_ptr;
+   auto new_socket = socket->Accept(&native_addr, &native_len);
++  if (!new_socket) {
++    SetSocketError();
++  }
++  if (new_socket && netplay::Enabled() && native_addr.address_family == AF_INET) {
++    uint16_t port =
++        uint16_t((uint8_t(native_addr.sa_data[0]) << 8) | uint8_t(native_addr.sa_data[1]));
++    port = netplay::GuestPort(port);
++    native_addr.sa_data[0] = char(port >> 8);
++    native_addr.sa_data[1] = char(port);
++    REX_NETPLAY_LOG("accept({:08X}) -> {:08X} from {}.{}.{}.{}", socket_handle,
++                    GuestSocket(new_socket->handle()), uint8_t(native_addr.sa_data[2]),
++                    uint8_t(native_addr.sa_data[3]), uint8_t(native_addr.sa_data[4]),
++                    uint8_t(native_addr.sa_data[5]));
++  }
+   if (new_socket) {
+     addr_ptr->address_family = native_addr.address_family;
+     std::memcpy(addr_ptr->sa_data, native_addr.sa_data, *addrlen_ptr - 2);
+     *addrlen_ptr = native_len;
+ 
+-    return new_socket->handle();
++    return GuestSocket(new_socket->handle());
+   } else {
+     return -1;
+   }
+@@ -762,7 +1002,7 @@ struct host_set {
+         break;
+       }
+       // Convert from Xenia -> native
+-      auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++      auto socket = LookupSocket(socket_handle);
+       assert_not_null(socket);
+       this->sockets[i] = socket;
+     }
+@@ -772,7 +1012,7 @@ struct host_set {
+     guest_set->fd_count = 0;
+     for (uint32_t i = 0; i < this->count; ++i) {
+       auto socket = this->sockets[i];
+-      guest_set->fd_array[guest_set->fd_count++] = socket->handle();
++      guest_set->fd_array[guest_set->fd_count++] = GuestSocket(socket->handle());
+     }
+   }
+ 
+@@ -825,7 +1065,15 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+                                              reinterpret_cast<int32_t*>(&timeout.tv_usec));
+     timeout_in = &timeout;
+   }
+-  int ret = select(nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
++  // Winsock ignores nfds; POSIX needs the highest descriptor plus one.
++  int native_nfds = 0;
++  for (const host_set* set : {&host_readfds, &host_writefds, &host_exceptfds}) {
++    for (uint32_t i = 0; i < set->count; ++i) {
++      native_nfds = std::max(native_nfds, int(set->sockets[i]->native_handle()) + 1);
++    }
++  }
++  (void)nfds;
++  int ret = select(native_nfds, readfds ? &native_readfds : nullptr, writefds ? &native_writefds : nullptr,
+                    exceptfds ? &native_exceptfds : nullptr, timeout_in);
+   if (readfds) {
+     host_readfds.UpdateFrom(&native_readfds);
+@@ -840,24 +1088,40 @@ i32 NetDll_select_entry(i32 caller, i32 nfds, ppc_ptr_t<x_fd_set> readfds,
+     host_exceptfds.Store(exceptfds);
+   }
+ 
++  static std::atomic<uint32_t> selects;
++  if (ret != 0 && NetplayLogBusy(selects)) {
++    REX_NETPLAY_LOG("select({} read, {} write, {} except) -> {}",
++                    readfds ? uint32_t(readfds->fd_count) : 0,
++                    writefds ? uint32_t(writefds->fd_count) : 0,
++                    exceptfds ? uint32_t(exceptfds->fd_count) : 0, ret);
++  }
+   // TODO(gibbed): modify ret to be what's actually copied to the guest fd_sets?
+   return ret;
+ }
+ 
+ u32 NetDll_recv_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+     return -1;
+   }
+ 
+-  return socket->Recv(buf_ptr, buf_len, flags);
++  int ret = socket->Recv(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetSocketError();
++  }
++  static std::atomic<uint32_t> received;
++  if ((ret >= 0 || XThread::GetLastError() != 10035) && NetplayLogBusy(received)) {
++    REX_NETPLAY_LOG("recv({:08X}, {} bytes) -> {} (error {})", socket_handle, buf_len, ret,
++                    ret < 0 ? XThread::GetLastError() : 0);
++  }
++  return ret;
+ }
+ 
+ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len,
+                           u32 flags, ppc_ptr_t<XSOCKADDR_IN> from_ptr, mapped_u32 fromlen_ptr) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -871,7 +1135,29 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+   uint32_t native_fromlen = fromlen_ptr ? fromlen_ptr.value() : 0;
+   int ret =
+       socket->RecvFrom(buf_ptr, buf_len, flags, &native_from, fromlen_ptr ? &native_fromlen : 0);
++  if (ret < 0) {
++#if REX_PLATFORM_WIN32
++    int native_error = WSAGetLastError();
++    const bool would_block = native_error == WSAEWOULDBLOCK;
++#else
++    int native_error = errno;
++    const bool would_block = native_error == EWOULDBLOCK || native_error == EAGAIN;
++#endif
++    SetSocketError();
++    static std::atomic<uint32_t> failed;
++    if (!would_block && NetplayLogBusy(failed)) {
++      REX_NETPLAY_LOG("recvfrom({:08X}) failed: errno {}", socket_handle, native_error);
++    }
++  }
++  static std::atomic<uint32_t> received;
++  if (ret >= 0 && NetplayLogBusy(received)) {
++    REX_NETPLAY_LOG("recvfrom({:08X}) {} bytes from {}:{}", socket_handle, ret,
++                    NetplayIp(uint32_t(native_from.sin_addr)), uint16_t(native_from.sin_port));
++  }
+ 
++  if (netplay::Enabled()) {
++    native_from.sin_port = netplay::GuestPort(native_from.sin_port);
++  }
+   if (from_ptr) {
+     from_ptr->sin_family = native_from.sin_family;
+     from_ptr->sin_port = native_from.sin_port;
+@@ -882,33 +1168,32 @@ u32 NetDll_recvfrom_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u3
+     *fromlen_ptr = native_fromlen;
+   }
+ 
+-  if (ret == -1) {
+-// TODO: Better way of getting the error code
+-#if REX_PLATFORM_WIN32
+-    uint32_t error_code = WSAGetLastError();
+-    XThread::SetLastError(error_code);
+-#else
+-    XThread::SetLastError(0x0);
+-#endif
+-  }
+-
+   return ret;
+ }
+ 
+ u32 NetDll_send_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+     return -1;
+   }
+ 
+-  return socket->Send(buf_ptr, buf_len, flags);
++  int ret = socket->Send(buf_ptr, buf_len, flags);
++  if (ret < 0) {
++    SetSocketError();
++  }
++  static std::atomic<uint32_t> sent;
++  if (NetplayLogBusy(sent)) {
++    REX_NETPLAY_LOG("send({:08X}, {} bytes) -> {} (error {})", socket_handle, buf_len, ret,
++                    ret < 0 ? XThread::GetLastError() : 0);
++  }
++  return ret;
+ }
+ 
+ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32 buf_len, u32 flags,
+                         ppc_ptr_t<XSOCKADDR_IN> to_ptr, u32 to_len) {
+-  auto socket = REX_KERNEL_OBJECTS()->LookupObject<XSocket>(socket_handle);
++  auto socket = LookupSocket(socket_handle);
+   if (!socket) {
+     // WSAENOTSOCK
+     XThread::SetLastError(0x2736);
+@@ -916,7 +1201,20 @@ u32 NetDll_sendto_entry(u32 caller, u32 socket_handle, mapped_void buf_ptr, u32
+   }
+ 
+   N_XSOCKADDR_IN native_to(to_ptr);
+-  return socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
++  if (netplay::Enabled()) {
++    native_to.sin_port = netplay::HostPort(native_to.sin_port);
++  }
++  int ret = socket->SendTo(buf_ptr, buf_len, flags, &native_to, to_len);
++  if (ret < 0) {
++    SetSocketError();
++  }
++  static std::atomic<uint32_t> sent;
++  if (NetplayLogBusy(sent)) {
++    REX_NETPLAY_LOG("sendto({:08X}, {} bytes, {}:{}) -> {}", socket_handle, buf_len,
++                    to_ptr ? NetplayIp(uint32_t(to_ptr->sin_addr)) : std::string("-"),
++                    to_ptr ? uint16_t(to_ptr->sin_port) : 0, ret);
++  }
++  return ret;
+ }
+ 
+ u32 NetDll___WSAFDIsSet_entry(u32 socket_handle, ppc_ptr_t<x_fd_set> fd_set) {
+@@ -968,6 +1266,7 @@ REX_EXPORT(__imp__NetDll_XNetDnsRelease, rex::kernel::xam::NetDll_XNetDnsRelease
+ REX_EXPORT(__imp__NetDll_XNetQosServiceLookup, rex::kernel::xam::NetDll_XNetQosServiceLookup_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosRelease, rex::kernel::xam::NetDll_XNetQosRelease_entry)
+ REX_EXPORT(__imp__NetDll_XNetQosListen, rex::kernel::xam::NetDll_XNetQosListen_entry)
++REX_EXPORT(__imp__NetDll_XNetQosLookup, rex::kernel::xam::NetDll_XNetQosLookup_entry)
+ REX_EXPORT(__imp__NetDll_inet_addr, rex::kernel::xam::NetDll_inet_addr_entry)
+ REX_EXPORT(__imp__NetDll_socket, rex::kernel::xam::NetDll_socket_entry)
+ REX_EXPORT(__imp__NetDll_closesocket, rex::kernel::xam::NetDll_closesocket_entry)
+@@ -1040,7 +1339,7 @@ REX_EXPORT_STUB(__imp__NetDll_XNetGetSystemLinkPort);
+ REX_EXPORT_STUB(__imp__NetDll_XNetGetXnAddrPlatform);
+ REX_EXPORT_STUB(__imp__NetDll_XNetInAddrToServer);
+ REX_EXPORT_STUB(__imp__NetDll_XNetQosGetListenStats);
+-REX_EXPORT_STUB(__imp__NetDll_XNetQosLookup);
++
+ REX_EXPORT_STUB(__imp__NetDll_XNetRegisterKey);
+ REX_EXPORT_STUB(__imp__NetDll_XNetReplaceKey);
+ REX_EXPORT_STUB(__imp__NetDll_XNetServerToInAddr);
+@@ -1076,7 +1375,7 @@ REX_EXPORT_STUB(__imp__NetDll_XnpLogonClearQEvent);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetChallenge);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQFlags);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetQVals);
+-REX_EXPORT_STUB(__imp__NetDll_XnpLogonGetStatus);
++REX_EXPORT_NETPLAY_TRACE(__imp__NetDll_XnpLogonGetStatus);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetChallengeResponse);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetPState);
+ REX_EXPORT_STUB(__imp__NetDll_XnpLogonSetQEvent);
+diff --git a/src/kernel/xam/xam_user.cpp b/src/kernel/xam/xam_user.cpp
+index 8778066..d4a56cd 100644
+--- a/src/kernel/xam/xam_user.cpp
++++ b/src/kernel/xam/xam_user.cpp
+@@ -12,9 +12,11 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <atomic>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
++#include <rex/kernel/xam/netplay.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -49,8 +51,9 @@ i32 XamUserGetXUID_entry(u32 user_index, u32 type_mask, mapped_u64 xuid_ptr) {
+       const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+       auto type = user_profile->type() & type_mask;
+       if (type & (2 | 4)) {
+-        // maybe online profile?
+-        xuid = user_profile->xuid();
++        // maybe online profile? With netplay, this copy's own online XUID;
++        // saves stay under the profile's.
++        xuid = netplay::Enabled() ? netplay::OnlineXuid() : user_profile->xuid();
+         result = X_E_SUCCESS;
+       } else if (type & 1) {
+         // maybe offline profile?
+@@ -97,7 +100,8 @@ i32 XamUserGetSigninInfo_entry(u32 user_index, u32 flags, ppc_ptr_t<X_USER_SIGNI
+   }
+ 
+   const auto& user_profile = REX_KERNEL_STATE()->user_profile();
+-  info->xuid = user_profile->xuid();
++  // XUSER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY (1) asks for the online XUID.
++  info->xuid = netplay::Enabled() && (flags & 1) ? netplay::OnlineXuid() : user_profile->xuid();
+   info->signin_state = user_profile->signin_state();
+   rex::string::copy_truncating(info->name, user_profile->name(), rex::countof(info->name));
+   return X_E_SUCCESS;
+@@ -382,8 +386,11 @@ u32 XamUserCheckPrivilege_entry(u32 user_index, u32 mask, mapped_u32 out_value)
+     }
+   }
+ 
+-  // If we deny everything, games should hopefully not try to do stuff.
+-  *out_value = 0;
++  // If we deny everything, games should hopefully not try to do stuff. With
++  // netplay on, everything is allowed so online modes open.
++  *out_value = REXCVAR_GET(netplay) ? 1 : 0;
++  REX_NETPLAY_LOG("XamUserCheckPrivilege(user {}, privilege {}) -> {}", user_index, mask,
++                  uint32_t(*out_value));
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -712,16 +719,18 @@ u32 XamWriteGamerTile_entry(u32 arg1, u32 arg2, u32 arg3, u32 arg4, u32 arg5, u3
+   return X_ERROR_SUCCESS;
+ }
+ 
++// Session handles and the objects they refer to: games pass the object back
++// in XSession messages (apps/xgi_app.cpp tells sessions apart by it) and
++// don't look inside it.
+ u32 XamSessionCreateHandle_entry(mapped_u32 handle_ptr) {
+-  *handle_ptr = 0xCAFEDEAD;
++  static std::atomic<uint32_t> next{0};
++  *handle_ptr = 0xCAFE0000 | (next.fetch_add(1) & 0xFFFF);
++  REX_NETPLAY_LOG("XamSessionCreateHandle -> {:08X}", uint32_t(*handle_ptr));
+   return X_ERROR_SUCCESS;
+ }
+ 
+ u32 XamSessionRefObjByHandle_entry(u32 handle, mapped_u32 obj_ptr) {
+-  assert_true(handle == 0xCAFEDEAD);
+-  // TODO(PermaNull): Implement this properly,
+-  // For the time being returning 0xDEADF00D will prevent crashing.
+-  *obj_ptr = 0xDEADF00D;
++  *obj_ptr = 0xDEAD0000 | (handle & 0xFFFF);
+   return X_ERROR_SUCCESS;
+ }
+ 
+@@ -769,8 +778,31 @@ REX_EXPORT_STUB(__imp__XamUserGetAgeGroup);
+ REX_EXPORT_STUB(__imp__XamUserGetCachedUserFlags);
+ REX_EXPORT_STUB(__imp__XamUserGetDeviceId);
+ REX_EXPORT_STUB(__imp__XamUserGetIndexFromXUID);
+-REX_EXPORT_STUB(__imp__XamUserGetMembershipTierFromXUID);
+-REX_EXPORT_STUB(__imp__XamUserGetOnlineCountryFromXUID);
++// Both take a XUID in r3. With netplay on, everyone is Gold in the
++// configured country.
++extern "C" REX_FUNC(__imp__XamUserGetMembershipTierFromXUID) {
++  (void)base;
++  if (!REXCVAR_GET(netplay)) {
++    REXKRNL_WARN("__imp__XamUserGetMembershipTierFromXUID STUB");
++    return;
++  }
++  REX_NETPLAY_LOG("XamUserGetMembershipTierFromXUID({:016X}) -> Gold", ctx.r3.u64);
++  ctx.r3.u64 = 6;
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XamUserGetMembershipTierFromXUID(
++    "__imp__XamUserGetMembershipTierFromXUID", &__imp__XamUserGetMembershipTierFromXUID);
++extern "C" REX_FUNC(__imp__XamUserGetOnlineCountryFromXUID) {
++  (void)base;
++  if (!REXCVAR_GET(netplay)) {
++    REXKRNL_WARN("__imp__XamUserGetOnlineCountryFromXUID STUB");
++    return;
++  }
++  REX_NETPLAY_LOG("XamUserGetOnlineCountryFromXUID({:016X}) -> {}", ctx.r3.u64,
++                  REXCVAR_GET(user_country));
++  ctx.r3.u64 = REXCVAR_GET(user_country);
++}
++static rex::ppc::detail::PPCFuncRegistrar _ppc_reg___imp__XamUserGetOnlineCountryFromXUID(
++    "__imp__XamUserGetOnlineCountryFromXUID", &__imp__XamUserGetOnlineCountryFromXUID);
+ REX_EXPORT_STUB(__imp__XamUserGetOnlineLanguageFromXUID);
+ REX_EXPORT_STUB(__imp__XamUserGetOnlineXUIDFromOfflineXUID);
+ REX_EXPORT_STUB(__imp__XamUserGetReportingInfo);
+diff --git a/src/system/xam/app_manager.cpp b/src/system/xam/app_manager.cpp
+index 9b882af..5f6044f 100644
+--- a/src/system/xam/app_manager.cpp
++++ b/src/system/xam/app_manager.cpp
+@@ -9,6 +9,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <map>
++#include <mutex>
++
++#include <rex/kernel/xam/netplay.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/app_manager.h>
+ 
+@@ -25,6 +29,27 @@ void AppManager::RegisterApp(std::unique_ptr<App> app) {
+   apps_.push_back(std::move(app));
+ }
+ 
++namespace {
++// With netplay on, logs the first few of each kind of message: some are
++// polled every frame.
++void LogMessage(uint32_t app_id, uint32_t message, uint32_t buffer_ptr, uint32_t buffer_length,
++                X_HRESULT result) {
++  if (!REXCVAR_GET(netplay)) {
++    return;
++  }
++  static std::mutex mutex;
++  static std::map<uint64_t, uint32_t> counts;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    if (counts[(uint64_t(app_id) << 32) | message]++ >= 4) {
++      return;
++    }
++  }
++  REX_NETPLAY_LOG("app {:02X} message {:08X} (buffer {:08X}, length {:08X}) -> {:08X}", app_id,
++                  message, buffer_ptr, buffer_length, uint32_t(result));
++}
++}  // namespace
++
+ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+                                           uint32_t buffer_length) {
+   App* app;
+@@ -35,7 +60,9 @@ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uin
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  LogMessage(app_id, message, buffer_ptr, buffer_length, result);
++  return result;
+ }
+ 
+ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+@@ -48,7 +75,9 @@ X_HRESULT AppManager::DispatchMessageAsync(uint32_t app_id, uint32_t message, ui
+     }
+     app = it->second;
+   }
+-  return app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  X_HRESULT result = app->DispatchMessageSync(message, buffer_ptr, buffer_length);
++  LogMessage(app_id, message, buffer_ptr, buffer_length, result);
++  return result;
+ }
+ 
+ }  // namespace xam
+diff --git a/src/system/xsocket.cpp b/src/system/xsocket.cpp
+index 2d13ac8..8680d08 100644
+--- a/src/system/xsocket.cpp
++++ b/src/system/xsocket.cpp
+@@ -12,6 +12,7 @@
+ #include <cstring>
+ 
+ #include <rex/kernel/xam/module.h>
++#include <rex/memory.h>
+ #include <rex/platform.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xsocket.h>
+@@ -28,6 +29,9 @@
+ #include <arpa/inet.h>
+ #include <netinet/in.h>
+ #include <netinet/ip.h>
++#include <netinet/tcp.h>
++#include <sys/ioctl.h>
++#include <sys/time.h>
+ #include <sys/socket.h>
+ #endif
+ 
+@@ -76,7 +80,73 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+     return X_STATUS_SUCCESS;
+   }
+ 
+-  int ret = setsockopt(native_handle_, level, optname, (char*)optval_ptr, optlen);
++  // The guest uses Winsock's numbering and stores values big-endian; a BOOL
++  // may be passed as a single byte.
++  int value = 0;
++  if (optlen >= 4) {
++    value = int(memory::load_and_swap<uint32_t>(optval_ptr));
++  } else if (optlen >= 1) {
++    value = *static_cast<uint8_t*>(optval_ptr);
++  }
++  int native_level = int(level);
++  int native_name = int(optname);
++  const void* native_value = &value;
++  socklen_t native_length = sizeof(value);
++#if REX_PLATFORM_WIN32
++  timeval timeout_value{};  // unused
++  (void)timeout_value;
++#else
++  timeval timeout_value{};
++  if (level == 0xFFFF) {
++    native_level = SOL_SOCKET;
++    switch (optname) {
++      case 0x0004:
++        native_name = SO_REUSEADDR;
++        break;
++      case 0x0008:
++        native_name = SO_KEEPALIVE;
++        break;
++      case 0x0020:
++        native_name = SO_BROADCAST;
++        break;
++      case 0x1001:
++        native_name = SO_SNDBUF;
++        break;
++      case 0x1002:
++        native_name = SO_RCVBUF;
++        break;
++      case 0x1005:
++      case 0x1006:
++        // Milliseconds in Winsock, a timeval here.
++        native_name = optname == 0x1005 ? SO_SNDTIMEO : SO_RCVTIMEO;
++        timeout_value.tv_sec = value / 1000;
++        timeout_value.tv_usec = (value % 1000) * 1000;
++        native_value = &timeout_value;
++        native_length = sizeof(timeout_value);
++        break;
++      case 0x0080:  // SO_LINGER
++      case 0xFF7F:  // SO_DONTLINGER
++        // Not needed for the guest's traffic.
++        return X_STATUS_SUCCESS;
++      default:
++        native_name = -1;
++        break;
++    }
++  } else if (level == 6 && optname == 1) {
++    native_level = IPPROTO_TCP;
++    native_name = 1;  // TCP_NODELAY
++  } else if (level == 0 && (optname == 2 || optname == 4)) {
++    // IP_TTL (4) / IP_HDRINCL (2) style options: same values, IPPROTO_IP.
++    native_level = IPPROTO_IP;
++  }
++  if (native_name < 0) {
++    // An option this host has no equivalent for; let the guest carry on.
++    return X_STATUS_SUCCESS;
++  }
++#endif
++
++  int ret = setsockopt(native_handle_, native_level, native_name,
++                       static_cast<const char*>(native_value), native_length);
+   if (ret < 0) {
+     // TODO: WSAGetLastError()
+     return X_STATUS_UNSUCCESSFUL;
+@@ -91,6 +161,20 @@ X_STATUS XSocket::SetOption(uint32_t level, uint32_t optname, void* optval_ptr,
+ }
+ 
+ X_STATUS XSocket::IOControl(uint32_t cmd, uint8_t* arg_ptr) {
++#if !REX_PLATFORM_WIN32
++  // Winsock's FIONBIO / FIONREAD, with the guest's big-endian u_long.
++  if (cmd == 0x8004667E || cmd == 0x4004667F) {
++    int value = cmd == 0x8004667E ? int(memory::load_and_swap<uint32_t>(arg_ptr)) : 0;
++    int ret = ioctl(int(native_handle_), cmd == 0x8004667E ? FIONBIO : FIONREAD, &value);
++    if (ret < 0) {
++      return X_STATUS_UNSUCCESSFUL;
++    }
++    if (cmd == 0x4004667F) {
++      memory::store_and_swap<uint32_t>(arg_ptr, uint32_t(value));
++    }
++    return X_STATUS_SUCCESS;
++  }
++#endif
+   int ret = rex::net::socket_ioctl(native_handle_, cmd, arg_ptr);
+   if (ret < 0) {
+     // TODO: Get last error
+@@ -192,8 +276,10 @@ int XSocket::RecvFrom(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADD
+                      (sockaddr*)&nfrom, &nfromlen);
+   if (from) {
+     from->sin_family = nfrom.sin_family;
+-    from->sin_addr = ntohl(nfrom.sin_addr.s_addr);  // BE <- BE
+-    from->sin_port = nfrom.sin_port;
++    // N_XSOCKADDR_IN holds numbers (stored big-endian); sockaddr_in holds
++    // network-order bytes.
++    from->sin_addr = ntohl(nfrom.sin_addr.s_addr);
++    from->sin_port = ntohs(nfrom.sin_port);
+     std::memset(from->x_sin_zero, 0, sizeof(from->x_sin_zero));
+   }
+ 
+@@ -221,15 +307,16 @@ int XSocket::SendTo(uint8_t* buf, uint32_t buf_len, uint32_t flags, N_XSOCKADDR_
+   }
+   */
+ 
+-  sockaddr_in nto;
++  // N_XSOCKADDR_IN holds numbers; sockaddr_in wants network-order bytes.
++  sockaddr_in nto = {};
+   if (to) {
+-    nto.sin_addr.s_addr = to->sin_addr;
+-    nto.sin_family = to->sin_family;
+-    nto.sin_port = to->sin_port;
++    nto.sin_family = AF_INET;
++    nto.sin_port = htons(to->sin_port);
++    nto.sin_addr.s_addr = htonl(to->sin_addr);
+   }
+ 
+   return sendto(native_handle_, reinterpret_cast<char*>(buf), buf_len, flags,
+-                to ? (sockaddr*)&nto : nullptr, to_len);
++                to ? (sockaddr*)&nto : nullptr, to ? socklen_t(sizeof(nto)) : 0);
+ }
+ 
+ bool XSocket::QueuePacket(uint32_t src_ip, uint16_t src_port, const uint8_t* buf, size_t len) {

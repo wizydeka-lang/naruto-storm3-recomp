@@ -19,9 +19,12 @@
 // a resolved image if one was resolved to its address; otherwise it is
 // decoded from guest memory on first use (texture_decode.h) and kept while
 // its memory is unchanged. Textures the view can't decode are a 1x1 white
-// placeholder.
+// placeholder; draws whose textures are still to be decoded are left out
+// until they are.
 
 #include "native_view.h"
+
+#include "postfx_spirv.h"
 
 #include "shader_library.h"
 #include "texture_decode.h"
@@ -38,6 +41,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -49,7 +53,9 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace native_view {
@@ -57,7 +63,6 @@ namespace native_view {
 namespace {
 
 constexpr uint32_t kFramesInFlight = 2;
-constexpr VkFormat kDepthFormat = VK_FORMAT_D32_SFLOAT;
 constexpr VkImageUsageFlags kColorTargetUsage =
     VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
@@ -86,6 +91,12 @@ constexpr VkDeviceSize kVertexChunkSize = 32ull << 20;
 constexpr uint64_t kVertexIdleFrames = 600;
 // Frames a texture may go unused before it is freed.
 constexpr uint64_t kTextureIdleFrames = 1800;
+// Frames a texture's memory may differ from what the game drew with, each
+// within kTextureStaleGap frames of the last, before it is decoded as it is
+// anyway. (A video's frame decoded early matches the next draw, so its
+// misses aren't every frame.)
+constexpr uint32_t kTextureStaleFrames = 3;
+constexpr uint64_t kTextureStaleGap = 4;
 
 #define NV_INSTANCE_FUNCTIONS(X)                \
   X(vkEnumeratePhysicalDevices)                 \
@@ -98,6 +109,7 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)  \
   X(vkGetPhysicalDeviceSurfaceFormatsKHR)       \
   X(vkGetPhysicalDeviceSurfacePresentModesKHR)  \
+  X(vkDestroySurfaceKHR)                        \
   X(vkCreateDevice)                             \
   X(vkGetDeviceProcAddr)
 
@@ -133,7 +145,9 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCreatePipelineCache)           \
   X(vkGetPipelineCacheData)          \
   X(vkCreateShaderModule)            \
+  X(vkDestroyShaderModule)           \
   X(vkCreateGraphicsPipelines)       \
+  X(vkCreateComputePipelines)        \
   X(vkCreateCommandPool)             \
   X(vkAllocateCommandBuffers)        \
   X(vkBeginCommandBuffer)            \
@@ -157,6 +171,7 @@ constexpr uint64_t kTextureIdleFrames = 1800;
   X(vkCmdSetViewport)                \
   X(vkCmdSetScissor)                 \
   X(vkCmdDrawIndexed)                \
+  X(vkCmdDispatch)                   \
   X(vkCreateQueryPool)               \
   X(vkCmdResetQueryPool)             \
   X(vkCmdBeginQuery)                 \
@@ -213,6 +228,82 @@ uint32_t DebugFlags() {
     return value ? uint32_t(std::strtoul(value, nullptr, 0)) : 0u;
   }();
   return flags;
+}
+
+// NARUTO_NATIVE_VIEW_SCALE: how many times the game's resolution the view
+// renders at (1.5 by default, 1080p from the game's 720p). Render targets,
+// resolved textures, viewports, clears and resolves are all scaled by it.
+float ResolutionScale() {
+  static const float scale = [] {
+    const char* value = std::getenv("NARUTO_NATIVE_VIEW_SCALE");
+    float scale = value ? std::strtof(value, nullptr) : 1.5f;
+    return std::isfinite(scale) ? std::clamp(scale, 1.0f, 4.0f) : 1.0f;
+  }();
+  return scale;
+}
+
+// A size or coordinate in game pixels, in the view's pixels.
+int32_t Scaled(int32_t pixels) { return int32_t(std::lround(pixels * ResolutionScale())); }
+uint32_t Scaled(uint32_t pixels) { return uint32_t(std::lround(pixels * ResolutionScale())); }
+
+// NARUTO_NATIVE_VIEW_UPSCALER: how the frame is scaled up where the window
+// shows it larger than it was rendered: fsr (AMD FSR 1, the default), cas
+// (AMD CAS, which also sharpens it at its own size) or linear.
+enum class Upscaler { kFsr, kCas, kLinear };
+
+Upscaler UpscalerSetting() {
+  static const Upscaler upscaler = [] {
+    const char* value = std::getenv("NARUTO_NATIVE_VIEW_UPSCALER");
+    std::string_view name = value ? value : "fsr";
+    return name == "cas" ? Upscaler::kCas : name == "linear" ? Upscaler::kLinear : Upscaler::kFsr;
+  }();
+  return upscaler;
+}
+
+// NARUTO_NATIVE_VIEW_SHARPNESS: how much FSR's RCAS or CAS sharpens, from 0
+// to 1 (the sharpest); 0.9 by default.
+float Sharpness() {
+  static const float sharpness = [] {
+    const char* value = std::getenv("NARUTO_NATIVE_VIEW_SHARPNESS");
+    float sharpness = value ? std::strtof(value, nullptr) : 0.9f;
+    return std::isfinite(sharpness) ? std::clamp(sharpness, 0.0f, 1.0f) : 0.9f;
+  }();
+  return sharpness;
+}
+
+// NARUTO_NATIVE_VIEW_ASPECT: the shape the game's frame is shown at, as
+// "W:H" (16:9 by default, the 360's TV picture), or "fill" for the window's
+// own shape. 0 for fill.
+float DisplayAspect() {
+  static const float aspect = [] {
+    const char* value = std::getenv("NARUTO_NATIVE_VIEW_ASPECT");
+    std::string_view text = value ? value : "16:9";
+    if (text == "fill") {
+      return 0.0f;
+    }
+    char* end = nullptr;
+    float w = std::strtof(text.data(), &end);
+    float h = *end == ':' ? std::strtof(end + 1, nullptr) : 0.0f;
+    float aspect = w / h;
+    return std::isfinite(aspect) && aspect >= 0.25f && aspect <= 8.0f ? aspect : 16.0f / 9.0f;
+  }();
+  return aspect;
+}
+
+// NARUTO_OUT_DIR: where the view keeps its pipeline cache and snapshots,
+// "out" by default (Android passes a folder of the app's own).
+std::string OutDir() {
+  const char* value = std::getenv("NARUTO_OUT_DIR");
+  return value && *value ? value : "out";
+}
+
+// NARUTO_NATIVE_VIEW_FXAA=1 smooths edges with FXAA before scaling.
+bool FxaaEnabled() {
+  static const bool enabled = [] {
+    const char* value = std::getenv("NARUTO_NATIVE_VIEW_FXAA");
+    return value && *value == '1';
+  }();
+  return enabled;
 }
 
 VkBlendOp BlendOp(uint32_t op) {
@@ -279,15 +370,50 @@ class View {
   }
 
   bool Initialize() {
+#ifdef __ANDROID__
+    // Android has one window, the game's; Xenia doesn't present to it in
+    // native-only mode (naruto_app.h), so the view draws there.
+    SDL_RunOnMainThread(
+        [](void* self) {
+          int count = 0;
+          SDL_Window** windows = SDL_GetWindows(&count);
+          static_cast<View*>(self)->window_ = windows && count ? windows[0] : nullptr;
+          SDL_free(windows);
+        },
+        this, true);
+    if (!window_ || !SDL_Vulkan_LoadLibrary(nullptr)) {
+      REXLOG_ERROR("[native view] no game window to draw in: {}", SDL_GetError());
+      return false;
+    }
+#else
     // SDL windows belong to the main thread.
+    // A window the size of the frame shown at its aspect, where the screen has
+    // room for it.
     auto create_window = [](void* self) {
+      float aspect = DisplayAspect() > 0.0f ? DisplayAspect() : 16.0f / 9.0f;
+      int height = int(Scaled(720u)), width = int(std::lround(height * aspect));
+      SDL_Rect usable;
+      if (SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
+        float fit = std::min({1.0f, 0.9f * usable.w / width, 0.9f * usable.h / height});
+        width = int(width * fit);
+        height = int(height * fit);
+      }
       static_cast<View*>(self)->window_ = SDL_CreateWindow(
-          "Naruto - native renderer", 960, 540, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+          "Naruto - native renderer", width, height, SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+      const char* fullscreen = std::getenv("NARUTO_NATIVE_VIEW_FULLSCREEN");
+      if (fullscreen && *fullscreen == '1' && static_cast<View*>(self)->window_) {
+        SDL_SetWindowFullscreen(static_cast<View*>(self)->window_, true);
+      }
     };
     if (!SDL_RunOnMainThread(create_window, this, true) || !window_) {
       REXLOG_ERROR("[native view] window creation failed: {}", SDL_GetError());
       return false;
     }
+    if (const char* value = std::getenv("NARUTO_NATIVE_VIEW_ONLY"); value && *value == '1') {
+      SDL_RunOnMainThread([](void* self) { static_cast<View*>(self)->ReplaceGameWindow(); }, this,
+                          true);
+    }
+#endif
 
     vk_get_instance_proc_addr_ =
         reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
@@ -312,12 +438,54 @@ class View {
   name = reinterpret_cast<PFN_##name>(vk_get_instance_proc_addr_(instance_, #name));
     NV_INSTANCE_FUNCTIONS(X)
 #undef X
-    if (!SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_)) {
+    if (!CreateSurface()) {
       REXLOG_ERROR("[native view] surface creation failed: {}", SDL_GetError());
       return false;
     }
-    return PickDevice() && CreateDevice() && CreateResources() && CreateSwapchain();
+    return PickDevice() && CreateDevice() && CreateResources() && CreatePostProcessing() &&
+           CreateDepthConversion() &&
+           CreateSwapchain();
   }
+
+  bool CreateSurface() {
+#ifdef __ANDROID__
+    surface_window_ = AndroidWindow();
+#endif
+    return SDL_Vulkan_CreateSurface(window_, instance_, nullptr, &surface_);
+  }
+
+#ifdef __ANDROID__
+  void* AndroidWindow() const {
+    return SDL_GetPointerProperty(SDL_GetWindowProperties(window_),
+                                  SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, nullptr);
+  }
+
+  // Android replaces the window's surface when the app comes back from the
+  // background (and has none meanwhile): the swapchain follows it. False
+  // while there is none.
+  bool FollowAndroidSurface() {
+    void* current = AndroidWindow();
+    if (current == surface_window_ && surface_) {
+      return current != nullptr;
+    }
+    vkDeviceWaitIdle(device_);
+    if (swapchain_) {
+      DestroySwapchainResources();
+      vkDestroySwapchainKHR(device_, swapchain_, nullptr);
+      swapchain_ = VK_NULL_HANDLE;
+    }
+    if (surface_) {
+      vkDestroySurfaceKHR(instance_, surface_, nullptr);
+      surface_ = VK_NULL_HANDLE;
+    }
+    surface_window_ = nullptr;
+    if (!current || !CreateSurface()) {
+      return false;
+    }
+    REXLOG_INFO("[native view] drawing to a new Android surface");
+    return true;
+  }
+#endif
 
   // Prefers a discrete GPU with a queue that both draws and presents, and
   // the Vulkan 1.3 features the view needs.
@@ -366,7 +534,7 @@ class View {
           physical_device_ = device;
           queue_family_ = family;
           device_name_ = properties.deviceName;
-          pipeline_cache_path_ = fmt::format("out/pipeline-cache/{:04x}-{:04x}.bin",
+          pipeline_cache_path_ = fmt::format("{}/pipeline-cache/{:04x}-{:04x}.bin", OutDir(),
                                              properties.vendorID, properties.deviceID);
           timestamp_period_ =
               families[family].timestampValidBits ? properties.limits.timestampPeriod : 0.0f;
@@ -416,6 +584,7 @@ class View {
 #undef X
     vkGetDeviceQueue(device_, queue_family_, 0, &queue_);
     vkGetPhysicalDeviceMemoryProperties(physical_device_, &memory_properties_);
+    ChooseDepthFormat();
     LoadPipelineCache();
 
     VkCommandPoolCreateInfo pool_info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -571,6 +740,9 @@ class View {
         FreeVertexMemory(entry.second);
         return true;
       });
+      std::erase_if(stale_textures_, [&](const auto& entry) {
+        return entry.second.frame + kTextureStaleGap < frames_total_;
+      });
       for (auto it = textures_.begin(); it != textures_.end();) {
         if (it->second.last_used + kTextureIdleFrames < frames_total_) {
           Retire(it->second);
@@ -584,8 +756,16 @@ class View {
 
   // The cache entry for a bound texture, decoded into uploads if it is new or
   // its memory changed; nullptr if it has to wait for a later frame.
-  const CachedTexture* Texture(const FrameInfo& frame, const uint32_t fetch[6],
+  //
+  // The view runs behind the game, which may have rewritten a texture's
+  // memory since it drew with it (reused it for another, or started loading
+  // one). Textures are decoded only while their memory matches the
+  // fingerprint taken at the draw; otherwise the previous image stays. Memory
+  // that keeps changing, as a video's frames do, is decoded as it is after a
+  // few frames: that is the closest to what the game drew.
+  const CachedTexture* Texture(const FrameInfo& frame, const TextureBinding& binding,
                                std::vector<PendingUpload>& uploads, size_t& budget) {
+    const uint32_t* fetch = binding.fetch;
     // The fields that decide the image: pitch and tiling, format, endian and
     // address, size, swizzle, dimension.
     auto resolved = resolved_.find(fetch[1] & 0x1FFFF000);
@@ -595,48 +775,98 @@ class View {
     std::array<uint32_t, 5> key = {fetch[0] & 0xFFC00000, fetch[1], fetch[2],
                                    fetch[3] & 0x1FFE, fetch[5] & 0x600};
     auto it = textures_.find(key);
-    if (it != textures_.end()) {
-      CachedTexture& texture = it->second;
-      texture.last_used = frames_total_;
-      if (texture.checked_frame == frames_total_) {
-        return &texture;
+    CachedTexture* previous = it != textures_.end() ? &it->second : nullptr;
+    if (previous) {
+      previous->last_used = frames_total_;
+      // One that keeps changing is checked every frame: what's decoded runs
+      // ahead of the draws, so matching one says nothing about the next.
+      if (previous->checked_frame == frames_total_ ||
+          (binding.fingerprint == previous->fingerprint && !IsChanging(key))) {
+        return previous;
       }
-      texture.checked_frame = frames_total_;
-      uint64_t fingerprint = texture_decode::Fingerprint(frame.guest_base, fetch);
-      if (fingerprint == texture.fingerprint) {
-        return &texture;
-      }
-      Retire(texture);
-      textures_.erase(it);
+      previous->checked_frame = frames_total_;
     }
+    uint64_t current = texture_decode::Fingerprint(frame.guest_base, fetch);
+    // NARUTO_NATIVE_VIEW_LOG_TEXTURES=1 logs what happens to each texture
+    // whose memory changed.
+    static const bool log_textures = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_LOG_TEXTURES");
+      return value && *value == '1';
+    }();
+    auto log = [&](const char* what, double ms = 0) {
+      if (log_textures) {
+        REXLOG_INFO("[native view] texture {:08x} {:08x} frame {}: {} {:.1f} ms (drawn {:016x} now {:016x} had {:016x})",
+                    fetch[1], fetch[2], frames_total_, what, ms, binding.fingerprint, current,
+                    previous ? previous->fingerprint : 0);
+      }
+    };
+    if (previous && current == previous->fingerprint) {
+      return previous;
+    }
+    if (current != binding.fingerprint && !KeepsChanging(key)) {
+      textures_stale_++;
+      log("stale");
+      return previous;
+    }
+    // The new entry, in place of any previous one.
+    auto replace = [&](const CachedTexture& entry) {
+      if (previous) {
+        Retire(*previous);
+        textures_.erase(key);
+      }
+      return &textures_.emplace(key, entry).first->second;
+    };
 
     CachedTexture entry;
-    entry.last_used = entry.checked_frame = frames_total_;
-    entry.fingerprint = texture_decode::Fingerprint(frame.guest_base, fetch);
+    entry.last_used = frames_total_;
+    entry.fingerprint = current;
+    entry.checked_frame = frames_total_;  // its upload may be pending: not replaced again
     texture_decode::Texture decoded;
     const char* reason = nullptr;
     if (!texture_decode::Describe(fetch, decoded, &reason)) {
       WarnOnce(reason, fetch[1] & 0x3F);
       textures_failed_++;
-      return &textures_.emplace(key, entry).first->second;
+      return replace(entry);
     }
-    VkFormatProperties properties;
-    vkGetPhysicalDeviceFormatProperties(physical_device_, VkFormat(decoded.format), &properties);
-    if (!(properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT)) {
-      WarnOnce("texture format not supported by the GPU", decoded.format);
-      textures_failed_++;
-      return &textures_.emplace(key, entry).first->second;
+    // Phone GPUs can't sample BC (DXT) textures: those are decompressed
+    // (NARUTO_NATIVE_VIEW_DECOMPRESS=1 does it on any GPU, to compare).
+    static const bool force_decompress = [] {
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_DECOMPRESS");
+      return value && *value == '1';
+    }();
+    bool decompress = force_decompress && texture_decode::DecompressedFormat(decoded.format);
+    if (!decompress && !CanSample(decoded.format)) {
+      uint32_t plain = texture_decode::DecompressedFormat(decoded.format);
+      if (!plain || !CanSample(plain)) {
+        WarnOnce("texture format not supported by the GPU", decoded.format);
+        textures_failed_++;
+        return replace(entry);
+      }
+      decompress = true;
     }
     entry.heap = uint32_t(decoded.dimension);
     if (!budget || frame_work_.texture_seconds > kTextureDecodeSeconds ||
         free_indices_[entry.heap].empty()) {
-      return nullptr;
+      log("deferred");
+      return previous;
     }
     auto began = std::chrono::steady_clock::now();
     texture_decode::Decode(frame.guest_base, fetch, decoded);
+    if (decompress) {
+      texture_decode::Decompress(decoded);
+    }
     frame_work_.textures++;
     frame_work_.texture_seconds +=
         std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
+    // Changed while decoding: try again in a later frame.
+    double decode_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - began).count();
+    if (texture_decode::Fingerprint(frame.guest_base, fetch) != current) {
+      textures_stale_++;
+      log("changed while decoding", decode_ms);
+      return previous;
+    }
+    log(decompress ? "decoded and decompressed" : "decoded", decode_ms);
     if (const char* dir = std::getenv("NARUTO_NATIVE_VIEW_TEXTURES")) {
       // A PPM where the format allows; otherwise the decoded data as is,
       // named with its size, layers and VkFormat.
@@ -667,12 +897,42 @@ class View {
     entry.index = free_indices_[entry.heap].back();
     free_indices_[entry.heap].pop_back();
     WriteTextureDescriptor(entry.heap, entry.index, entry.image.view);
-    CachedTexture* cached = &textures_.emplace(key, entry).first->second;
+    CachedTexture* cached = replace(entry);
     uploads.push_back({cached, std::move(decoded), 0});
     return cached;
   }
 
-  void WarnOnce(const char* reason, uint32_t value) {
+  // Counts the frames a texture's memory didn't match what the game drew
+  // with, close together; true from the kTextureStaleFrames-th.
+  bool KeepsChanging(const std::array<uint32_t, 5>& key) {
+    StaleTexture& stale = stale_textures_[key];
+    if (stale.frame != frames_total_) {
+      bool close = stale.frame != UINT64_MAX && stale.frame + kTextureStaleGap >= frames_total_;
+      stale.misses = close ? stale.misses + 1 : 1;
+      stale.frame = frames_total_;
+    }
+    return stale.misses >= kTextureStaleFrames;
+  }
+
+  bool IsChanging(const std::array<uint32_t, 5>& key) const {
+    auto stale = stale_textures_.find(key);
+    return stale != stale_textures_.end() && stale->second.misses >= kTextureStaleFrames &&
+           stale->second.frame + kTextureStaleGap >= frames_total_;
+  }
+
+  bool CanSample(uint32_t format) {
+    auto known = sampleable_.find(format);
+    if (known != sampleable_.end()) {
+      return known->second;
+    }
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(physical_device_, VkFormat(format), &properties);
+    bool can = properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    sampleable_.emplace(format, can);
+    return can;
+  }
+
+    void WarnOnce(const char* reason, uint32_t value) {
     if (warned_.insert({reason, value}).second) {
       REXLOG_WARN("[native view] texture not drawn: {} ({})", reason, value);
     }
@@ -827,6 +1087,313 @@ class View {
            VK_SUCCESS;
   }
 
+  // Post-processing (src/shaders), each a compute pass that binds its input
+  // (0), a linear sampler (1) and its output (2): FXAA smooths the shown
+  // image at its own size into fxaa_image_, then FSR 1 (EASU into
+  // post_images_[0], RCAS into post_images_[1]) or CAS (into post_images_[0])
+  // scales it to the window. Present copies the last output to the window;
+  // without any of them it scales the image with a linear blit.
+  bool CreatePostProcessing() {
+    VkDescriptorSetLayoutBinding bindings[] = {
+        {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {1, VK_DESCRIPTOR_TYPE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+        {2, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+    VkDescriptorSetLayoutCreateInfo set_layout{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    set_layout.bindingCount = 3;
+    set_layout.pBindings = bindings;
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(PostConstants)};
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout.setLayoutCount = 1;
+    layout.pSetLayouts = &post_set_layout_;
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &push;
+    constexpr uint32_t kSets = kPostSetsPerFrame * kFramesInFlight;
+    VkDescriptorPoolSize sizes[] = {{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, kSets},
+                                    {VK_DESCRIPTOR_TYPE_SAMPLER, kSets},
+                                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kSets}};
+    VkDescriptorPoolCreateInfo pool{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    pool.maxSets = kSets;
+    pool.poolSizeCount = 3;
+    pool.pPoolSizes = sizes;
+    VkSamplerCreateInfo sampler{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+    sampler.magFilter = sampler.minFilter = VK_FILTER_LINEAR;
+    sampler.addressModeU = sampler.addressModeV = sampler.addressModeW =
+        VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    if (vkCreateDescriptorSetLayout(device_, &set_layout, nullptr, &post_set_layout_) !=
+            VK_SUCCESS ||
+        vkCreatePipelineLayout(device_, &layout, nullptr, &post_layout_) != VK_SUCCESS ||
+        vkCreateDescriptorPool(device_, &pool, nullptr, &post_pool_) != VK_SUCCESS ||
+        vkCreateSampler(device_, &sampler, nullptr, &post_sampler_) != VK_SUCCESS) {
+      return false;
+    }
+    std::array<VkDescriptorSetLayout, kSets> layouts;
+    layouts.fill(post_set_layout_);
+    VkDescriptorSetAllocateInfo allocate{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+    allocate.descriptorPool = post_pool_;
+    allocate.descriptorSetCount = uint32_t(layouts.size());
+    allocate.pSetLayouts = layouts.data();
+    if (vkAllocateDescriptorSets(device_, &allocate, post_sets_.data()) != VK_SUCCESS) {
+      return false;
+    }
+    auto pipeline = [&](const char* name, const uint32_t* code, size_t size, VkPipeline& out) {
+      VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+      module_info.codeSize = size;
+      module_info.pCode = code;
+      VkShaderModule module = VK_NULL_HANDLE;
+      VkResult result = vkCreateShaderModule(device_, &module_info, nullptr, &module);
+      if (result == VK_SUCCESS) {
+        VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        info.stage.module = module;
+        info.stage.pName = "main";
+        info.layout = post_layout_;
+        result = vkCreateComputePipelines(device_, pipeline_cache_, 1, &info, nullptr, &out);
+        vkDestroyShaderModule(device_, module, nullptr);
+      }
+      if (result != VK_SUCCESS) {
+        REXLOG_WARN("[native view] {} pipeline failed; going without it", name);
+        out = VK_NULL_HANDLE;
+      }
+    };
+    pipeline("FSR 1 EASU", kFsrEasuSpirv, sizeof(kFsrEasuSpirv), fsr_easu_);
+    pipeline("FSR 1 RCAS", kFsrRcasSpirv, sizeof(kFsrRcasSpirv), fsr_rcas_);
+    pipeline("CAS", kCasSpirv, sizeof(kCasSpirv), cas_);
+    pipeline("CAS scaling", kCasScaleSpirv, sizeof(kCasScaleSpirv), cas_scale_);
+    pipeline("FXAA", kFxaaSpirv, sizeof(kFxaaSpirv), fxaa_);
+    return true;
+  }
+
+  // The Xbox's depth buffer is 24-bit unorm, which rounds depths a hair
+  // apart to the same value: the character select draws each portrait just
+  // behind the transparent quad before it, and on the Xbox they tie and the
+  // portrait passes its LEQUAL test. A float depth buffer keeps the
+  // difference and, depending on how the GPU rounds, hides the portrait. So
+  // depth is X8_D24 where the GPU can render and copy it, else D32 float.
+  void ChooseDepthFormat() {
+    constexpr VkFormatFeatureFlags needed = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                            VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                            VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    VkFormatProperties properties;
+    vkGetPhysicalDeviceFormatProperties(physical_device_, VK_FORMAT_X8_D24_UNORM_PACK32,
+                                        &properties);
+    const char* force32 = std::getenv("NARUTO_NATIVE_VIEW_DEPTH32");
+    bool d24 = (properties.optimalTilingFeatures & needed) == needed &&
+               !(force32 && force32[0] == '1');
+    depth_format_ = d24 ? VK_FORMAT_X8_D24_UNORM_PACK32 : VK_FORMAT_D32_SFLOAT;
+    REXLOG_INFO("[native view] depth buffers are {}", d24 ? "24-bit unorm" : "32-bit float");
+  }
+
+  // Converts the 24-bit depths a depth resolve copied into the scratch
+  // buffer to floats (src/shaders/depth24.hlsl).
+  bool CreateDepthConversion() {
+    VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(DepthConstants)};
+    VkPipelineLayoutCreateInfo layout{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    layout.pushConstantRangeCount = 1;
+    layout.pPushConstantRanges = &push;
+    if (vkCreatePipelineLayout(device_, &layout, nullptr, &depth24_layout_) != VK_SUCCESS) {
+      return false;
+    }
+    VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    module_info.codeSize = sizeof(kDepth24Spirv);
+    module_info.pCode = kDepth24Spirv;
+    VkShaderModule module = VK_NULL_HANDLE;
+    VkResult result = vkCreateShaderModule(device_, &module_info, nullptr, &module);
+    if (result == VK_SUCCESS) {
+      VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+      info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+      info.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+      info.stage.module = module;
+      info.stage.pName = "main";
+      info.layout = depth24_layout_;
+      result = vkCreateComputePipelines(device_, pipeline_cache_, 1, &info, nullptr, &depth24_);
+      vkDestroyShaderModule(device_, module, nullptr);
+    }
+    if (result != VK_SUCCESS) {
+      // Depth resolves would read garbage, so go back to float depth.
+      REXLOG_WARN("[native view] 24-bit depth conversion failed; using 32-bit float depth");
+      depth24_ = VK_NULL_HANDLE;
+      depth_format_ = VK_FORMAT_D32_SFLOAT;
+    }
+    return true;
+  }
+
+  struct DepthConstants {
+    VkDeviceAddress address;
+    uint32_t count;
+    uint32_t padding;
+  };
+
+  struct PostConstants {
+    uint32_t con[4][4];  // FsrEasuCon, CasSetup's two, or FXAA's 1 / size
+    uint32_t rcas[4];    // FsrRcasCon
+    uint32_t size[4];    // output width and height, input width and height
+  };
+
+  // A post-processing output, recreated when it has to change size. A new
+  // one is moved to the general layout in the frame's command buffer.
+  struct PostImage {
+    Image image;
+    VkExtent2D extent{};
+  };
+
+  void EnsurePostImage(VkCommandBuffer cmd, PostImage& post, VkExtent2D extent) {
+    if (post.image.image && post.extent.width == extent.width &&
+        post.extent.height == extent.height) {
+      return;
+    }
+    if (post.image.image) {
+      retired_.push_back({post.image, 0, 0, frames_total_});
+    }
+    post.image = CreateImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, VK_FORMAT_R8G8B8A8_UNORM,
+                             {extent.width, extent.height, 1}, 1,
+                             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                             VK_IMAGE_ASPECT_COLOR_BIT);
+    post.extent = extent;
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barrier.srcQueueFamilyIndex = barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = post.image.image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                         &barrier);
+  }
+
+  // Runs one post-processing pass from `input` to `output`, with the frame's
+  // descriptor set `slot`.
+  void DispatchPost(VkCommandBuffer cmd, VkPipeline pipeline, uint32_t slot, VkImageView input,
+                    const PostImage& output, PostConstants& constants) {
+    constants.size[0] = output.extent.width;
+    constants.size[1] = output.extent.height;
+    VkDescriptorSet set = post_sets_[kPostSetsPerFrame * frame_index_ + slot];
+    VkDescriptorImageInfo images[] = {
+        {VK_NULL_HANDLE, input, VK_IMAGE_LAYOUT_GENERAL},
+        {post_sampler_, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED},
+        {VK_NULL_HANDLE, output.image.view, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorType types[] = {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, VK_DESCRIPTOR_TYPE_SAMPLER,
+                                VK_DESCRIPTOR_TYPE_STORAGE_IMAGE};
+    VkWriteDescriptorSet writes[3];
+    for (uint32_t i = 0; i < 3; ++i) {
+      writes[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+      writes[i].dstSet = set;
+      writes[i].dstBinding = i;
+      writes[i].descriptorCount = 1;
+      writes[i].descriptorType = types[i];
+      writes[i].pImageInfo = &images[i];
+    }
+    vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+    Barrier(vkCmdPipelineBarrier, cmd);
+    vkCmdPushConstants(cmd, post_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                       &constants);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, post_layout_, 0, 1, &set, 0,
+                            nullptr);
+    vkCmdDispatch(cmd, (output.extent.width + 7) / 8, (output.extent.height + 7) / 8, 1);
+  }
+
+  // Records the post-processing of `source` (in the general layout, `extent`
+  // big) for showing `size` big in the window. Returns the image to copy to
+  // the window, or nullptr where none of it runs.
+  const PostImage* RecordPostProcess(VkCommandBuffer cmd, VkImage source, VkFormat format,
+                                     VkExtent2D extent, VkExtent2D size) {
+    bool fxaa = FxaaEnabled() && fxaa_;
+    Upscaler upscaler = UpscalerSetting();
+    bool upscale = size.width > extent.width;
+    bool fsr = upscaler == Upscaler::kFsr && upscale && fsr_easu_ && fsr_rcas_;
+    // CAS scales up to 4 times the area; past that it sharpens and the blit
+    // scales the rest of the way.
+    bool cas_scale = upscaler == Upscaler::kCas && upscale && cas_scale_ &&
+                     double(size.width) * size.height <= 4.0 * extent.width * extent.height;
+    bool cas = upscaler == Upscaler::kCas && (cas_scale || cas_);
+    if (!fxaa && !fsr && !cas) {
+      return nullptr;
+    }
+    // The source through a view without the swizzle the game's samplers see;
+    // the frame slot's previous view is done with (its fence was waited on).
+    VkImageView& view = post_source_views_[frame_index_];
+    if (view) {
+      vkDestroyImageView(device_, view, nullptr);
+      view = VK_NULL_HANDLE;
+    }
+    VkImageViewCreateInfo view_info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+    view_info.image = source;
+    view_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    view_info.format = format;
+    view_info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    if (vkCreateImageView(device_, &view_info, nullptr, &view) != VK_SUCCESS) {
+      view = VK_NULL_HANDLE;
+      return nullptr;
+    }
+    auto bits = [](float value) { return std::bit_cast<uint32_t>(value); };
+    float in_w = float(extent.width), in_h = float(extent.height);
+    const PostImage* result = nullptr;
+    VkImageView input = view;
+
+    if (fxaa) {
+      EnsurePostImage(cmd, fxaa_image_, extent);
+      PostConstants constants{};
+      constants.con[0][0] = bits(1.0f / in_w);
+      constants.con[0][1] = bits(1.0f / in_h);
+      constants.size[2] = extent.width;
+      constants.size[3] = extent.height;
+      DispatchPost(cmd, fxaa_, 0, input, fxaa_image_, constants);
+      result = &fxaa_image_;
+      input = fxaa_image_.image.view;
+    }
+
+    if (fsr) {
+      EnsurePostImage(cmd, post_images_[0], size);
+      EnsurePostImage(cmd, post_images_[1], size);
+      PostConstants constants{};
+      float out_w = float(size.width), out_h = float(size.height);
+      uint32_t(&con)[4][4] = constants.con;
+      con[0][0] = bits(in_w / out_w);
+      con[0][1] = bits(in_h / out_h);
+      con[0][2] = bits(0.5f * in_w / out_w - 0.5f);
+      con[0][3] = bits(0.5f * in_h / out_h - 0.5f);
+      con[1][0] = bits(1.0f / in_w);
+      con[1][1] = bits(1.0f / in_h);
+      con[1][2] = bits(1.0f / in_w);
+      con[1][3] = bits(-1.0f / in_h);
+      con[2][0] = bits(-1.0f / in_w);
+      con[2][1] = bits(2.0f / in_h);
+      con[2][2] = bits(1.0f / in_w);
+      con[2][3] = bits(2.0f / in_h);
+      con[3][1] = bits(4.0f / in_h);
+      // RCAS takes its sharpness in stops below the maximum.
+      constants.rcas[0] = bits(std::exp2(-2.0f * (1.0f - Sharpness())));
+      constants.size[2] = extent.width;
+      constants.size[3] = extent.height;
+      DispatchPost(cmd, fsr_easu_, 1, input, post_images_[0], constants);
+      constants.size[2] = size.width;
+      constants.size[3] = size.height;
+      DispatchPost(cmd, fsr_rcas_, 2, post_images_[0].image.view, post_images_[1], constants);
+      result = &post_images_[1];
+    } else if (cas) {
+      VkExtent2D out = cas_scale ? size : extent;
+      EnsurePostImage(cmd, post_images_[0], out);
+      PostConstants constants{};
+      // CasSetup.
+      float out_w = float(out.width), out_h = float(out.height);
+      constants.con[0][0] = bits(in_w / out_w);
+      constants.con[0][1] = bits(in_h / out_h);
+      constants.con[0][2] = bits(0.5f * in_w / out_w - 0.5f);
+      constants.con[0][3] = bits(0.5f * in_h / out_h - 0.5f);
+      float sharp = -1.0f / std::lerp(8.0f, 5.0f, Sharpness());
+      constants.con[1][0] = bits(sharp);
+      constants.con[1][2] = bits(8.0f * in_w / out_w);
+      constants.size[2] = extent.width;
+      constants.size[3] = extent.height;
+      DispatchPost(cmd, cas_scale ? cas_scale_ : cas_, 3, input, post_images_[0], constants);
+      result = &post_images_[0];
+    }
+    Barrier(vkCmdPipelineBarrier, cmd);
+    return result;
+  }
+
   void PickSurfaceFormat() {
     uint32_t count = 0;
     vkGetPhysicalDeviceSurfaceFormatsKHR(physical_device_, surface_, &count, nullptr);
@@ -847,6 +1414,15 @@ class View {
     VkSurfaceCapabilitiesKHR caps;
     vkGetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device_, surface_, &caps);
     extent_ = caps.currentExtent;
+#ifdef __ANDROID__
+    // The size the game renders at: the display's compositor stretches it
+    // over the screen for free, instead of the GPU drawing every pixel of a
+    // phone's panel.
+    if (extent_.width && extent_.height) {
+      extent_ = {std::clamp(Scaled(1280u), caps.minImageExtent.width, caps.maxImageExtent.width),
+                 std::clamp(Scaled(720u), caps.minImageExtent.height, caps.maxImageExtent.height)};
+    }
+#endif
     if (extent_.width == UINT32_MAX) {
       int w = 0, h = 0;
       SDL_GetWindowSizeInPixels(window_, &w, &h);
@@ -863,18 +1439,22 @@ class View {
     }
 
     // Mailbox or immediate keep the view from pacing itself to the display.
+    // On Android, FIFO: the game sets the pace (30 frames a second) and the
+    // view waits for the display instead of spinning.
     uint32_t mode_count = 0;
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count, nullptr);
     std::vector<VkPresentModeKHR> modes(mode_count);
     vkGetPhysicalDeviceSurfacePresentModesKHR(physical_device_, surface_, &mode_count,
                                               modes.data());
     VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+#ifndef __ANDROID__
     for (VkPresentModeKHR preferred : {VK_PRESENT_MODE_MAILBOX_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR}) {
       if (std::find(modes.begin(), modes.end(), preferred) != modes.end()) {
         present_mode = preferred;
         break;
       }
     }
+#endif
     VkCompositeAlphaFlagBitsKHR alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & alpha)) {
       alpha = VkCompositeAlphaFlagBitsKHR(caps.supportedCompositeAlpha &
@@ -893,6 +1473,13 @@ class View {
     info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     info.preTransform = caps.currentTransform;
+#ifdef __ANDROID__
+    // The image isn't drawn rotated: the compositor turns it to the
+    // landscape screen.
+    if (caps.supportedTransforms & VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR) {
+      info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    }
+#endif
     info.compositeAlpha = alpha;
     info.presentMode = present_mode;
     info.clipped = VK_TRUE;
@@ -1166,11 +1753,13 @@ class View {
     new_images_.push_back({image, depth, layers});
   }
 
-  // The render target for key, at least `height` rows; recreated (losing
-  // its contents) if it has to grow.
+  // The render target for key, at least `height` rows (in game pixels);
+  // recreated (losing its contents) if it has to grow. Its size is in the
+  // view's pixels.
   RenderTarget* RenderTargetFor(uint64_t key, uint32_t info, uint32_t height) {
     RenderTarget& target = render_targets_[key];
-    uint32_t width = std::max<uint32_t>(uint32_t(key >> 32) & 0x3FFF, 1);
+    uint32_t width = Scaled(std::max<uint32_t>(uint32_t(key >> 32) & 0x3FFF, 1));
+    height = Scaled(height);
     if (target.image.image && target.height >= height && target.width == width) {
       return &target;
     }
@@ -1178,7 +1767,7 @@ class View {
       retired_.push_back({target.image, 0, 0, frames_total_});
     }
     target.depth = key >> 63;
-    target.format = target.depth ? kDepthFormat : ColorFormat(info);
+    target.format = target.depth ? depth_format_ : ColorFormat(info);
     target.width = width;
     target.height = std::max(height, target.height);
     target.image = CreateImage(VK_IMAGE_TYPE_2D, VK_IMAGE_VIEW_TYPE_2D, target.format,
@@ -1203,7 +1792,8 @@ class View {
     const char* reason = nullptr;
     VkFormat format;
     VkComponentMapping components{};
-    uint32_t width = (resolve.fetch[2] & 0x1FFF) + 1, height = ((resolve.fetch[2] >> 13) & 0x1FFF) + 1;
+    uint32_t width = Scaled((resolve.fetch[2] & 0x1FFF) + 1);
+    uint32_t height = Scaled(((resolve.fetch[2] >> 13) & 0x1FFF) + 1);
     if (depth) {
       format = VK_FORMAT_R32_SFLOAT;
       components = {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_R,
@@ -1573,15 +2163,17 @@ class View {
     return viewport;
   }
 
-  // Left/Right in the view's window step through passes, Home goes back to
-  // the busiest one.
+  // Ctrl+Left/Right in the view's window step through passes, Ctrl+Home goes
+  // back to the presented frame. (Ctrl keeps them apart from keyboard
+  // controls, which match their modifiers exactly.)
   void HandleKeys() {
     if (SDL_GetKeyboardFocus() != window_) {
       return;
     }
     const bool* keys = SDL_GetKeyboardState(nullptr);
-    bool left = keys[SDL_SCANCODE_LEFT], right = keys[SDL_SCANCODE_RIGHT],
-         home = keys[SDL_SCANCODE_HOME];
+    bool ctrl = keys[SDL_SCANCODE_LCTRL] || keys[SDL_SCANCODE_RCTRL];
+    bool left = ctrl && keys[SDL_SCANCODE_LEFT], right = ctrl && keys[SDL_SCANCODE_RIGHT],
+         home = ctrl && keys[SDL_SCANCODE_HOME];
     if (left && !key_left_) {
       pass_offset_--;
     }
@@ -1595,9 +2187,79 @@ class View {
     if (f12 && !key_f12_) {
       snapshot_requested_ = true;
     }
+    // F11 switches between the window and fullscreen.
+    bool f11 = keys[SDL_SCANCODE_F11];
+    if (f11 && !key_f11_) {
+      SDL_RunOnMainThread(
+          [](void* window) {
+            auto* w = static_cast<SDL_Window*>(window);
+            SDL_SetWindowFullscreen(w, !(SDL_GetWindowFlags(w) & SDL_WINDOW_FULLSCREEN));
+          },
+          window_, false);
+    }
     key_left_ = left;
     key_right_ = right;
     key_f12_ = f12;
+    key_f11_ = f11;
+  }
+
+  // NARUTO_NATIVE_VIEW_ONLY=1 (run-radeon.sh --native-only): hides the
+  // game's own window, which draws nothing then, and makes this one stand in
+  // for it. Keyboard and focus events here go to the game's window (its
+  // keyboard input needs focus), and closing this one quits the game. Runs on
+  // the main thread.
+  void ReplaceGameWindow() {
+    int count = 0;
+    SDL_Window** windows = SDL_GetWindows(&count);
+    for (int i = 0; windows && i < count; ++i) {
+      if (windows[i] != window_) {
+        game_window_id_ = SDL_GetWindowID(windows[i]);
+        SDL_HideWindow(windows[i]);
+      }
+    }
+    SDL_free(windows);
+    if (!game_window_id_) {
+      REXLOG_WARN("[native view] no game window to hide");
+      return;
+    }
+    SDL_AddEventWatch(
+        [](void* self, SDL_Event* event) -> bool {
+          static_cast<View*>(self)->ForwardEvent(*event);
+          return true;
+        },
+        this);
+  }
+
+  void ForwardEvent(SDL_Event& event) {
+    SDL_WindowID id = SDL_GetWindowID(window_);
+    switch (event.type) {
+      case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+        if (event.window.windowID == id) {
+          SDL_Event quit{};
+          quit.type = SDL_EVENT_QUIT;
+          SDL_PushEvent(&quit);
+        }
+        break;
+      case SDL_EVENT_WINDOW_FOCUS_GAINED:
+      case SDL_EVENT_WINDOW_FOCUS_LOST:
+        if (event.window.windowID == id) {
+          event.window.windowID = game_window_id_;
+        }
+        break;
+      case SDL_EVENT_KEY_DOWN:
+      case SDL_EVENT_KEY_UP:
+        if (event.key.windowID == id) {
+          event.key.windowID = game_window_id_;
+        }
+        break;
+      case SDL_EVENT_TEXT_INPUT:
+        if (event.text.windowID == id) {
+          event.text.windowID = game_window_id_;
+        }
+        break;
+      default:
+        break;
+    }
   }
 
   void SetTitle(std::string title) {
@@ -1849,9 +2511,9 @@ class View {
                      const ResolvedTexture& dest) {
     int32_t x1 = 0, y1 = 0, x2 = int32_t(dest.width), y2 = int32_t(dest.height);
     if (r.has_rect) {
-      x1 = r.rect[0], y1 = r.rect[1], x2 = r.rect[2], y2 = r.rect[3];
+      x1 = Scaled(r.rect[0]), y1 = Scaled(r.rect[1]), x2 = Scaled(r.rect[2]), y2 = Scaled(r.rect[3]);
     }
-    int32_t dx = r.point[0], dy = r.point[1];
+    int32_t dx = Scaled(r.point[0]), dy = Scaled(r.point[1]);
     x2 = std::min({x2, int32_t(source.width), x1 + int32_t(dest.width) - dx});
     y2 = std::min({y2, int32_t(source.height), y1 + int32_t(dest.height) - dy});
     if (x1 < 0 || y1 < 0 || dx < 0 || dy < 0 || x2 <= x1 || y2 <= y1) {
@@ -1882,6 +2544,15 @@ class View {
     vkCmdCopyImageToBuffer(cmd, source.image.image, VK_IMAGE_LAYOUT_GENERAL, scratch_.buffer, 1,
                            &copy);
     Barrier(vkCmdPipelineBarrier, cmd);
+    if (source.format == VK_FORMAT_X8_D24_UNORM_PACK32) {
+      DepthConstants constants{scratch_.address, w * h, 0};
+      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, depth24_);
+      vkCmdPushConstants(cmd, depth24_layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(constants),
+                         &constants);
+      uint32_t groups = (constants.count + 63) / 64;
+      vkCmdDispatch(cmd, std::min<uint32_t>(groups, 65535), (groups + 65534) / 65535, 1);
+      Barrier(vkCmdPipelineBarrier, cmd);
+    }
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     copy.imageOffset = {dx, dy, 0};
     vkCmdCopyBufferToImage(cmd, scratch_.buffer, dest.entry.image.image, VK_IMAGE_LAYOUT_GENERAL,
@@ -1951,17 +2622,21 @@ class View {
     }
     VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     info.size = std::max<VkDeviceSize>(size, 16ull << 20);
-    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     vkCreateBuffer(device_, &info, nullptr, &scratch_.buffer);
     VkMemoryRequirements requirements;
     vkGetBufferMemoryRequirements(device_, scratch_.buffer, &requirements);
-    scratch_.memory = Allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, false);
+    scratch_.memory = Allocate(requirements, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true);
     if (!scratch_.memory) {
       vkDestroyBuffer(device_, scratch_.buffer, nullptr);
       scratch_ = {};
       return false;
     }
     vkBindBufferMemory(device_, scratch_.buffer, scratch_.memory, 0);
+    VkBufferDeviceAddressInfo address_info{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    address_info.buffer = scratch_.buffer;
+    scratch_.address = vkGetBufferDeviceAddress(device_, &address_info);
     scratch_.size = info.size;
     return true;
   }
@@ -2036,14 +2711,14 @@ class View {
   // NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS names (first_draw_slot onwards): its
   // first and second color targets.
   void WriteSnapshots(const char* root, uint32_t count, uint32_t first_draw_slot,
-                      uint32_t draw_pass) {
+                      uint32_t draw_pass, uint32_t first_draw) {
     std::string dir = fmt::format("{}/{:06}", root, frames_total_);
     std::error_code error;
     std::filesystem::create_directories(dir, error);
     for (uint32_t slot = 0; slot < count; ++slot) {
       std::string path =
           slot >= first_draw_slot ? fmt::format("{}/pass{:02}_draw{:03}_rt{}.ppm", dir, draw_pass,
-                                                (slot - first_draw_slot) / 2,
+                                                first_draw + (slot - first_draw_slot) / 2,
                                                 (slot - first_draw_slot) % 2)
           : slot + 1 == first_draw_slot ? fmt::format("{}/final.ppm", dir)
                                         : fmt::format("{}/pass{:02}.ppm", dir, slot);
@@ -2063,6 +2738,11 @@ class View {
   }
 
   void DrawFrame(const FrameInfo& frame) {
+#ifdef __ANDROID__
+    if (!FollowAndroidSurface()) {
+      return;  // in the background
+    }
+#endif
     if (!swapchain_ && !CreateSwapchain()) {
       return;
     }
@@ -2088,8 +2768,10 @@ class View {
     // F12, Back+R3 on a controller (RequestSnapshot), or
     // out/snapshot-request appearing (for scripts), asks for a snapshot.
     std::error_code error;
+    static const std::string snapshot_request = OutDir() + "/snapshot-request";
+    static const std::string default_snapshot_dir = OutDir() + "/snapshots";
     bool requested = snapshot_requested_.exchange(false) ||
-                     std::filesystem::remove("out/snapshot-request", error);
+                     std::filesystem::remove(snapshot_request, error);
     if (requested) {
       REXLOG_INFO("[native view] snapshot requested at frame {}", frames_total_);
     }
@@ -2107,7 +2789,7 @@ class View {
                       (long(frames_total_) - dump_frame) % snapshot_every == 0) ||
                      requested;
     if (!snapshot_dir) {
-      snapshot_dir = "out/snapshots";
+      snapshot_dir = default_snapshot_dir.c_str();
     }
     Dump(frame, snapshots ? UINT32_MAX : shown_pass == UINT32_MAX ? 0 : shown_pass, snapshots);
 
@@ -2118,19 +2800,60 @@ class View {
       const char* value = std::getenv("NARUTO_NATIVE_VIEW_DRAW_SNAPSHOTS");
       return value ? uint32_t(std::strtoul(value, nullptr, 10)) : UINT32_MAX;
     }();
+    // NARUTO_NATIVE_VIEW_DRAW_SNAPSHOT_RANGE=from-to limits them to those
+    // draws of the pass (counted from 0, to excluded): a whole pass of a
+    // phone's frame may not fit in its memory.
+    static const std::pair<size_t, size_t> draw_range = [] {
+      std::pair<size_t, size_t> range{0, SIZE_MAX};
+      if (const char* value = std::getenv("NARUTO_NATIVE_VIEW_DRAW_SNAPSHOT_RANGE")) {
+        char* end = nullptr;
+        range.first = std::strtoul(value, &end, 10);
+        if (end && *end == '-') {
+          range.second = std::strtoul(end + 1, nullptr, 10);
+        }
+      }
+      return range;
+    }();
     uint32_t draw_snapshots = 0;
     if (snapshots) {
+      size_t in_pass = 0;
       for (const Draw& draw : frame.captured) {
-        draw_snapshots += draw.pass == draw_pass ? 2 : 0;
+        if (draw.pass == draw_pass) {
+          draw_snapshots += in_pass >= draw_range.first && in_pass < draw_range.second ? 2 : 0;
+          in_pass++;
+        }
       }
     }
-    if (snapshots && !PrepareSnapshots(pass_count + 1 + draw_snapshots)) {
+    // NARUTO_NATIVE_VIEW_DEPTH_PROBE=x,y[,x,y]: with draw snapshots, logs the
+    // depth at those points (render target pixels at the game's resolution)
+    // after each of the draws.
+    static const std::vector<std::array<int32_t, 2>> depth_probes = [] {
+      std::vector<std::array<int32_t, 2>> points;
+      const char* value = std::getenv("NARUTO_NATIVE_VIEW_DEPTH_PROBE");
+      while (value && *value) {
+        char* end = nullptr;
+        int32_t x = int32_t(std::strtol(value, &end, 10));
+        if (!end || *end != ',') {
+          break;
+        }
+        int32_t y = int32_t(std::strtol(end + 1, &end, 10));
+        points.push_back({x, y});
+        value = end && *end == ',' ? end + 1 : nullptr;
+      }
+      return points;
+    }();
+    const uint32_t probe_slot = pass_count + 1 + draw_snapshots;
+    std::vector<std::pair<size_t, bool>> probed;  // draw in pass, had depth
+    if (snapshots && !PrepareSnapshots(probe_slot + (depth_probes.empty() ? 0 : 1))) {
       snapshots = false;
     }
     std::vector<PassTargets> targets = PlanTargets(frame);
     std::vector<ResolvedTexture*> resolve_destinations(frame.resolves.size());
     std::vector<PendingUpload> texture_uploads;
     size_t budget = kTextureUploadBudget;
+    // Draws with a texture still to be decoded wait for it: drawn with the
+    // placeholder, a new scene would flash white as it loads.
+    std::vector<uint8_t> textures_pending(frame.captured.size());
     shared_.resize(frame.captured.size() * kSharedConstantsSize);
     size_t next_resolve = 0;
     auto plan_resolves = [&](uint32_t up_to_pass) {
@@ -2147,11 +2870,16 @@ class View {
       }
       uint8_t* shared = shared_.data() + d * kSharedConstantsSize;
       std::memcpy(shared, frame.data.data() + draw.shared_constants, kSharedConstantsSize);
+      // At 276, game pixels per view pixel, for pixel shaders that read their
+      // position.
+      float pixel_scale = 1.0f / ResolutionScale();
+      std::memcpy(shared + 276, &pixel_scale, 4);
       // XenosRecomp's layout: 2D, 3D and cube texture indices at 0, 64 and
       // 128, sampler indices at 192, four bytes per sampler register.
       for (uint32_t t = 0; t < draw.texture_count; ++t) {
         const TextureBinding& binding = frame.textures[draw.first_texture + t];
-        const CachedTexture* texture = Texture(frame, binding.fetch, texture_uploads, budget);
+        const CachedTexture* texture = Texture(frame, binding, texture_uploads, budget);
+        textures_pending[d] |= !texture;
         uint32_t heap = texture ? texture->heap : 0, index = texture ? texture->index : 0;
         uint32_t sampler = SamplerIndex(binding.fetch);
         std::memcpy(shared + heap * 64 + binding.sampler * 4, &index, 4);
@@ -2390,6 +3118,8 @@ class View {
             continue;
           }
           VkRect2D area = ClearArea(clear);
+          area = {{Scaled(area.offset.x), Scaled(area.offset.y)},
+                  {Scaled(area.extent.width), Scaled(area.extent.height)}};
           if (rendering && ClearAttachments(cmd, clear, area, pt)) {
             continue;
           }
@@ -2415,9 +3145,14 @@ class View {
         }
         const Draw& draw = frame.captured[i];
         VkViewport viewport = Viewport(draw);
-        if (!draw.index_count || viewport.width <= 0.0f || viewport.height == 0.0f) {
+        if (!draw.index_count || viewport.width <= 0.0f || viewport.height == 0.0f ||
+            textures_pending[i]) {
           continue;
         }
+        viewport.x *= ResolutionScale();
+        viewport.y *= ResolutionScale();
+        viewport.width *= ResolutionScale();
+        viewport.height *= ResolutionScale();
         VkPipeline pipeline = Pipeline(frame, draw, pt);
         if (!pipeline) {
           continue;
@@ -2464,7 +3199,8 @@ class View {
           statistics_draws.push_back(i);
         }
         drawn++;
-        if (snapshots && pass == draw_pass && pt.color_count && pt.color[0]) {
+        if (snapshots && pass == draw_pass && pt.color_count && pt.color[0] &&
+            i - first >= draw_range.first && i - first < draw_range.second) {
           vkCmdEndRendering(cmd);
           rendering = false;
           Barrier(vkCmdPipelineBarrier, cmd);
@@ -2472,8 +3208,27 @@ class View {
             if (pt.color[c]) {
               RecordSnapshot(cmd, pt.color[c]->image.image,
                              {pt.color[c]->width, pt.color[c]->height},
-                             pass_count + 1 + 2 * uint32_t(i - first) + c);
+                             pass_count + 1 + 2 * uint32_t(i - first - draw_range.first) + c);
             }
+          }
+          if (!depth_probes.empty()) {
+            size_t index = probed.size();
+            probed.push_back({i - first, pt.depth != nullptr});
+            for (size_t p = 0; pt.depth && p < depth_probes.size() &&
+                               (index + 1) * depth_probes.size() * 4 <=
+                                   kSnapshotWidth * kSnapshotHeight * 4;
+                 ++p) {
+              VkBufferImageCopy copy{};
+              copy.bufferOffset = VkDeviceSize(probe_slot) * kSnapshotWidth * kSnapshotHeight * 4 +
+                                  (index * depth_probes.size() + p) * 4;
+              copy.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+              copy.imageOffset = {int32_t(depth_probes[p][0] * ResolutionScale()),
+                                  int32_t(depth_probes[p][1] * ResolutionScale()), 0};
+              copy.imageExtent = {1, 1, 1};
+              vkCmdCopyImageToBuffer(cmd, pt.depth->image.image, VK_IMAGE_LAYOUT_GENERAL,
+                                     snapshot_buffer_.buffer, 1, &copy);
+            }
+            Barrier(vkCmdPipelineBarrier, cmd);
           }
         }
       }
@@ -2509,6 +3264,8 @@ class View {
 
     // Present: the front buffer texture, or a pass's render target.
     VkImage present_source = VK_NULL_HANDLE;
+    VkFormat present_format = VK_FORMAT_UNDEFINED;
+    bool present_depth = false;
     VkExtent2D present_extent{};
     std::string shown;
     if (shown_pass == UINT32_MAX) {
@@ -2516,6 +3273,8 @@ class View {
                                           : resolved_.end();
       if (front != resolved_.end()) {
         present_source = front->second.entry.image.image;
+        present_format = front->second.format;
+        present_depth = front->second.depth;
         present_extent = {front->second.width, front->second.height};
       }
       shown = "presented frame";
@@ -2527,6 +3286,8 @@ class View {
       }
       if (target) {
         present_source = target->image.image;
+        present_format = target->format;
+        present_depth = target->depth;
         present_extent = {target->width, target->height};
       }
       shown = fmt::format("pass {}/{}", shown_pass + 1, pass_count);
@@ -2535,6 +3296,32 @@ class View {
                          frame.draws, frame.resolves.size()));
     if (snapshots && present_source) {
       RecordSnapshot(cmd, present_source, present_extent, pass_count);
+    }
+    // Fit the picture inside the window. The game's front buffer isn't 16:9
+    // (1280x640): the 360's scaler stretches it to the 16:9 screen, so the
+    // presented frame is shown at the display aspect (16:9 unless set, or
+    // the window's own); a pass is shown as it is.
+    int32_t w = 0, h = 0;
+    const PostImage* post = nullptr;
+    if (present_source) {
+      float aspect = shown_pass != UINT32_MAX ? float(present_extent.width) / present_extent.height
+                     : DisplayAspect() > 0.0f ? DisplayAspect()
+                                              : float(extent_.width) / extent_.height;
+      float scale = std::min(float(extent_.width) / aspect, float(extent_.height));
+      w = std::max(int32_t(scale * aspect + 0.5f), 1);
+      h = std::max(int32_t(scale + 0.5f), 1);
+      if (present_extent.width != logged_source_.width ||
+          present_extent.height != logged_source_.height || extent_.width != logged_window_.width ||
+          extent_.height != logged_window_.height) {
+        REXLOG_INFO("[native view] showing {}x{} as {}x{} in {}x{}", present_extent.width,
+                    present_extent.height, w, h, extent_.width, extent_.height);
+        logged_source_ = present_extent;
+        logged_window_ = extent_;
+      }
+      if (!present_depth) {
+        post = RecordPostProcess(cmd, present_source, present_format, present_extent,
+                                 {uint32_t(w), uint32_t(h)});
+      }
     }
     VkImage swap_image = targets_[image_index].image;
     VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -2551,19 +3338,27 @@ class View {
     vkCmdClearColorImage(cmd, swap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &background, 1,
                          &range);
     if (present_source) {
-      // Fit the source's aspect ratio inside the window.
-      float scale = std::min(float(extent_.width) / present_extent.width,
-                             float(extent_.height) / present_extent.height);
-      int32_t w = int32_t(present_extent.width * scale), h = int32_t(present_extent.height * scale);
+      // The clear has to finish first: racing it, the blit's writes leave
+      // blocks of noise on AMD GPUs.
+      VkMemoryBarrier cleared{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      cleared.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      cleared.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
+                           1, &cleared, 0, nullptr, 0, nullptr);
+      // Copy with a blit, which converts the format to the swapchain's and
+      // scales whatever post-processing didn't.
       int32_t x = (int32_t(extent_.width) - w) / 2, y = (int32_t(extent_.height) - h) / 2;
       VkImageBlit blit{};
       blit.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-      blit.srcOffsets[1] = {int32_t(present_extent.width), int32_t(present_extent.height), 1};
+      VkExtent2D source_extent = post ? post->extent : present_extent;
+      blit.srcOffsets[1] = {int32_t(source_extent.width), int32_t(source_extent.height), 1};
       blit.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
       blit.dstOffsets[0] = {x, y, 0};
       blit.dstOffsets[1] = {x + w, y + h, 1};
-      vkCmdBlitImage(cmd, present_source, VK_IMAGE_LAYOUT_GENERAL, swap_image,
-                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_LINEAR);
+      bool same_size = source_extent.width == uint32_t(w) && source_extent.height == uint32_t(h);
+      vkCmdBlitImage(cmd, post ? post->image.image : present_source, VK_IMAGE_LAYOUT_GENERAL,
+                     swap_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                     same_size ? VK_FILTER_NEAREST : VK_FILTER_LINEAR);
     }
     VkImageMemoryBarrier to_present = to_dst;
     to_present.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2614,7 +3409,27 @@ class View {
                       values[4]);
         }
       }
-      WriteSnapshots(snapshot_dir, pass_count + 1 + draw_snapshots, pass_count + 1, draw_pass);
+      WriteSnapshots(snapshot_dir, pass_count + 1 + draw_snapshots, pass_count + 1, draw_pass,
+                     uint32_t(draw_range.first));
+      for (size_t index = 0; index < probed.size(); ++index) {
+        std::string values;
+        for (size_t p = 0; probed[index].second && p < depth_probes.size(); ++p) {
+          float depth;
+          std::memcpy(&depth,
+                      snapshot_buffer_.mapped + size_t(probe_slot) * kSnapshotWidth *
+                                                    kSnapshotHeight * 4 +
+                                  (index * depth_probes.size() + p) * 4,
+                      4);
+          if (depth_format_ == VK_FORMAT_X8_D24_UNORM_PACK32) {
+            uint32_t bits;
+            std::memcpy(&bits, &depth, 4);
+            depth = float(bits & 0xFFFFFF) / 16777215.0f;
+          }
+          values += fmt::format(" ({},{}) {:.9g}", depth_probes[p][0], depth_probes[p][1], depth);
+        }
+        REXLOG_INFO("[native view] depth after draw {} of pass {}:{}", probed[index].first,
+                    draw_pass, probed[index].second ? values : std::string(" no depth target"));
+      }
     }
 
     VkPresentInfoKHR present{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
@@ -2625,8 +3440,14 @@ class View {
     present.pImageIndices = &image_index;
     VkResult presented = vkQueuePresentKHR(queue_, &present);
     frame_index_ = (frame_index_ + 1) % kFramesInFlight;
-    if (presented == VK_ERROR_OUT_OF_DATE_KHR || presented == VK_SUBOPTIMAL_KHR ||
-        acquired == VK_SUBOPTIMAL_KHR) {
+#ifdef __ANDROID__
+    // Android calls a swapchain that isn't the screen's size or rotation
+    // suboptimal; it is that way on purpose.
+    bool suboptimal = false;
+#else
+    bool suboptimal = presented == VK_SUBOPTIMAL_KHR || acquired == VK_SUBOPTIMAL_KHR;
+#endif
+    if (presented == VK_ERROR_OUT_OF_DATE_KHR || suboptimal) {
       Recreate();
     }
 
@@ -2638,11 +3459,12 @@ class View {
       REXLOG_INFO(
           "[native view] {:.1f} fps, {:.1f} draws/frame, {} passes, {} resolves, "
           "{:.1f} MB captured/frame, {} pipelines, {} render targets, {} resolved textures, "
-          "{} textures ({} not decodable), {:.1f} MB of textures uploaded, {:.1f} MB of "
+          "{} textures ({} not decodable, {} changed before decoding), {:.1f} MB of textures uploaded, {:.1f} MB of "
           "vertices cached ({} ranges in {} chunks)",
           frames_presented_ / seconds, double(draws_drawn_) / std::max<uint64_t>(frames_presented_, 1),
           pass_count, frame.resolves.size(), frame.data.size() / 1048576.0, pipelines_.size(),
           render_targets_.size(), resolved_.size(), textures_.size(), textures_failed_,
+          textures_stale_,
           textures_uploaded_bytes_ / 1048576.0, vertices_uploaded_bytes_ / 1048576.0,
           vertex_data_.size(), vertex_chunks_.size());
       vertices_uploaded_bytes_ = 0;
@@ -2698,6 +3520,7 @@ class View {
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceAddress address = 0;
   };
 
   std::once_flag started_;
@@ -2708,11 +3531,14 @@ class View {
   std::vector<std::vector<uint8_t>> spare_data_;
 
   SDL_Window* window_ = nullptr;
+  SDL_WindowID game_window_id_ = 0;  // the hidden game window, with NATIVE_VIEW_ONLY
   std::string title_;
   int64_t pass_offset_ = 0;
   bool key_left_ = false;
   bool key_right_ = false;
   bool key_f12_ = false;
+  bool key_f11_ = false;
+  VkExtent2D logged_source_{}, logged_window_{};  // last sizes logged by present
   std::atomic<bool> snapshot_requested_ = false;
   uint64_t frames_presented_ = 0;
   uint64_t frames_total_ = 0;
@@ -2727,6 +3553,9 @@ class View {
 #undef X
   VkInstance instance_ = VK_NULL_HANDLE;
   VkSurfaceKHR surface_ = VK_NULL_HANDLE;
+#ifdef __ANDROID__
+  void* surface_window_ = nullptr;  // the ANativeWindow surface_ was made for
+#endif
   VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
   VkPhysicalDeviceMemoryProperties memory_properties_{};
   uint32_t queue_family_ = 0;
@@ -2748,12 +3577,34 @@ class View {
   VkQueryPool statistics_pool_ = VK_NULL_HANDLE;
   static constexpr uint32_t kStatisticsQueries = 64;
   std::map<std::array<uint32_t, 5>, CachedTexture> textures_;
+  struct StaleTexture {
+    uint64_t frame = UINT64_MAX;  // the last frame its memory didn't match
+    uint32_t misses = 0;          // frames, each close to the last
+  };
+  std::map<std::array<uint32_t, 5>, StaleTexture> stale_textures_;
   std::array<std::vector<uint32_t>, 3> free_indices_;
   std::vector<Retired> retired_;
   uint64_t textures_failed_ = 0;
+  uint64_t textures_stale_ = 0;  // memory changed since the game drew with it
   uint64_t textures_uploaded_bytes_ = 0;
   VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
   std::string pipeline_cache_path_;
+  // Post-processing: a descriptor set per pass (FXAA, EASU, RCAS, CAS) per
+  // frame in flight.
+  static constexpr uint32_t kPostSetsPerFrame = 4;
+  VkDescriptorSetLayout post_set_layout_ = VK_NULL_HANDLE;
+  VkPipelineLayout post_layout_ = VK_NULL_HANDLE;
+  VkFormat depth_format_ = VK_FORMAT_D32_SFLOAT;
+  VkPipelineLayout depth24_layout_ = VK_NULL_HANDLE;
+  VkPipeline depth24_ = VK_NULL_HANDLE;
+  VkPipeline fsr_easu_ = VK_NULL_HANDLE, fsr_rcas_ = VK_NULL_HANDLE;
+  VkPipeline cas_ = VK_NULL_HANDLE, cas_scale_ = VK_NULL_HANDLE, fxaa_ = VK_NULL_HANDLE;
+  VkSampler post_sampler_ = VK_NULL_HANDLE;
+  VkDescriptorPool post_pool_ = VK_NULL_HANDLE;
+  std::array<VkDescriptorSet, kPostSetsPerFrame * kFramesInFlight> post_sets_{};
+  std::array<VkImageView, kFramesInFlight> post_source_views_{};
+  PostImage fxaa_image_;
+  std::array<PostImage, 2> post_images_{};  // EASU and RCAS, or CAS, output
   size_t saved_pipelines_ = 0;  // pipelines_.size() at the last save
   std::unordered_map<uint64_t, ResidentVertices> vertex_data_;  // by VertexData::id
   std::vector<VertexChunk> vertex_chunks_;
@@ -2777,6 +3628,7 @@ class View {
   uint64_t gpu_frames_ = 0;
   std::vector<uint8_t> shared_;
   std::set<std::pair<std::string, uint32_t>> warned_;
+  std::unordered_map<uint32_t, bool> sampleable_;  // by VkFormat
   VkDescriptorPool descriptor_pool_ = VK_NULL_HANDLE;
   std::array<VkDescriptorSetLayout, 4> set_layouts_{};
   std::array<VkDescriptorSet, 4> descriptor_sets_{};

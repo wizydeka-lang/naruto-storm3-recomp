@@ -12,6 +12,7 @@ def sdkLibs = new File(rexglueSdk, 'out/install/android-arm64/lib')
 def gameBuild = rootProject.file('../out/build/android-arm64-release')
 def stagedLibs = layout.buildDirectory.dir('staged/jniLibs')
 def stagedAssets = layout.buildDirectory.dir('staged/assets')
+def stagedRes = layout.buildDirectory.dir('staged/res')
 
 android {
     namespace = 'dev.narutorecomp'
@@ -48,6 +49,9 @@ android {
             java.srcDirs += sdlJava
             jniLibs.srcDirs = [stagedLibs]
             assets.srcDirs = [stagedAssets]
+            // src/main/res, with the icon made from the game's art over the
+            // default one.
+            res.srcDirs = [stagedRes]
         }
     }
 
@@ -82,13 +86,42 @@ def stageNativeLibs = tasks.register('stageNativeLibs', Copy) {
     }
 }
 
+// The settings, and the shader cache built on the PC when there is one
+// (tools/build-shaders.py): the phone then compiles no shaders as it plays.
+// Both come from the local build, never from the repository.
 def stageAssets = tasks.register('stageAssets', Copy) {
     from(rootProject.file('../config/naruto-performance.toml')) {
         rename { 'naruto.toml' }
     }
+    from(rootProject.file('../out/shaders/naruto_shaders.bin'))
     into(stagedAssets)
 }
 
+// The resources, with the app icon made from the game's own box art
+// (assets/nxeart) when it and the desktop launcher's Python and Qt are there;
+// otherwise the default icon stays.
+def stageIcons = tasks.register('stageIcons') {
+    def script = rootProject.file('../tools/launcher/naruto_launcher.py')
+    def art = rootProject.file('../assets/nxeart')
+    def res = file('src/main/res')
+    inputs.dir(res)
+    inputs.files(script, art).optional()
+    outputs.dir(stagedRes)
+    doLast {
+        def staged = stagedRes.get().asFile
+        project.delete(staged)
+        project.copy { from res; into staged }
+        if (!art.exists()) {
+            return
+        }
+        def result = providers.exec {
+            commandLine 'python3', script.path, '--android-icons', staged.path
+            ignoreExitValue = true
+        }
+        logger.lifecycle(result.standardOutput.asText.get().trim())
+    }
+}
+
 tasks.named('preBuild') {
-    dependsOn stageNativeLibs, stageAssets
+    dependsOn stageNativeLibs, stageAssets, stageIcons
 }

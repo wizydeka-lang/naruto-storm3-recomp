@@ -31,13 +31,21 @@ bool Describe(const uint32_t fetch[6], Texture& texture, const char** reason);
 // Fills texture.data from guest memory.
 void Decode(const uint8_t* guest_base, const uint32_t fetch[6], Texture& texture);
 
+// The uncompressed VkFormat Decompress turns a block-compressed format into
+// (BC1-3 to RGBA8, BC4 to R8, BC5 to R8G8), or 0 for other formats.
+uint32_t DecompressedFormat(uint32_t format);
+
+// Converts decoded BC1-5 blocks to plain texels, for GPUs that can't sample
+// them (phone GPUs, which have ASTC and ETC2 instead). Changes the format.
+void Decompress(Texture& texture);
+
 // Writes an uncompressed 2D texture as a binary PPM (development aid);
 // returns false for formats it doesn't handle.
 bool WritePreview(const Texture& texture, const char* path);
 
 // A fingerprint of the texture's guest memory, to notice new contents at the
-// same address: a hash of all of it for small textures, of 512 evenly spaced
-// samples for larger ones.
+// same address: a hash of all of it up to 1 MB, of 64 bytes in every 512 for
+// larger ones.
 uint64_t Fingerprint(const uint8_t* guest_base, const uint32_t fetch[6]);
 
 }  // namespace texture_decode

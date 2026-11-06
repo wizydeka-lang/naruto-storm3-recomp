@@ -24,7 +24,7 @@ while [[ $# -gt 0 ]]; do
         '--radeon: use the integrated Radeon 660M instead (menus run at ~25 FPS vs 30).' \
         '--profile: isolated run with per-guest-update GPU logs under out/performance/runs/.' \
         '--check: verify required files without launching or writing files.' \
-        '--native-only: draw only in the native view; Xenia runs the command stream but renders nothing.'
+        '--native-only: draw only in the native view, the only window shown; Xenia runs the command stream but renders nothing.'
       exit 0 ;;
     *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
   esac
@@ -72,6 +72,7 @@ export LD_LIBRARY_PATH="$sdk_prefix/lib64${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 native_args=()
 if [[ "$native_only" == true ]]; then
   export NARUTO_NATIVE_VIEW=1
+  export NARUTO_NATIVE_VIEW_ONLY=1
   native_args=(--vulkan_skip_rendering=true)
 fi
 cd -- "$project_root"

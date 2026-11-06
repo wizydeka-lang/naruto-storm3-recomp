@@ -147,3 +147,47 @@ presents do nothing. The native view (`src/native_view.cpp`) then does all the
 rendering; `bash tools/run-radeon.sh --native-only` turns both on. Resolved
 data never reaches guest memory in this mode, so anything the game reads back
 on the CPU from a resolve sees stale memory.
+
+## Netplay (online play without Xbox Live)
+
+`rexglue-netplay.patch` adds the `netplay` setting (off by default). It fakes
+just enough of Xbox Live for the game's own online code to run peer to peer
+on a local network. Apply it after `rexglue-android.patch`.
+
+```bash
+naruto --netplay=true --netplay_peer=192.168.0.4   # the other machine's IP
+```
+
+On Android, put `netplay = true` and `netplay_peer = "<PC IP>"` in
+`files/user/naruto.toml`. Both sides then use Online Battle → Player Match:
+one hosts, and the other searches or uses Quick Match.
+
+What the patch does with `--netplay=true`:
+
+- **Sign-in.** Player 1 is signed in to Xbox Live with every privilege and Gold.
+  `XamGetSystemVersion` reports a current dashboard. Without it the game skips
+  `XSessionGetDetails` and crashes when hosting.
+- **Lobby.** A lobby on UDP 36000 answers session searches with the session
+  hosted on this machine. It asks `netplay_peer` and broadcasts on the LAN.
+- **Ports.** Game socket ports move up by `netplay_port_offset` (36000). The
+  game's TCP 8996 becomes 44996 and its UDP 1000/1001 become 37000/37001, so
+  allow those through firewalls.
+- **Sessions.** Create, join, leave, modify, details, start, end and delete
+  are implemented. A joining copy reports the host's slot counts. The game
+  sizes its peer table from `XSessionGetDetails` and otherwise writes through
+  a null pointer (guest 0x54) once the match starts.
+- **Winsock on POSIX.** Option and ioctl constants are translated, errno is
+  mapped to WSA codes, and `select` gets a real `nfds`. Socket handles are
+  positive, because the game treats negative ones as invalid. `sendto` and
+  `recvfrom` convert address byte order: before this, every UDP packet went
+  to a byte-swapped IP.
+- **Logging.** Calls are logged with a `[netplay]` prefix, capped at the first
+  40 of each kind.
+
+The Android app needs the `INTERNET` permission (in the manifest).
+
+Tested on one Wi-Fi network between a Linux PC and an Android phone. With the
+phone hosting and the PC joining, a Player Match reaches the fight and both
+screens stay in step. With the PC hosting, the phone joins and gets through
+character select. That direction has not yet been played into a fight with
+the UDP fix.

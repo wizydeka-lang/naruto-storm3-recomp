@@ -39,6 +39,7 @@ set(NARUTO_SOURCES
     src/frame_capture.cpp
     src/texture_decode.cpp
     src/shader_library.cpp
+    src/input_remap.cpp
 )
 
 if(WIN32)

@@ -9,6 +9,7 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #define XXH_INLINE_ALL
 #include <xxhash.h>
@@ -76,6 +77,7 @@ const FormatInfo* Find(uint32_t xenos) {
 struct Fetch {
   uint32_t format, endian, dimension;
   bool tiled;
+  bool packed_mips;
   uint32_t pitch;  // texels
   uint32_t address;  // physical
   uint32_t width, height, depth;
@@ -91,6 +93,7 @@ Fetch Parse(const uint32_t f[6]) {
   fetch.address = f[1] & 0xFFFFF000;
   fetch.swizzle = (f[3] >> 1) & 0xFFF;
   fetch.dimension = (f[5] >> 9) & 3;
+  fetch.packed_mips = (f[5] >> 11) & 1;
   fetch.depth = 1;
   switch (fetch.dimension) {
     case 0:  // 1D
@@ -139,19 +142,36 @@ uint32_t Swap32(uint32_t value, uint32_t endian) {
 
 struct Layout {
   uint32_t blocks_w, blocks_h, pitch_blocks;
+  // Where the base level starts, in blocks: with packed mips, a base level
+  // 16 texels or less on its shorter side lies in the mip tail, beside (or,
+  // for wide textures, below) where the 16x16 mip would be (Xenia's
+  // GetPackedMipOffset for level 0).
+  uint32_t offset_x = 0, offset_y = 0;
   uint32_t layer_size;  // guest bytes per layer or slice
 };
+
+uint32_t Log2Ceil(uint32_t value) { return value <= 1 ? 0 : 32 - std::countl_zero(value - 1); }
 
 Layout LayoutOf(const Fetch& fetch, const FormatInfo& info) {
   Layout layout;
   layout.blocks_w = (fetch.width + info.block - 1) / info.block;
   layout.blocks_h = (fetch.height + info.block - 1) / info.block;
   layout.pitch_blocks = std::max((fetch.pitch + info.block - 1) / info.block, layout.blocks_w);
+  uint32_t log2_w = Log2Ceil(fetch.width), log2_h = Log2Ceil(fetch.height);
+  if (fetch.packed_mips && fetch.dimension != 0 && std::min(log2_w, log2_h) <= 4) {
+    if (log2_w > std::max(log2_h, 1u)) {
+      layout.offset_y = 16 / info.block;
+    } else {
+      layout.offset_x = 16 / info.block;
+    }
+  }
+  uint32_t extent_w = layout.offset_x + layout.blocks_w, extent_h = layout.offset_y + layout.blocks_h;
+  layout.pitch_blocks = std::max(layout.pitch_blocks, extent_w);
   uint32_t size;
   if (fetch.tiled) {
-    size = ((layout.pitch_blocks + 31) & ~31u) * ((layout.blocks_h + 31) & ~31u) * info.bytes;
+    size = ((layout.pitch_blocks + 31) & ~31u) * ((extent_h + 31) & ~31u) * info.bytes;
   } else {
-    size = ((layout.pitch_blocks * info.bytes + 255) & ~255u) * layout.blocks_h;
+    size = ((layout.pitch_blocks * info.bytes + 255) & ~255u) * extent_h;
   }
   layout.layer_size = (size + 4095) & ~4095u;
   return layout;
@@ -216,9 +236,10 @@ void Decode(const uint8_t* guest_base, const uint32_t fetch_words[6], Texture& t
     const uint8_t* source = Physical(guest_base, fetch.address + image * layout.layer_size);
     for (uint32_t y = 0; y < layout.blocks_h; ++y) {
       for (uint32_t x = 0; x < layout.blocks_w; ++x, out += info.bytes) {
-        uint32_t offset = fetch.tiled ? TiledOffset(x, y, layout.pitch_blocks, info.bytes) *
+        uint32_t sx = x + layout.offset_x, sy = y + layout.offset_y;
+        uint32_t offset = fetch.tiled ? TiledOffset(sx, sy, layout.pitch_blocks, info.bytes) *
                                             info.bytes
-                                      : y * linear_row + x * info.bytes;
+                                      : sy * linear_row + sx * info.bytes;
         if (info.bytes >= 4) {
           for (uint32_t w = 0; w < info.bytes; w += 4) {
             uint32_t value;
@@ -238,6 +259,135 @@ void Decode(const uint8_t* guest_base, const uint32_t fetch_words[6], Texture& t
   }
 }
 
+namespace {
+
+// The four colours of a BC1 colour block, as RGBA8. BC2 and BC3 blocks always
+// use four opaque colours; BC1 uses three and transparent black when the
+// first endpoint isn't the greater.
+void ColorBlock(const uint8_t* block, bool bc1, uint8_t colors[4][4]) {
+  uint16_t c0 = uint16_t(block[0] | block[1] << 8), c1 = uint16_t(block[2] | block[3] << 8);
+  for (int e = 0; e < 2; ++e) {
+    uint16_t c = e ? c1 : c0;
+    colors[e][0] = uint8_t((c >> 11) * 255 / 31);
+    colors[e][1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+    colors[e][2] = uint8_t((c & 31) * 255 / 31);
+    colors[e][3] = 255;
+  }
+  for (int i = 0; i < 4; ++i) {
+    if (c0 > c1 || !bc1) {
+      colors[2][i] = uint8_t((2 * colors[0][i] + colors[1][i]) / 3);
+      colors[3][i] = uint8_t((colors[0][i] + 2 * colors[1][i]) / 3);
+    } else {
+      colors[2][i] = uint8_t((colors[0][i] + colors[1][i]) / 2);
+      colors[3][i] = 0;
+    }
+  }
+}
+
+// The 16 values of a BC3 alpha (or BC4/BC5 channel) block.
+void ValueBlock(const uint8_t* block, uint8_t values[16]) {
+  uint8_t v[8] = {block[0], block[1]};
+  for (int i = 2; i < 8; ++i) {
+    v[i] = v[0] > v[1] ? uint8_t(((8 - i) * v[0] + (i - 1) * v[1]) / 7)
+           : i < 6     ? uint8_t(((6 - i) * v[0] + (i - 1) * v[1]) / 5)
+           : i == 6    ? 0
+                       : 255;
+  }
+  uint64_t bits = 0;
+  for (int i = 0; i < 6; ++i) {
+    bits |= uint64_t(block[2 + i]) << (8 * i);
+  }
+  for (int i = 0; i < 16; ++i) {
+    values[i] = v[(bits >> (3 * i)) & 7];
+  }
+}
+
+}  // namespace
+
+uint32_t DecompressedFormat(uint32_t format) {
+  switch (format) {
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+    case VK_FORMAT_BC2_UNORM_BLOCK:
+    case VK_FORMAT_BC3_UNORM_BLOCK:
+      return VK_FORMAT_R8G8B8A8_UNORM;
+    case VK_FORMAT_BC4_UNORM_BLOCK:
+      return VK_FORMAT_R8_UNORM;
+    case VK_FORMAT_BC5_UNORM_BLOCK:
+      return VK_FORMAT_R8G8_UNORM;
+    default:
+      return 0;
+  }
+}
+
+void Decompress(Texture& texture) {
+  uint32_t plain = DecompressedFormat(texture.format);
+  if (!plain) {
+    return;
+  }
+  uint32_t texel = plain == VK_FORMAT_R8G8B8A8_UNORM ? 4 : plain == VK_FORMAT_R8G8_UNORM ? 2 : 1;
+  uint32_t block_bytes = texture.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK ||
+                                 texture.format == VK_FORMAT_BC4_UNORM_BLOCK
+                             ? 8
+                             : 16;
+  uint32_t blocks_w = (texture.width + 3) / 4, blocks_h = (texture.height + 3) / 4;
+  uint32_t images = texture.layers * texture.depth;
+  std::vector<uint8_t> out(size_t(texture.width) * texture.height * texel * images);
+  const uint8_t* block = texture.data.data();
+  for (uint32_t image = 0; image < images; ++image) {
+    uint8_t* base = out.data() + size_t(texture.width) * texture.height * texel * image;
+    for (uint32_t by = 0; by < blocks_h; ++by) {
+      for (uint32_t bx = 0; bx < blocks_w; ++bx, block += block_bytes) {
+        uint8_t texels[16][4] = {};
+        switch (texture.format) {
+          case VK_FORMAT_BC1_RGBA_UNORM_BLOCK:
+          case VK_FORMAT_BC2_UNORM_BLOCK:
+          case VK_FORMAT_BC3_UNORM_BLOCK: {
+            bool bc1 = texture.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK;
+            const uint8_t* color = bc1 ? block : block + 8;
+            uint8_t colors[4][4];
+            ColorBlock(color, bc1, colors);
+            uint32_t indices = uint32_t(color[4] | color[5] << 8 | color[6] << 16 | color[7] << 24);
+            for (int i = 0; i < 16; ++i) {
+              std::memcpy(texels[i], colors[(indices >> (2 * i)) & 3], 4);
+            }
+            if (texture.format == VK_FORMAT_BC2_UNORM_BLOCK) {
+              for (int i = 0; i < 16; ++i) {
+                texels[i][3] = uint8_t(((block[i / 2] >> (4 * (i & 1))) & 15) * 17);
+              }
+            } else if (texture.format == VK_FORMAT_BC3_UNORM_BLOCK) {
+              uint8_t alpha[16];
+              ValueBlock(block, alpha);
+              for (int i = 0; i < 16; ++i) {
+                texels[i][3] = alpha[i];
+              }
+            }
+            break;
+          }
+          default: {  // BC4, BC5: one or two channels
+            uint8_t values[16];
+            for (uint32_t c = 0; c < texel; ++c) {
+              ValueBlock(block + 8 * c, values);
+              for (int i = 0; i < 16; ++i) {
+                texels[i][c] = values[i];
+              }
+            }
+            break;
+          }
+        }
+        // The block's texels inside the texture (edge blocks overhang).
+        for (uint32_t y = 0; y < 4 && by * 4 + y < texture.height; ++y) {
+          for (uint32_t x = 0; x < 4 && bx * 4 + x < texture.width; ++x) {
+            std::memcpy(base + (size_t(by * 4 + y) * texture.width + bx * 4 + x) * texel,
+                        texels[y * 4 + x], texel);
+          }
+        }
+      }
+    }
+  }
+  texture.data = std::move(out);
+  texture.format = plain;
+}
+
 bool WritePreview(const Texture& texture, const char* path) {
   if (texture.dimension != Dimension::k2D ||
       (texture.format != VK_FORMAT_B5G6R5_UNORM_PACK16 &&
@@ -249,6 +399,11 @@ bool WritePreview(const Texture& texture, const char* path) {
     return false;
   }
   std::fprintf(file, "P6 %u %u 255\n", texture.width, texture.height);
+  // The alpha the view samples, beside it as a PGM.
+  FILE* alpha = std::fopen((std::string(path) + ".alpha.pgm").c_str(), "wb");
+  if (alpha) {
+    std::fprintf(alpha, "P5 %u %u 255\n", texture.width, texture.height);
+  }
   for (uint32_t i = 0; i < texture.width * texture.height; ++i) {
     uint8_t rgba[4];
     if (texture.format == VK_FORMAT_R8G8B8A8_UNORM) {
@@ -269,8 +424,17 @@ bool WritePreview(const Texture& texture, const char* path) {
                : s == VK_COMPONENT_SWIZZLE_ONE ? 255 : 0;
     }
     std::fwrite(out, 1, 3, file);
+    if (alpha) {
+      uint32_t s = texture.swizzle[3];
+      uint8_t a = s >= VK_COMPONENT_SWIZZLE_R ? rgba[s - VK_COMPONENT_SWIZZLE_R]
+                  : s == VK_COMPONENT_SWIZZLE_ONE ? 255 : 0;
+      std::fputc(a, alpha);
+    }
   }
   std::fclose(file);
+  if (alpha) {
+    std::fclose(alpha);
+  }
   return true;
 }
 
@@ -286,18 +450,18 @@ uint64_t Fingerprint(const uint8_t* guest_base, const uint32_t fetch_words[6]) {
     return 0;
   }
   const uint8_t* data = Physical(guest_base, fetch.address);
-  // Small textures are hashed whole: games swap small details, such as an
-  // eye's iris, by rewriting a few blocks of a texture in place. Larger
-  // ones are sampled evenly.
-  constexpr uint64_t kWholeBytes = 256 << 10;
+  // Textures up to 1 MB are hashed whole: games rewrite parts of a texture
+  // in place, such as an eye's iris, or a character portrait streamed into
+  // an atlas as the cursor nears it. Larger ones are hashed 64 bytes in
+  // every 512, close enough that no rewritten block of a tile is missed.
+  constexpr uint64_t kWholeBytes = 1 << 20;
   if (span <= kWholeBytes) {
     return XXH3_64bits(data, span);
   }
-  constexpr uint32_t kSamples = 512, kSampleBytes = 64;
+  constexpr uint32_t kStride = 512, kSampleBytes = 64;
   XXH3_state_t state;
   XXH3_64bits_reset(&state);
-  for (uint32_t s = 0; s < kSamples; ++s) {
-    uint64_t at = std::min<uint64_t>(span * s / kSamples, span - kSampleBytes);
+  for (uint64_t at = 0; at + kSampleBytes <= span; at += kStride) {
     XXH3_64bits_update(&state, data + at, kSampleBytes);
   }
   return XXH3_64bits_digest(&state);

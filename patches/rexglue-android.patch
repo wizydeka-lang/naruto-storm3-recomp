@@ -422,7 +422,7 @@ index b52bf39..ffbd0eb 100644
    int oflag;
    switch (access) {
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 9ac8d15..bfd0d66 100644
+index 9ac8d15..231726e 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -270,8 +270,9 @@ static sem_t* RexCreateAnonymousSemaphore() {
@@ -454,6 +454,32 @@ index 9ac8d15..bfd0d66 100644
          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
          int result = pthread_mutex_trylock(native_mutex);
          if (result == 0 || result == EOWNERDEAD) {
+@@ -868,19 +869,17 @@ class PosixCondition<Thread> : public PosixConditionBase {
+       return;
+     }
+ 
+-#if defined(__APPLE__)
+-    // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+-    // without the sigval payload.
++#if defined(__APPLE__) || REX_PLATFORM_ANDROID
++    // macOS has no sigqueue/pthread_sigqueue, and Bionic only has
++    // pthread_sigqueue from API 29 (sigqueue takes a process, not a thread:
++    // it fails for any but the main one, and the thread never wakes).
++    // pthread_kill delivers the signal without the sigval payload, which the
++    // handler doesn't use.
+     int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+ #else
+     sigval value{};
+     value.sival_ptr = this;
+-#if REX_PLATFORM_ANDROID
+-    int result = sigqueue(pthread_gettid_np(thread_),
+-                          GetSystemSignal(SignalType::kThreadUserCallback), value);
+-#else
+     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+-#endif
+ #endif
+     if (result != 0) {
+       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
 index 001f36b..0cab718 100644
 --- a/src/graphics/vulkan/command_processor.cpp
