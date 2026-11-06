@@ -1,3 +1,5 @@
+<p align="center"><img src="tools/icon/icon-512.png" width="128" alt="Naruto Recomp icon"></p>
+
 # Naruto Recomp
 
 An experimental native PC and Android port of the Xbox 360 game **Naruto Shippuden: Ultimate Ninja Storm 3 Full Burst**, built with [ReXGlue](https://github.com/rexglue/rexglue-sdk). ReXGlue translates the game's PowerPC code into C++, which is then compiled for your machine.
