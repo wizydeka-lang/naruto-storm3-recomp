@@ -150,6 +150,10 @@ The game leaves a large shared-memory file in `/dev/shm` when it exits. Delete l
 
 An arm64 phone with Android 8 or newer and a Vulkan 1.3 GPU that supports 64-bit integers in shaders. Not every phone GPU has these; the game stops at start-up on those that don't.
 
+### Download
+
+Get `naruto-storm3-recomp-<version>-arm64.apk` from [Releases](https://github.com/wizydeka-lang/naruto-storm3-recomp/releases) and install it (allow installing from your browser or file manager when Android asks). The APK contains no game files: you still need your own copy of the game on the phone (see [Play](#play)). If you installed an APK you built yourself, uninstall it first; the signatures differ. Uninstalling deletes `Android/data/dev.narutorecomp`, so copy your saves out of it first.
+
 ### Build (on Linux)
 
 Install the Android NDK r30, JDK 17 and the Android SDK (platform 35), set up the desktop SDK first (step 3), then build the SDK for Android as described in [`patches/README.md`](patches/README.md#android-build-support). Then:
@@ -162,7 +166,7 @@ cd android
 JAVA_HOME=~/Android/jdk-17 ANDROID_HOME=~/Android/sdk ./gradlew assembleRelease
 ```
 
-The APK is `android/app/build/outputs/apk/release/app-release.apk`. If you built the shader cache on the PC (`out/shaders/naruto_shaders.bin`), it goes into the APK, so the phone doesn't compile shaders while you play. The app icon is made from your game's box art.
+The APK is `android/app/build/outputs/apk/release/app-release.apk`. Add `-PpublicRelease=true` for an APK without the shader cache and box-art icon, as published in Releases. If you built the shader cache on the PC (`out/shaders/naruto_shaders.bin`), it goes into the APK, so the phone doesn't compile shaders while you play. The app icon is made from your game's box art.
 
 ### Play
 
@@ -308,9 +312,9 @@ A good report has:
 
 Search the existing issues first; adding your details to a matching issue helps more than a duplicate. **Never attach game files, `default.xex`, `generated/` code, or built executables or APKs.** They contain the game and will be removed.
 
-## Why there are no ready-made downloads
+## Downloads
 
-A built `naruto.exe` or Android APK contains the game's own code, recompiled from `default.xex`, plus shader data from the game. Sharing it would mean sharing the game, so this project only publishes source code, and everyone builds from their own copy. The Windows installer makes this mostly automatic.
+The Android APK is published in [Releases](https://github.com/wizydeka-lang/naruto-storm3-recomp/releases). Like other recompilation projects, it contains the recompiled program but **no game assets**: no textures, models, sounds, videos or shader data. The game files always come from your own copy, and only the one supported version is accepted. On Windows and Linux, the game is built on your machine (the Windows installer does it for you).
 
 ## How the project is organised
 

@@ -13,6 +13,14 @@ def gameBuild = rootProject.file('../out/build/android-arm64-release')
 def stagedLibs = layout.buildDirectory.dir('staged/jniLibs')
 def stagedAssets = layout.buildDirectory.dir('staged/assets')
 def stagedRes = layout.buildDirectory.dir('staged/res')
+// -PpublicRelease=true: an APK for publishing. It leaves out everything made
+// from the game's data (the PC shader cache and the box-art icon); the game's
+// files still come from the user's own copy on the phone.
+def publicRelease = providers.gradleProperty('publicRelease').getOrElse('false').toBoolean()
+// Release signing key, kept outside the repository:
+// -PreleaseKeystore=... -PreleaseKeyAlias=... and the passwords in
+// NARUTO_KEYSTORE_PASSWORD. Without it, release builds use the debug key.
+def releaseKeystore = providers.gradleProperty('releaseKeystore').getOrNull()
 
 android {
     namespace = 'dev.narutorecomp'
@@ -24,18 +32,29 @@ android {
         applicationId = 'dev.narutorecomp'
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = '0.1'
+        versionCode = providers.gradleProperty('versionCode').getOrElse('1').toInteger()
+        versionName = providers.gradleProperty('versionName').getOrElse('0.1')
         ndk {
             abiFilters 'arm64-v8a'
+        }
+    }
+
+    signingConfigs {
+        if (releaseKeystore) {
+            published {
+                storeFile = file(releaseKeystore)
+                storePassword = System.getenv('NARUTO_KEYSTORE_PASSWORD')
+                keyAlias = providers.gradleProperty('releaseKeyAlias').getOrElse('naruto')
+                keyPassword = System.getenv('NARUTO_KEYSTORE_PASSWORD')
+            }
         }
     }
 
     buildTypes {
         release {
             minifyEnabled = false
-            // Sideloaded test builds: sign with the local debug key.
-            signingConfig = signingConfigs.debug
+            // Sideloaded test builds use the local debug key.
+            signingConfig = releaseKeystore ? signingConfigs.published : signingConfigs.debug
         }
     }
 
@@ -93,8 +112,11 @@ def stageAssets = tasks.register('stageAssets', Copy) {
     from(rootProject.file('../config/naruto-performance.toml')) {
         rename { 'naruto.toml' }
     }
-    from(rootProject.file('../out/shaders/naruto_shaders.bin'))
+    if (!publicRelease) {
+        from(rootProject.file('../out/shaders/naruto_shaders.bin'))
+    }
     into(stagedAssets)
+    doFirst { project.delete(stagedAssets) }
 }
 
 // The resources, with the app icon made from the game's own box art
@@ -106,12 +128,13 @@ def stageIcons = tasks.register('stageIcons') {
     def res = file('src/main/res')
     inputs.dir(res)
     inputs.files(script, art).optional()
+    inputs.property('publicRelease', publicRelease)
     outputs.dir(stagedRes)
     doLast {
         def staged = stagedRes.get().asFile
         project.delete(staged)
         project.copy { from res; into staged }
-        if (!art.exists()) {
+        if (publicRelease || !art.exists()) {
             return
         }
         def result = providers.exec {
