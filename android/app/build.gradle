@@ -118,6 +118,12 @@ def stageAssets = tasks.register('stageAssets', Copy) {
         rename { 'naruto.toml' }
     }
     from(rootProject.file('../out/shaders/naruto_shaders.bin'))
+    // Shaders captured from memory on the PC; the cache's entries for them are
+    // matched through these containers.
+    from(rootProject.file('../out/shaders/runtime')) {
+        include '*.bin'
+        into 'shader_runtime'
+    }
     into(stagedAssets)
     doFirst {
         project.delete(stagedAssets)

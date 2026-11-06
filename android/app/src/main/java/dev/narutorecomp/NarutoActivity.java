@@ -195,6 +195,22 @@ public class NarutoActivity extends SDLActivity {
         if (cache.exists() && prefs.getLong("shader_cache_install", 0) == installed) {
             return;
         }
+        // The shaders captured from memory on the PC (2D sprites: text, icons,
+        // logos). The cache's SPIR-V for them is matched through these files,
+        // so without them those draws are skipped until the phone captures
+        // them itself.
+        File runtime = new File(cache.getParentFile(), "runtime");
+        runtime.mkdirs();
+        try {
+            String[] captured = getAssets().list("shader_runtime");
+            if (captured != null) {
+                for (String name : captured) {
+                    copyAsset("shader_runtime/" + name, new File(runtime, name));
+                }
+            }
+        } catch (IOException e) {
+            Log.w(TAG, "Could not list captured shaders", e);
+        }
         if (copyAsset("naruto_shaders.bin", cache)) {
             prefs.edit().putLong("shader_cache_install", installed).apply();
         }
